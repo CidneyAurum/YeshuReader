@@ -22,6 +22,7 @@ keystore.properties
 *.hprof
 captures/
 screenshots/
+artifacts/
 
 # Local test documents and model harnesses
 *.tmp

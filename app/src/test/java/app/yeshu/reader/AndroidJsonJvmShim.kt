@@ -1,0 +1,220 @@
+@file:Suppress("unused")
+
+package org.json
+
+/**
+ * Minimal JVM implementation for the Android org.json API used by AiClient.
+ *
+ * Android local unit tests otherwise receive the mockable android.jar stubs, whose JSON methods
+ * return defaults. Keeping this shim in the test source set lets the production parser execute on
+ * the host JVM without Robolectric, a device, network access, or a production dependency change.
+ */
+class JSONObject {
+    internal val values: MutableMap<String, Any?>
+
+    constructor() {
+        values = linkedMapOf()
+    }
+
+    constructor(source: String) {
+        values = JsonParser(source).parseObjectRoot().toMutableMap()
+    }
+
+    internal constructor(values: Map<String, Any?>) {
+        this.values = values.toMutableMap()
+    }
+
+    fun getJSONArray(name: String): JSONArray =
+        values[name] as? JSONArray ?: throw JSONException("$name is not a JSONArray")
+
+    fun getJSONObject(name: String): JSONObject =
+        values[name] as? JSONObject ?: throw JSONException("$name is not a JSONObject")
+
+    fun optJSONObject(name: String): JSONObject? = values[name] as? JSONObject
+
+    fun optJSONArray(name: String): JSONArray? = values[name] as? JSONArray
+
+    fun has(name: String): Boolean = values.containsKey(name)
+
+    fun isNull(name: String): Boolean = !values.containsKey(name) || values[name] == null
+
+    fun getString(name: String): String = when (val value = values[name]) {
+        null -> throw JSONException("$name is null or missing")
+        is String -> value
+        else -> value.toString()
+    }
+
+    fun optString(name: String): String = optString(name, "")
+
+    fun optString(name: String, fallback: String): String = when (val value = values[name]) {
+        null -> fallback
+        is String -> value
+        else -> value.toString()
+    }
+
+    fun put(name: String, value: Any?): JSONObject = apply { values[name] = value }
+}
+
+class JSONArray internal constructor(internal val values: MutableList<Any?>) {
+    constructor() : this(mutableListOf())
+
+    constructor(source: String) : this(JsonParser(source).parseArrayRoot().toMutableList())
+
+    fun length(): Int = values.size
+
+    fun getJSONObject(index: Int): JSONObject =
+        values.getOrNull(index) as? JSONObject
+            ?: throw JSONException("Value at $index is not a JSONObject")
+
+    fun optJSONObject(index: Int): JSONObject? = values.getOrNull(index) as? JSONObject
+
+    fun put(value: Any?): JSONArray = apply { values += value }
+}
+
+class JSONException(message: String) : RuntimeException(message)
+
+private class JsonParser(private val source: String) {
+    private var index = 0
+
+    fun parseObjectRoot(): Map<String, Any?> {
+        val value = parseDocument()
+        return (value as? JSONObject)?.values
+            ?: throw JSONException("JSON document is not an object")
+    }
+
+    fun parseArrayRoot(): List<Any?> {
+        val value = parseDocument()
+        return (value as? JSONArray)?.values
+            ?: throw JSONException("JSON document is not an array")
+    }
+
+    private fun parseDocument(): Any? {
+        skipWhitespace()
+        val value = parseValue()
+        skipWhitespace()
+        if (index != source.length) fail("Unexpected trailing content")
+        return value
+    }
+
+    private fun parseValue(): Any? {
+        skipWhitespace()
+        if (index >= source.length) fail("Unexpected end of input")
+        return when (source[index]) {
+            '{' -> JSONObject(parseObject())
+            '[' -> JSONArray(parseArray().toMutableList())
+            '"' -> parseString()
+            't' -> parseLiteral("true", true)
+            'f' -> parseLiteral("false", false)
+            'n' -> parseLiteral("null", null)
+            '-', in '0'..'9' -> parseNumber()
+            else -> fail("Unexpected character '${source[index]}'")
+        }
+    }
+
+    private fun parseObject(): Map<String, Any?> {
+        expect('{')
+        skipWhitespace()
+        if (consume('}')) return emptyMap()
+        val result = linkedMapOf<String, Any?>()
+        while (true) {
+            skipWhitespace()
+            if (index >= source.length || source[index] != '"') fail("Expected object key")
+            val key = parseString()
+            skipWhitespace()
+            expect(':')
+            result[key] = parseValue()
+            skipWhitespace()
+            if (consume('}')) return result
+            expect(',')
+        }
+    }
+
+    private fun parseArray(): List<Any?> {
+        expect('[')
+        skipWhitespace()
+        if (consume(']')) return emptyList()
+        val result = mutableListOf<Any?>()
+        while (true) {
+            result += parseValue()
+            skipWhitespace()
+            if (consume(']')) return result
+            expect(',')
+        }
+    }
+
+    private fun parseString(): String {
+        expect('"')
+        val result = StringBuilder()
+        while (index < source.length) {
+            when (val char = source[index++]) {
+                '"' -> return result.toString()
+                '\\' -> {
+                    if (index >= source.length) fail("Incomplete escape")
+                    when (val escaped = source[index++]) {
+                        '"', '\\', '/' -> result.append(escaped)
+                        'b' -> result.append('\b')
+                        'f' -> result.append('\u000C')
+                        'n' -> result.append('\n')
+                        'r' -> result.append('\r')
+                        't' -> result.append('\t')
+                        'u' -> result.append(parseUnicodeEscape())
+                        else -> fail("Unsupported escape \\$escaped")
+                    }
+                }
+                else -> result.append(char)
+            }
+        }
+        fail("Unterminated string")
+    }
+
+    private fun parseUnicodeEscape(): Char {
+        if (index + 4 > source.length) fail("Incomplete unicode escape")
+        val digits = source.substring(index, index + 4)
+        index += 4
+        return digits.toIntOrNull(16)?.toChar() ?: fail("Invalid unicode escape")
+    }
+
+    private fun parseNumber(): Number {
+        val start = index
+        if (source[index] == '-') index++
+        while (index < source.length && source[index].isDigit()) index++
+        if (index < source.length && source[index] == '.') {
+            index++
+            while (index < source.length && source[index].isDigit()) index++
+        }
+        if (index < source.length && source[index] in "eE") {
+            index++
+            if (index < source.length && source[index] in "+-") index++
+            while (index < source.length && source[index].isDigit()) index++
+        }
+        val token = source.substring(start, index)
+        return token.toLongOrNull() ?: token.toDoubleOrNull() ?: fail("Invalid number")
+    }
+
+    private fun parseLiteral(token: String, value: Any?): Any? {
+        if (!source.startsWith(token, index)) fail("Expected $token")
+        index += token.length
+        return value
+    }
+
+    private fun expect(expected: Char) {
+        skipWhitespace()
+        if (index >= source.length || source[index] != expected) fail("Expected '$expected'")
+        index++
+    }
+
+    private fun consume(expected: Char): Boolean {
+        if (index < source.length && source[index] == expected) {
+            index++
+            return true
+        }
+        return false
+    }
+
+    private fun skipWhitespace() {
+        while (index < source.length && source[index].isWhitespace()) index++
+    }
+
+    private fun fail(message: String): Nothing = throw JSONException("$message at index $index")
+
+}

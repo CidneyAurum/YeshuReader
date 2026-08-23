@@ -1,0 +1,55 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="1800" height="1000" viewBox="0 0 1800 1000" role="img" aria-label="页枢图标深浅背景预览">
+  <defs>
+    <filter id="shadow" x="-30%" y="-30%" width="160%" height="180%"><feDropShadow dx="0" dy="22" stdDeviation="24" flood-color="#071027" flood-opacity=".24"/></filter>
+    <clipPath id="lightMask"><rect x="280" y="215" width="360" height="360" rx="88"/></clipPath>
+    <clipPath id="darkMask"><rect x="1160" y="215" width="360" height="360" rx="88"/></clipPath>
+    <clipPath id="smallLight48"><rect x="356" y="706" width="48" height="48" rx="12"/></clipPath>
+    <clipPath id="smallLight24"><rect x="467" y="718" width="24" height="24" rx="6"/></clipPath>
+    <clipPath id="smallDark48"><rect x="1236" y="706" width="48" height="48" rx="12"/></clipPath>
+    <clipPath id="smallDark24"><rect x="1347" y="718" width="24" height="24" rx="6"/></clipPath>
+    <g id="monoMark" fill="currentColor">
+      <path d="M54 51.6C49 48 46.2 43.4 45.1 38.2L42.9 26.3C42.4 23.6 44.9 22.8 47.7 22.8L59 23.8C61.1 24 62 25.8 61.6 27.6L58.9 39.1C57.7 44.5 56 48.7 54 51.6Z"/>
+      <path d="M54 51.6C49 48 46.2 43.4 45.1 38.2L42.9 26.3C42.4 23.6 44.9 22.8 47.7 22.8L59 23.8C61.1 24 62 25.8 61.6 27.6L58.9 39.1C57.7 44.5 56 48.7 54 51.6Z" transform="rotate(120 54 54)"/>
+      <path d="M54 51.6C49 48 46.2 43.4 45.1 38.2L42.9 26.3C42.4 23.6 44.9 22.8 47.7 22.8L59 23.8C61.1 24 62 25.8 61.6 27.6L58.9 39.1C57.7 44.5 56 48.7 54 51.6Z" transform="rotate(240 54 54)"/>
+      <path d="M54 47.2a6.8 6.8 0 1 1 0 13.6 6.8 6.8 0 1 1 0-13.6ZM54 51.4a2.6 2.6 0 1 0 0 5.2 2.6 2.6 0 1 0 0-5.2Z" fill-rule="evenodd"/>
+    </g>
+  </defs>
+
+  <rect width="1800" height="1000" fill="#DDE4F1"/>
+  <rect x="52" y="52" width="816" height="896" rx="54" fill="#F8FAFF"/>
+  <rect x="932" y="52" width="816" height="896" rx="54" fill="#070B16"/>
+  <text x="112" y="135" fill="#17213A" font-family="Arial, Microsoft YaHei, sans-serif" font-size="34" font-weight="700">浅色背景</text>
+  <text x="992" y="135" fill="#F5F8FF" font-family="Arial, Microsoft YaHei, sans-serif" font-size="34" font-weight="700">深色背景</text>
+  <text x="112" y="174" fill="#64708A" font-family="Arial, Microsoft YaHei, sans-serif" font-size="20">Light surface · squircle mask</text>
+  <text x="992" y="174" fill="#9EA9C1" font-family="Arial, Microsoft YaHei, sans-serif" font-size="20">Dark surface · squircle mask</text>
+
+  <g filter="url(#shadow)">
+    <image href="yeshu-icon.svg" x="280" y="215" width="360" height="360" clip-path="url(#lightMask)"/>
+    <image href="yeshu-icon.svg" x="1160" y="215" width="360" height="360" clip-path="url(#darkMask)"/>
+  </g>
+  <line x1="112" y1="650" x2="808" y2="650" stroke="#D8DFEC" stroke-width="2"/>
+  <line x1="992" y1="650" x2="1688" y2="650" stroke="#202A40" stroke-width="2"/>
+  <text x="112" y="727" fill="#44506A" font-family="Arial, Microsoft YaHei, sans-serif" font-size="22" font-weight="600">小尺寸辨识</text>
+  <text x="992" y="727" fill="#C6CEE0" font-family="Arial, Microsoft YaHei, sans-serif" font-size="22" font-weight="600">小尺寸辨识</text>
+  <image href="yeshu-icon.svg" x="356" y="706" width="48" height="48" clip-path="url(#smallLight48)"/>
+  <image href="yeshu-icon.svg" x="467" y="718" width="24" height="24" clip-path="url(#smallLight24)"/>
+  <rect x="568" y="706" width="48" height="48" rx="12" fill="#E5E8FF"/>
+  <use href="#monoMark" color="#5B5FF5" transform="translate(568 706) scale(.444444)"/>
+  <image href="yeshu-icon.svg" x="1236" y="706" width="48" height="48" clip-path="url(#smallDark48)"/>
+  <image href="yeshu-icon.svg" x="1347" y="718" width="24" height="24" clip-path="url(#smallDark24)"/>
+  <rect x="1448" y="706" width="48" height="48" rx="12" fill="#273052"/>
+  <use href="#monoMark" color="#BBC5FF" transform="translate(1448 706) scale(.444444)"/>
+  <text x="356" y="790" fill="#64708A" font-family="Arial, sans-serif" font-size="18">48 px</text>
+  <text x="459" y="790" fill="#64708A" font-family="Arial, sans-serif" font-size="18">24 px</text>
+  <text x="548" y="790" fill="#64708A" font-family="Arial, Microsoft YaHei, sans-serif" font-size="18">主题单色</text>
+  <text x="1236" y="790" fill="#9EA9C1" font-family="Arial, sans-serif" font-size="18">48 px</text>
+  <text x="1339" y="790" fill="#9EA9C1" font-family="Arial, sans-serif" font-size="18">24 px</text>
+  <text x="1428" y="790" fill="#9EA9C1" font-family="Arial, Microsoft YaHei, sans-serif" font-size="18">主题单色</text>
+  <rect x="112" y="838" width="696" height="66" rx="22" fill="#EEF2FA"/>
+  <rect x="992" y="838" width="696" height="66" rx="22" fill="#11182A"/>
+  <circle cx="151" cy="871" r="8" fill="#22D3EE"/>
+  <circle cx="1031" cy="871" r="8" fill="#A855F7"/>
+  <text x="174" y="878" fill="#44506A" font-family="Arial, Microsoft YaHei, sans-serif" font-size="19">108dp 画布 · 66dp 安全区 · 三页一枢</text>
+  <text x="1054" y="878" fill="#C6CEE0" font-family="Arial, Microsoft YaHei, sans-serif" font-size="19">Android 13 单色轮廓已同步</text>
+</svg>

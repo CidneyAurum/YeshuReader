@@ -1,0 +1,59 @@
+name: Android CI
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: android-ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  verify:
+    name: Test, lint, and build
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v4
+
+      - name: Make Gradle wrapper executable
+        run: chmod +x gradlew
+
+      - name: Run debug unit tests
+        run: ./gradlew --stacktrace testDebugUnitTest
+
+      - name: Run debug lint
+        run: ./gradlew --stacktrace lintDebug
+
+      - name: Assemble debug APK
+        run: ./gradlew --stacktrace assembleDebug
+
+      - name: Verify release lint and APK
+        run: ./gradlew --stacktrace lintRelease assembleRelease
+
+      - name: Reject debug components and committed API keys
+        shell: bash
+        run: |
+          if find app/build/intermediates -path '*release*' -name AndroidManifest.xml -print0 | xargs -0 grep -n 'DebugActivity'; then
+            echo 'DebugActivity found in a release manifest'
+            exit 1
+          fi
+          if grep -R -n -E 'sk-[A-Za-z0-9_-]{20,}' app/src; then
+            echo 'Potential API key found in source'
+            exit 1
+          fi

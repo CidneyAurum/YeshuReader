@@ -6,5 +6,8 @@
         <item name="android:statusBarColor">@android:color/transparent</item>
         <item name="android:navigationBarColor">@android:color/transparent</item>
         <item name="android:windowActionModeOverlay">true</item>
+        <item name="android:windowSplashScreenBackground">@color/yeshu_icon_background</item>
+        <item name="android:windowSplashScreenAnimatedIcon">@drawable/ic_yeshu_foreground</item>
+        <item name="android:windowSplashScreenIconBackgroundColor">@color/yeshu_icon_background</item>
     </style>
 </resources>

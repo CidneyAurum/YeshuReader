@@ -1,4 +1,6 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
-    <string name="app_name">书阁</string>
+    <string name="app_name">页枢</string>
+    <string name="app_subtitle">本地书架与 AI 文档助手</string>
+    <string name="brand_tagline">读书，也读懂资料</string>
 </resources>

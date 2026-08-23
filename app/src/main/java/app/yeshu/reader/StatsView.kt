@@ -1,0 +1,332 @@
+package app.yeshu.reader
+
+import android.app.Activity
+import android.app.AlertDialog
+import android.graphics.Color
+import android.graphics.Typeface
+import android.graphics.drawable.GradientDrawable
+import android.view.Gravity
+import android.view.View
+import android.widget.FrameLayout
+import android.widget.LinearLayout
+import android.widget.ScrollView
+import android.widget.TextView
+
+/** 阅读统计页：总览 + 近7日柱状图 + 时长 Top 榜 + AI 阅读报告 */
+class StatsView(private val act: Activity) : FrameLayout(act) {
+
+    private val db = Db(act)
+    private lateinit var listBox: LinearLayout
+
+    companion object {
+        private val KIND_LABEL = mapOf(
+            "summary" to "摘要", "ask" to "问答", "quiz" to "自测",
+            "chat" to "聊天", "quote" to "金句", "digest" to "精读", "report" to "报告"
+        )
+    }
+
+    init {
+        setBackgroundColor(T.bg)
+        val col = LinearLayout(act).apply { orientation = LinearLayout.VERTICAL }
+        addView(col, LayoutParams(-1, -1))
+        applySystemBarInsets(col)
+
+        val d = density(act)
+        // 顶栏
+        val top = LinearLayout(act).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            setPadding(Glass.dp(T.pagePad, d), Glass.dp(18, d), Glass.dp(T.pagePad, d), Glass.dp(10, d))
+        }
+        top.addView(FrameLayout(act).apply {
+            background = Glass.iconBg()
+            foreground = Glass.pressFx()
+            layoutParams = LinearLayout.LayoutParams(Glass.dp(42, d), Glass.dp(42, d))
+            addView(IconView(act, "back", 22), FrameLayout.LayoutParams(Glass.dp(24, d), Glass.dp(24, d), Gravity.CENTER))
+            setOnClickListener { (act as MainActivity).backToShelf() }
+        })
+        top.addView(TextView(act).apply {
+            text = "阅读统计"
+            textSize = 20f
+            setTextColor(T.textP)
+            setTypeface(null, Typeface.BOLD)
+            val lp = LinearLayout.LayoutParams(0, -2, 1f)
+            lp.marginStart = Glass.dp(14, d)
+            layoutParams = lp
+        })
+        col.addView(top)
+
+        val sc = ScrollView(act)
+        listBox = LinearLayout(act).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(Glass.dp(T.pagePad, d), Glass.dp(6, d), Glass.dp(T.pagePad, d), Glass.dp(60, d))
+        }
+        sc.addView(listBox, LayoutParams(-1, -2))
+        col.addView(sc, LinearLayout.LayoutParams(-1, 0, 1f))
+
+        refresh()
+    }
+
+    fun refresh() {
+        val d = density(act)
+        listBox.removeAllViews()
+
+        // ---- 总览卡：总时长 / 坚持天数 / 笔记数 ----
+        val totalMs = db.totalAllReadMs()
+        val days = db.activeDays()
+        val notesN = db.noteCount()
+        val booksAll = db.listBooks()
+        val reading = booksAll.count { it.progress > 0.005f && it.progress < 0.99f }
+        val finished = booksAll.count { it.progress >= 0.99f }
+
+        fun statCard(): LinearLayout {
+            val row = LinearLayout(act).apply {
+                orientation = LinearLayout.HORIZONTAL
+                background = GradientDrawable().apply {
+                    cornerRadius = Glass.dp(T.rCard, d).toFloat(); setColor(T.surface)
+                }
+                setPadding(Glass.dp(8, d), Glass.dp(16, d), Glass.dp(8, d), Glass.dp(16, d))
+            }
+            val cells = listOf(
+                formatMs(totalMs) to "累计阅读",
+                "$days" to "坚持天数",
+                "${booksAll.size}" to "藏书",
+                "$reading" to "在读"
+            )
+            cells.forEachIndexed { i, (v, label) ->
+                row.addView(LinearLayout(act).apply {
+                    orientation = LinearLayout.VERTICAL
+                    gravity = Gravity.CENTER
+                    layoutParams = LinearLayout.LayoutParams(0, -2, 1f)
+                    addView(TextView(act).apply {
+                        text = v; textSize = if (i == 0) 15f else 19f
+                        setTextColor(if (i == 0) T.textP else T.accent)
+                        setTypeface(null, Typeface.BOLD); gravity = Gravity.CENTER
+                    })
+                    addView(TextView(act).apply {
+                        text = label; textSize = 11f; setTextColor(T.textT)
+                        setPadding(0, Glass.dp(4, d), 0, 0); gravity = Gravity.CENTER
+                    })
+                })
+            }
+            return row
+        }
+        listBox.addView(statCard(), LinearLayout.LayoutParams(-1, -2).also {
+            it.topMargin = Glass.dp(4, d)
+        })
+
+        // ---- 近 7 日柱状图 ----
+        val daily = db.dailyReadMs(7)
+        val maxMs = daily.maxOfOrNull { it.second }?.coerceAtLeast(1L) ?: 1L
+        listBox.addView(sectionTitle("近 7 天"))
+        val chart = LinearLayout(act).apply {
+            orientation = LinearLayout.VERTICAL
+            background = GradientDrawable().apply {
+                cornerRadius = Glass.dp(T.rCard, d).toFloat(); setColor(T.surface)
+            }
+            setPadding(Glass.dp(16, d), Glass.dp(16, d), Glass.dp(16, d), Glass.dp(12, d))
+        }
+        val barRow = LinearLayout(act).apply { orientation = LinearLayout.HORIZONTAL; gravity = Gravity.BOTTOM }
+        daily.forEach { (day, ms) ->
+            val frac = ms.toFloat() / maxMs
+            barRow.addView(LinearLayout(act).apply {
+                orientation = LinearLayout.VERTICAL
+                gravity = Gravity.BOTTOM or Gravity.CENTER_HORIZONTAL
+                layoutParams = LinearLayout.LayoutParams(0, Glass.dp(110, d), 1f)
+                addView(TextView(act).apply {
+                    text = if (ms > 0) "${ms / 60000}′" else ""
+                    textSize = 9f; setTextColor(T.textS); gravity = Gravity.CENTER
+                })
+                addView(View(act).apply {
+                    background = GradientDrawable().apply {
+                        cornerRadius = Glass.dp(3, d).toFloat()
+                        setColor(if (ms > 0) T.accent else T.surface3)
+                    }
+                    layoutParams = LinearLayout.LayoutParams(Glass.dp(14, d),
+                        ((Glass.dp(84, d)) * frac).toInt().coerceAtLeast(Glass.dp(3, d))).also {
+                        it.topMargin = Glass.dp(4, d); it.gravity = Gravity.CENTER_HORIZONTAL
+                    }
+                })
+                addView(TextView(act).apply {
+                    text = day.substring(5); textSize = 9f; setTextColor(T.textT)
+                    setPadding(0, Glass.dp(6, d), 0, 0); gravity = Gravity.CENTER
+                    layoutParams = LinearLayout.LayoutParams(-1, -2)
+                })
+            })
+        }
+        chart.addView(barRow, LinearLayout.LayoutParams(-1, -2))
+        listBox.addView(chart, LinearLayout.LayoutParams(-1, -2).also { it.topMargin = Glass.dp(12, d) })
+
+        // ---- 投入最多 ----
+        val tops = db.topBooks(5)
+        if (tops.isNotEmpty()) {
+            listBox.addView(sectionTitle("投入最多"))
+            val card = LinearLayout(act).apply {
+                orientation = LinearLayout.VERTICAL
+                background = GradientDrawable().apply {
+                    cornerRadius = Glass.dp(T.rCard, d).toFloat(); setColor(T.surface)
+                }
+                setPadding(Glass.dp(16, d), Glass.dp(6, d), Glass.dp(16, d), Glass.dp(10, d))
+            }
+            tops.forEachIndexed { i, tb ->
+                card.addView(LinearLayout(act).apply {
+                    orientation = LinearLayout.HORIZONTAL; gravity = Gravity.CENTER_VERTICAL
+                    setPadding(0, Glass.dp(10, d), 0, Glass.dp(10, d))
+                    addView(TextView(act).apply {
+                        text = "${i + 1}"; textSize = 13f; setTextColor(T.textT)
+                        setTypeface(null, Typeface.BOLD)
+                        layoutParams = LinearLayout.LayoutParams(Glass.dp(22, d), -2)
+                    })
+                    addView(TextView(act).apply {
+                        text = tb.title; textSize = 14f; setTextColor(T.textP)
+                        maxLines = 1; ellipsize = android.text.TextUtils.TruncateAt.END
+                        layoutParams = LinearLayout.LayoutParams(0, -2, 1f)
+                    })
+                    addView(TextView(act).apply {
+                        text = formatMs(tb.ms); textSize = 12f; setTextColor(T.textS)
+                        val lp = LinearLayout.LayoutParams(-2, -2); lp.marginStart = Glass.dp(10, d)
+                        layoutParams = lp
+                    })
+                })
+            }
+            listBox.addView(card, LinearLayout.LayoutParams(-1, -2).also { it.topMargin = Glass.dp(12, d) })
+        }
+
+        // ---- AI 阅读报告入口卡 ----
+        val aiCard = LinearLayout(act).apply {
+            orientation = LinearLayout.VERTICAL
+            background = GradientDrawable().apply {
+                cornerRadius = Glass.dp(T.rCard, d).toFloat()
+                setColor(Color.parseColor("#12233D"))
+            }
+            setPadding(Glass.dp(18, d), Glass.dp(18, d), Glass.dp(18, d), Glass.dp(18, d))
+            addView(TextView(act).apply {
+                text = "✨ AI 阅读报告"; textSize = 16f; setTextColor(T.textP)
+                setTypeface(null, Typeface.BOLD)
+            })
+            addView(TextView(act).apply {
+                text = "让 AI 根据你的阅读数据生成个性化报告，存进笔记可随时回看"
+                textSize = 12f; setTextColor(T.textS)
+                setPadding(0, Glass.dp(6, d), 0, 0)
+            })
+            addView(TextView(act).apply {
+                text = if (db.listNotes(0, "report").isEmpty()) "生成报告" else "重新生成"
+                textSize = 14f; setTextColor(Color.WHITE); setTypeface(null, Typeface.BOLD)
+                gravity = Gravity.CENTER
+                background = GradientDrawable().apply {
+                    cornerRadius = Glass.dp(12, d).toFloat(); setColor(T.accent)
+                }
+                setPadding(0, Glass.dp(11, d), 0, Glass.dp(11, d))
+                layoutParams = LinearLayout.LayoutParams(-1, -2).also { it.topMargin = Glass.dp(14, d) }
+                setOnClickListener { aiReport() }
+            })
+        }
+        listBox.addView(aiCard, LinearLayout.LayoutParams(-1, -2).also { it.topMargin = Glass.dp(16, d) })
+
+        // ---- 历史报告列表 ----
+        val reports = db.listNotes(0, "report")
+        reports.reversed().forEach { r ->
+            val card = LinearLayout(act).apply {
+                orientation = LinearLayout.VERTICAL
+                background = GradientDrawable().apply {
+                    cornerRadius = Glass.dp(12, d).toFloat(); setColor(T.surface)
+                }
+                setPadding(Glass.dp(14, d), Glass.dp(12, d), Glass.dp(14, d), Glass.dp(12, d))
+                addView(TextView(act).apply {
+                    text = r.content.replace("\n", " ").take(64) + "…"
+                    textSize = 12f; setTextColor(T.textS); maxLines = 2
+                })
+                setOnClickListener { showReport(r.content) }
+                setOnLongClickListener {
+                    AlertDialog.Builder(act).setTitle("删除该报告？")
+                        .setPositiveButton("删除") { _, _ -> db.deleteNote(r.id); refresh() }
+                        .setNegativeButton("取消", null).show().also { Glass.styleDialog(it, d) }
+                    true
+                }
+            }
+            listBox.addView(card, LinearLayout.LayoutParams(-1, -2).also { it.topMargin = Glass.dp(10, d) })
+        }
+    }
+
+    private fun sectionTitle(t: String): TextView {
+        val d = density(act)
+        return TextView(act).apply {
+            text = t; textSize = 13f; setTextColor(T.textT)
+            setTypeface(null, Typeface.BOLD); letterSpacing = 0.05f
+            val lp = LinearLayout.LayoutParams(-2, -2)
+            lp.topMargin = Glass.dp(18, d)
+            layoutParams = lp
+        }
+    }
+
+    private fun formatMs(ms: Long): String = when {
+        ms <= 0 -> "0 分钟"
+        ms < 3600_000 -> "${ms / 60000} 分钟"
+        else -> {
+            val h = ms / 3600000; val m = (ms % 3600000) / 60000
+            if (m == 0L) "$h 小时" else "$h 小时 $m 分"
+        }
+    }
+
+    /** AI 阅读报告：统计数据 → 个性化周报文案，存 notes(bookId=0, kind=report) */
+    private fun aiReport() {
+        val cfg = AiClient.config(db)
+        if (!AiClient.isReady(cfg)) {
+            AlertDialog.Builder(act).setTitle("未配置 AI")
+                .setMessage("请先在书架「AI 设置」填写接口地址、Key 和模型名。")
+                .setPositiveButton("去设置") { _, _ -> (act as MainActivity).showSettings() }
+                .setNegativeButton("取消", null).show().also { Glass.styleDialog(it, density(act)) }
+            return
+        }
+        val totalMs = db.totalAllReadMs()
+        val days = db.activeDays()
+        val tops = db.topBooks(5)
+        val booksAll = db.listBooks()
+        val finished = booksAll.count { it.progress >= 0.99f }
+        val recent7 = db.dailyReadMs(7).joinToString { (day, ms) -> "$day=${ms / 60000}分钟" }
+        val data = buildString {
+            append("累计阅读 ${formatMs(totalMs)}；有记录天数 $days 天；藏书 ${booksAll.size} 本，读完 $finished 本。\n")
+            append("投入最多：" + tops.joinToString { "${it.title}(${formatMs(it.ms)})" } + "\n")
+            append("近7天每日：$recent7")
+        }
+        val pd = android.app.ProgressDialog.show(act, "AI 阅读报告", "正在分析你的阅读数据…", true, false)
+        Thread {
+            var err: String? = null
+            var reply = ""
+            try {
+                reply = AiClient.chat(cfg,
+                    "你是一位温暖幽默的私人阅读顾问。用简体中文写一份简短的个性化阅读报告。",
+                    "根据以下阅读数据写一份「阅读报告」：① 一句总体评价；② 阅读习惯观察 2 条；" +
+                        "③ 一个具体可行的建议（比如下次读什么、什么时段读）；④ 一句鼓励。总共 200 字以内。" +
+                        "\n\n【数据】\n$data")
+                db.addNote(0, "report", reply)
+            } catch (t: Throwable) { err = t.message ?: t.toString() }
+            val e = err
+            act.runOnUiThread {
+                try { pd.dismiss() } catch (ex: Exception) {}
+                if (e != null) {
+                    AlertDialog.Builder(act).setTitle("AI 调用失败").setMessage(e)
+                        .setPositiveButton("关闭", null).show().also { Glass.styleDialog(it, density(act)) }
+                } else {
+                    refresh()
+                    showReport(reply)
+                }
+            }
+        }.start()
+    }
+
+    private fun showReport(body: String) {
+        val d = density(act)
+        val sc = ScrollView(act)
+        sc.addView(TextView(act).apply {
+            text = body
+            textSize = 15f
+            setTextColor(Color.parseColor("#222222"))
+            setLineSpacing(Glass.dp(4, d).toFloat(), 1.1f)
+            setPadding(Glass.dp(20, d), Glass.dp(16, d), Glass.dp(20, d), Glass.dp(20, d))
+            setTextIsSelectable(true)
+        })
+        AlertDialog.Builder(act).setTitle("✨ AI 阅读报告").setView(sc)
+            .setPositiveButton("关闭", null).show().also { Glass.styleDialog(it, density(act)) }
+    }
+}
