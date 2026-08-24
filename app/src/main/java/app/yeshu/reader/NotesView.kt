@@ -1,14 +1,23 @@
 package app.yeshu.reader
 
+import android.annotation.SuppressLint
 import android.app.Activity
 import android.app.AlertDialog
 import android.graphics.Color
 import android.graphics.Typeface
+import android.graphics.drawable.GradientDrawable
+import android.os.Handler
+import android.os.Looper
 import android.view.Gravity
+import android.view.HapticFeedbackConstants
+import android.view.MotionEvent
+import android.view.View
 import android.widget.FrameLayout
 import android.widget.LinearLayout
 import android.widget.ScrollView
 import android.widget.TextView
+import androidx.core.view.ViewCompat
+import androidx.core.view.WindowInsetsCompat
 
 /** 笔记页：某本书的全部 AI 产物（摘要/问答/自测题），点击查看、长按删除 */
 class NotesView(private val act: Activity, private val bookId: Long) : FrameLayout(act) {
@@ -17,6 +26,9 @@ class NotesView(private val act: Activity, private val bookId: Long) : FrameLayo
     private lateinit var listBox: LinearLayout
     private var filterKind: String? = null   // null=全部
     private var chipRow: LinearLayout? = null
+    private val mainHandler = Handler(Looper.getMainLooper())
+    private var undoBar: View? = null
+    private var pendingDismiss: Runnable? = null
 
     companion object {
         private val KIND_LABEL = mapOf(
@@ -59,6 +71,8 @@ class NotesView(private val act: Activity, private val bookId: Long) : FrameLayo
             setTextColor(Color.WHITE)
             background = Glass.pillBg(Color.argb(60, 255, 255, 255))
             setPadding(Glass.dp(13, d), Glass.dp(7, d), Glass.dp(13, d), Glass.dp(7, d))
+            foreground = Glass.pressFx()
+            isClickable = true
             val lp = LinearLayout.LayoutParams(-2, -2)
             lp.marginEnd = Glass.dp(8, d)
             layoutParams = lp
@@ -71,6 +85,8 @@ class NotesView(private val act: Activity, private val bookId: Long) : FrameLayo
             setTextColor(Color.WHITE)
             background = Glass.pillBg(Color.argb(60, 255, 255, 255))
             setPadding(Glass.dp(14, d), Glass.dp(7, d), Glass.dp(14, d), Glass.dp(7, d))
+            foreground = Glass.pressFx()
+            isClickable = true
             setOnClickListener { exportAll(db.getBook(bookId)?.title ?: "笔记") }
         })
         col.addView(top, LayoutParams(-1, -2))
@@ -95,6 +111,8 @@ class NotesView(private val act: Activity, private val bookId: Long) : FrameLayo
                     setTypeface(null, if (active) Typeface.BOLD else Typeface.NORMAL)
                     background = Glass.pillBg(if (active) Color.argb(140, 90, 130, 220) else Color.argb(45, 255, 255, 255))
                     setPadding(Glass.dp(14, d), Glass.dp(6, d), Glass.dp(14, d), Glass.dp(6, d))
+                    foreground = Glass.pressFx()
+                    isClickable = true
                     val lp = LinearLayout.LayoutParams(-2, -2)
                     lp.marginEnd = Glass.dp(8, d)
                     layoutParams = lp
@@ -141,26 +159,161 @@ class NotesView(private val act: Activity, private val bookId: Long) : FrameLayo
                 row.kind == "chat" && row.content.startsWith("A:") -> "🤖 " + row.content.removePrefix("A:")
                 else -> row.content
             }
-            val card = TextView(act).apply {
-                this.text = "[$label] ${body.take(120)}${if (body.length > 120) "…" else ""}"
-                textSize = 13f
-                setTextColor(Color.parseColor("#222222"))
+            val card = LinearLayout(act).apply {
+                orientation = LinearLayout.VERTICAL
                 background = Glass.card()
-                setPadding(Glass.dp(16, d), Glass.dp(12, d), Glass.dp(16, d), Glass.dp(12, d))
+                foreground = Glass.pressFx()
+                isClickable = true
+                isFocusable = true
+                elevation = Glass.dp(3, d).toFloat()
+                setPadding(Glass.dp(16, d), Glass.dp(13, d), Glass.dp(12, d), Glass.dp(10, d))
                 setOnClickListener { showFull(row.content) }
                 setOnLongClickListener {
-                    AlertDialog.Builder(act)
-                        .setTitle("删除这条笔记？")
-                        .setPositiveButton("删除") { _, _ -> db.deleteNote(row.id); refresh() }
-                        .setNegativeButton("取消", null)
-                        .show().also { Glass.styleDialog(it, density(act)) }
+                    performHapticFeedback(HapticFeedbackConstants.LONG_PRESS)
+                    confirmDelete(row)
                     true
                 }
+                installPressFeedback(this)
             }
+            card.addView(LinearLayout(act).apply {
+                orientation = LinearLayout.HORIZONTAL
+                gravity = Gravity.CENTER_VERTICAL
+                addView(TextView(act).apply {
+                    text = label
+                    textSize = 11f
+                    setTypeface(null, Typeface.BOLD)
+                    setTextColor(Color.rgb(72, 76, 196))
+                    background = Glass.pillBg(Color.argb(36, 91, 95, 245))
+                    setPadding(Glass.dp(10, d), Glass.dp(4, d), Glass.dp(10, d), Glass.dp(4, d))
+                })
+                addView(TextView(act).apply {
+                    text = "点击查看完整内容"
+                    textSize = 10f
+                    gravity = Gravity.END
+                    setTextColor(Color.argb(145, 34, 34, 34))
+                }, LinearLayout.LayoutParams(0, -2, 1f))
+            }, LinearLayout.LayoutParams(-1, -2))
+            card.addView(TextView(act).apply {
+                text = body.take(180) + if (body.length > 180) "…" else ""
+                textSize = 14f
+                setTextColor(Color.parseColor("#222222"))
+                setLineSpacing(0f, 1.12f)
+                setPadding(0, Glass.dp(10, d), Glass.dp(4, d), Glass.dp(7, d))
+            }, LinearLayout.LayoutParams(-1, -2))
+            card.addView(LinearLayout(act).apply {
+                gravity = Gravity.END or Gravity.CENTER_VERTICAL
+                addView(TextView(act).apply {
+                    text = "删除"
+                    textSize = 12f
+                    setTypeface(null, Typeface.BOLD)
+                    setTextColor(Color.rgb(190, 48, 61))
+                    background = Glass.pillBg(Color.argb(32, 220, 52, 68))
+                    foreground = Glass.pressFx()
+                    isClickable = true
+                    setPadding(Glass.dp(13, d), Glass.dp(6, d), Glass.dp(13, d), Glass.dp(6, d))
+                    setOnClickListener {
+                        performHapticFeedback(HapticFeedbackConstants.KEYBOARD_TAP)
+                        confirmDelete(row)
+                    }
+                })
+            }, LinearLayout.LayoutParams(-1, -2))
             val lp = LinearLayout.LayoutParams(-1, -2)
             lp.topMargin = Glass.dp(12, d)
             listBox.addView(card, lp)
         }
+    }
+
+    private fun confirmDelete(row: NoteRow) {
+        AlertDialog.Builder(act)
+            .setTitle("删除这条笔记？")
+            .setMessage("删除后可在底部提示中撤销。")
+            .setPositiveButton("删除笔记") { _, _ ->
+                db.deleteNote(row.id)
+                refresh()
+                showUndoSnackbar(row)
+            }
+            .setNegativeButton("取消", null)
+            .show().also { Glass.styleDialog(it, density(act)) }
+    }
+
+    private fun showUndoSnackbar(row: NoteRow) {
+        pendingDismiss?.let(mainHandler::removeCallbacks)
+        undoBar?.let(::removeView)
+        val d = density(act)
+        val bar = LinearLayout(act).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            elevation = Glass.dp(14, d).toFloat()
+            background = GradientDrawable().apply {
+                setColor(Color.argb(244, 26, 32, 52))
+                cornerRadius = Glass.dp(18, d).toFloat()
+                setStroke(1, Color.argb(70, 255, 255, 255))
+            }
+            setPadding(Glass.dp(18, d), Glass.dp(12, d), Glass.dp(9, d), Glass.dp(12, d))
+        }
+        bar.addView(TextView(act).apply {
+            text = "笔记已删除"
+            textSize = 14f
+            setTextColor(Color.WHITE)
+        }, LinearLayout.LayoutParams(0, -2, 1f))
+        bar.addView(TextView(act).apply {
+            text = "撤销"
+            textSize = 14f
+            setTypeface(null, Typeface.BOLD)
+            setTextColor(Color.rgb(132, 190, 255))
+            background = Glass.pillBg(Color.argb(34, 132, 190, 255))
+            foreground = Glass.pressFx()
+            isClickable = true
+            setPadding(Glass.dp(14, d), Glass.dp(7, d), Glass.dp(14, d), Glass.dp(7, d))
+            setOnClickListener {
+                pendingDismiss?.let(mainHandler::removeCallbacks)
+                db.addNote(row.bookId, row.kind, row.content)
+                refresh()
+                dismissUndoBar(bar)
+            }
+        })
+        val navigationBottom = ViewCompat.getRootWindowInsets(this)
+            ?.getInsets(WindowInsetsCompat.Type.navigationBars())?.bottom ?: 0
+        val lp = LayoutParams(-1, -2, Gravity.BOTTOM).apply {
+            leftMargin = Glass.dp(16, d)
+            rightMargin = Glass.dp(16, d)
+            bottomMargin = navigationBottom + Glass.dp(18, d)
+        }
+        addView(bar, lp)
+        undoBar = bar
+        bar.alpha = 0f
+        bar.translationY = Glass.dp(20, d).toFloat()
+        bar.animate().alpha(1f).translationY(0f).setDuration(180L).start()
+        pendingDismiss = Runnable { dismissUndoBar(bar) }.also {
+            mainHandler.postDelayed(it, 6_000L)
+        }
+    }
+
+    private fun dismissUndoBar(bar: View) {
+        if (undoBar !== bar) return
+        bar.animate().alpha(0f).translationY(Glass.dp(16, density(act)).toFloat()).setDuration(150L)
+            .withEndAction {
+                if (bar.parent === this) removeView(bar)
+                if (undoBar === bar) undoBar = null
+            }.start()
+    }
+
+    @SuppressLint("ClickableViewAccessibility")
+    private fun installPressFeedback(view: View) {
+        view.setOnTouchListener { target, event ->
+            when (event.actionMasked) {
+                MotionEvent.ACTION_DOWN -> target.animate().scaleX(0.985f).scaleY(0.985f).setDuration(70L).start()
+                MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL ->
+                    target.animate().scaleX(1f).scaleY(1f).setDuration(110L).start()
+            }
+            false
+        }
+    }
+
+    override fun onDetachedFromWindow() {
+        pendingDismiss?.let(mainHandler::removeCallbacks)
+        pendingDismiss = null
+        super.onDetachedFromWindow()
     }
 
     private fun showFull(content: String) {
@@ -206,7 +359,7 @@ class NotesView(private val act: Activity, private val bookId: Long) : FrameLayo
                         "① 核心主题一句话；② 3-5 个关键要点（合并重复内容）；③ 值得记住的金句摘录（如有）；④ 一条行动建议。" +
                         "只输出整理结果。\n\n【笔记开始】\n${body.take(22000)}\n【笔记结束】")
                 db.addNote(bookId, "digest", reply)
-            } catch (t: Throwable) { err = t.message ?: t.toString() }
+            } catch (t: Throwable) { err = AiClient.userFacingError(t) }
             val e = err
             act.runOnUiThread {
                 try { pd.dismiss() } catch (ex: Exception) {}

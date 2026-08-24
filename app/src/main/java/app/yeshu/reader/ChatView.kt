@@ -4,15 +4,18 @@ import android.app.Activity
 import android.graphics.Color
 import android.graphics.Typeface
 import android.graphics.drawable.GradientDrawable
-import android.text.Editable
-import android.text.TextWatcher
 import android.view.Gravity
-import android.view.KeyEvent
+import android.view.ViewGroup
+import android.view.WindowManager
 import android.widget.EditText
 import android.widget.FrameLayout
 import android.widget.LinearLayout
 import android.widget.ScrollView
 import android.widget.TextView
+import androidx.core.view.ViewCompat
+import androidx.core.view.WindowInsetsAnimationCompat
+import androidx.core.view.WindowInsetsCompat
+import kotlin.math.max
 
 /**
  * 与书聊天：带全书上下文的多轮对话伴侣。
@@ -32,6 +35,9 @@ class ChatView(
     private lateinit var etInput: EditText
     private lateinit var btnSend: TextView
     private var busy = false
+    private val scrollToBottomAction = Runnable {
+        if (::sc.isInitialized) sc.fullScroll(ScrollView.FOCUS_DOWN)
+    }
 
     companion object {
         private const val MAX_HISTORY = 12          // 送入模型的轮数上限
@@ -42,7 +48,7 @@ class ChatView(
         setBackgroundColor(Color.parseColor("#10141C"))
         val col = LinearLayout(act).apply { orientation = LinearLayout.VERTICAL }
         addView(col, LayoutParams(-1, -1))
-        applySystemBarInsets(col)
+        act.window.setSoftInputMode(WindowManager.LayoutParams.SOFT_INPUT_ADJUST_RESIZE)
 
         val d = density(act)
         // 顶栏
@@ -112,6 +118,14 @@ class ChatView(
         inputBar.addView(btnSend)
         col.addView(inputBar, LinearLayout.LayoutParams(-1, -2))
 
+        installKeyboardInsets(col)
+        etInput.setOnFocusChangeListener { _, focused ->
+            if (focused) scrollToBottom()
+        }
+        addOnLayoutChangeListener { _, _, _, _, _, _, _, _, _ ->
+            if (etInput.hasFocus()) scrollToBottom()
+        }
+
         loadHistory()
         if (history.isEmpty()) {
             bubble("assistant", "我是这本书的阅读伴侣 📖\n可以问我剧情、人物、难懂的段落，或者让我猜猜后续。")
@@ -159,7 +173,7 @@ class ChatView(
                     )
                 } else "（未配置 AI 服务——去设置页填接口地址和 Key 后再来聊）"
             } catch (e: Exception) {
-                "出错了：${e.message?.take(120)}"
+                "出错了：${AiClient.userFacingError(e)}"
             }
             act.runOnUiThread {
                 busy = false
@@ -221,9 +235,51 @@ class ChatView(
     }
 
     private fun scrollToBottom() {
-        sc.post { sc.fullScroll(ScrollView.FOCUS_DOWN) }
+        sc.removeCallbacks(scrollToBottomAction)
+        sc.post(scrollToBottomAction)
     }
 
-    @Suppress("unused")
-    private fun noop(e: Editable?) {}
+    /** Edge-to-edge 下显式使用 IME inset，避免键盘覆盖输入栏和最后一条消息。 */
+    private fun installKeyboardInsets(content: LinearLayout) {
+        var lastImeBottom = -1
+        ViewCompat.setOnApplyWindowInsetsListener(this) { root, insets ->
+            val systemBars = insets.getInsets(
+                WindowInsetsCompat.Type.statusBars() or
+                    WindowInsetsCompat.Type.displayCutout() or
+                    WindowInsetsCompat.Type.navigationBars()
+            )
+            val navigation = insets.getInsets(WindowInsetsCompat.Type.navigationBars())
+            val ime = insets.getInsets(WindowInsetsCompat.Type.ime())
+            root.setPadding(systemBars.left, systemBars.top, systemBars.right, 0)
+
+            val bottomInset = max(navigation.bottom, ime.bottom)
+            val params = content.layoutParams as ViewGroup.MarginLayoutParams
+            if (params.bottomMargin != bottomInset) {
+                params.bottomMargin = bottomInset
+                content.layoutParams = params
+            }
+            if (ime.bottom != lastImeBottom) {
+                lastImeBottom = ime.bottom
+                if (ime.bottom > 0) scrollToBottom()
+            }
+            insets
+        }
+        ViewCompat.setWindowInsetsAnimationCallback(
+            this,
+            object : WindowInsetsAnimationCompat.Callback(DISPATCH_MODE_CONTINUE_ON_SUBTREE) {
+                override fun onProgress(
+                    insets: WindowInsetsCompat,
+                    runningAnimations: MutableList<WindowInsetsAnimationCompat>
+                ): WindowInsetsCompat {
+                    if (insets.isVisible(WindowInsetsCompat.Type.ime())) scrollToBottom()
+                    return insets
+                }
+
+                override fun onEnd(animation: WindowInsetsAnimationCompat) {
+                    if (etInput.hasFocus()) scrollToBottom()
+                }
+            }
+        )
+        ViewCompat.requestApplyInsets(this)
+    }
 }

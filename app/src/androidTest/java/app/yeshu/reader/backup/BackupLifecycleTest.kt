@@ -3,6 +3,7 @@ package app.yeshu.reader.backup
 import android.content.Context
 import android.net.Uri
 import androidx.test.core.app.ApplicationProvider
+import app.yeshu.reader.CoverStore
 import app.yeshu.reader.Db
 import app.yeshu.reader.data.AiArtifactEntity
 import app.yeshu.reader.data.LibraryItemEntity
@@ -56,7 +57,7 @@ class BackupLifecycleTest {
             .put("books", JSONArray().put(JSONObject()
                 .put("id", 11).put("title", "同一本书").put("fileName", "payload.txt")
                 .put("format", "txt").put("sizeBytes", 7).put("contentHash", "ABC123")
-                .put("totalReadMs", 4321)))
+                .put("totalReadMs", 4321).put("coverSource", "custom")))
             .put("notes", JSONArray().put(JSONObject()
                 .put("id", 21).put("bookId", 11).put("kind", "note")
                 .put("content", "幂等笔记").put("createdAt", 1234)))
@@ -72,7 +73,10 @@ class BackupLifecycleTest {
                 .put(JSONObject().put("key", "ai_key").put("value", "backup-placeholder")))
             .put("readLogs", JSONArray().put(JSONObject().put("day", "2026-08-24").put("ms", 4321)))
             .put("appearance", JSONObject().put("themeMode", "dark").put("showIllustrations", false))
-        val archive = createZip(metadata, mapOf("library/payload.txt" to "content".toByteArray()))
+        val archive = createZip(metadata, mapOf(
+            "library/payload.txt" to "content".toByteArray(),
+            "covers/cover_11.img" to "custom-cover".toByteArray()
+        ))
 
         assertTrue(BackupService.restore(context, Uri.fromFile(archive)).startsWith("恢复完成"))
         assertTrue(BackupService.restore(context, Uri.fromFile(archive)).startsWith("恢复完成"))
@@ -80,6 +84,7 @@ class BackupLifecycleTest {
         val books = dao.listBooks()
         assertEquals(1, books.size)
         assertEquals("abc123", books.single().contentHash)
+        assertTrue(CoverStore.isCustom(context, books.single().id))
         assertEquals(1, dao.listNotes(books.single().id).size)
         assertEquals(1, dao.listArtifacts(books.single().id).size)
         assertEquals(4321L, books.single().totalReadMs)
@@ -110,6 +115,9 @@ class BackupLifecycleTest {
     fun export_excludesOrphansAndNonWhitelistedSettings() {
         val activeId = dao.insertBook(book("active.txt", "active-hash"))
         File(context.filesDir, "active.txt").also { it.writeText("active"); testFiles += it }
+        CoverStore.file(context, activeId).also { it.writeBytes("cover".toByteArray()); testFiles += it }
+        assertTrue(CoverStore.restoreCustomFlag(context, activeId, true))
+        File(context.filesDir, "cover_$activeId.custom").also { testFiles += it }
         dao.addNote(NoteEntity(bookId = activeId, kind = "note", content = "keep", createdAt = 1))
         dao.addNote(NoteEntity(bookId = 99999, kind = "note", content = "orphan", createdAt = 2))
         dao.saveArtifact(artifact(activeId, "keep-hash"))
@@ -133,6 +141,7 @@ class BackupLifecycleTest {
         val settingKeys = (0 until settings.length()).map { settings.getJSONObject(it).getString("key") }.toSet()
         assertEquals(setOf("reader_font_sp", "ai_model"), settingKeys)
         assertEquals(1234L, root.getJSONArray("books").getJSONObject(0).getLong("totalReadMs"))
+        assertEquals("custom", root.getJSONArray("books").getJSONObject(0).getString("coverSource"))
         assertEquals(1234L, root.getJSONArray("readLogs").getJSONObject(0).getLong("ms"))
         assertEquals("light", root.getJSONObject("appearance").getString("themeMode"))
         assertFalse(root.getJSONObject("appearance").getBoolean("showIllustrations"))
@@ -237,7 +246,7 @@ class BackupLifecycleTest {
 
     private fun cleanupRestoreFiles() {
         context.filesDir.listFiles()
-            ?.filter { it.name.startsWith("restore_") }
+            ?.filter { it.name.startsWith("restore_") || it.name.startsWith("cover_") }
             ?.forEach { it.deleteRecursively() }
     }
 }

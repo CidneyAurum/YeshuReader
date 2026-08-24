@@ -41,6 +41,7 @@ class ShelfView(private val act: Activity) : FrameLayout(act) {
     private val selected = mutableSetOf<Long>()
     private var multiBar: LinearLayout? = null
     private var multiCountTv: TextView? = null
+    private var pendingCoverBookId = -1L
 
     init {
         val d = density(act)
@@ -74,7 +75,7 @@ class ShelfView(private val act: Activity) : FrameLayout(act) {
             letterSpacing = 0.02f
         })
         titleCol.addView(TextView(act).apply {
-            text = "SHUGE READER"
+            text = "YESHU READER"
             textSize = 8.5f
             setTextColor(T.textT)
             setTypeface(null, Typeface.BOLD)
@@ -312,7 +313,7 @@ class ShelfView(private val act: Activity) : FrameLayout(act) {
                 i.type = "*/*"
                 act.startActivityForResult(i, Glass.REQ_BOOK)
             }
-            .item("folder", "新建文件夹") { newFolderDialog() }
+            .item("folder", "新建分类") { newFolderDialog() }
             .show()
     }
 
@@ -485,7 +486,7 @@ class ShelfView(private val act: Activity) : FrameLayout(act) {
                     }
                     .setNegativeButton("永久删除") { _, _ ->
                         File(act.filesDir, book.fileName).delete()
-                        CoverStore.file(act, book.id).delete()
+                        CoverStore.delete(act, book.id)
                         db.purgeBook(book.id)
                         refresh()
                     }
@@ -513,12 +514,128 @@ class ShelfView(private val act: Activity) : FrameLayout(act) {
         }
     }
 
+    private fun enterFolder(folderId: Long) {
+        val destination = if (folderId == 0L || db.getFolder(folderId) != null) folderId else 0L
+        curFolder = destination
+        val hadQuery = ::etSearch.isInitialized && etSearch.text?.isNotBlank() == true
+        if (hadQuery) {
+            // TextWatcher refreshes synchronously after the current folder has changed.
+            etSearch.setText("")
+            etSearch.clearFocus()
+        } else {
+            refresh()
+        }
+    }
+
+    /** Root + clickable path segments + an explicit current-level create action. */
+    private fun folderNavigator(d: Float): View {
+        val path = db.folderPath(curFolder)
+        val row = LinearLayout(act).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            background = GradientDrawable().apply {
+                cornerRadius = Glass.dp(T.rCard, d).toFloat()
+                setColor(T.surface)
+            }
+            setPadding(Glass.dp(8, d), Glass.dp(7, d), Glass.dp(8, d), Glass.dp(7, d))
+        }
+
+        if (curFolder != 0L) {
+            row.addView(TextView(act).apply {
+                text = "‹"
+                textSize = 25f
+                gravity = Gravity.CENTER
+                setTextColor(T.textP)
+                background = Glass.pressFx()
+                contentDescription = "返回上一级"
+                setOnClickListener { enterFolder(db.getFolder(curFolder)?.parentId ?: 0L) }
+            }, LinearLayout.LayoutParams(Glass.dp(38, d), Glass.dp(38, d)))
+        }
+
+        val pathRow = LinearLayout(act).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+        }
+        fun addSegment(label: String, folderId: Long, active: Boolean) {
+            if (pathRow.childCount > 0) {
+                pathRow.addView(TextView(act).apply {
+                    text = "›"
+                    textSize = 16f
+                    setTextColor(T.textT)
+                    gravity = Gravity.CENTER
+                }, LinearLayout.LayoutParams(Glass.dp(22, d), Glass.dp(34, d)))
+            }
+            pathRow.addView(TextView(act).apply {
+                text = label
+                textSize = 13f
+                maxLines = 1
+                ellipsize = android.text.TextUtils.TruncateAt.END
+                gravity = Gravity.CENTER
+                setTextColor(if (active) Color.WHITE else T.textS)
+                setTypeface(null, if (active) Typeface.BOLD else Typeface.NORMAL)
+                background = GradientDrawable().apply {
+                    cornerRadius = Glass.dp(11, d).toFloat()
+                    setColor(if (active) T.accent else Color.TRANSPARENT)
+                }
+                setPadding(Glass.dp(11, d), 0, Glass.dp(11, d), 0)
+                setOnClickListener { if (!active) enterFolder(folderId) }
+            }, LinearLayout.LayoutParams(-2, Glass.dp(34, d)))
+        }
+        addSegment("根目录", 0L, curFolder == 0L)
+        path.forEachIndexed { index, folder ->
+            addSegment(folder.name, folder.id, index == path.lastIndex)
+        }
+
+        val scroller = android.widget.HorizontalScrollView(act).apply {
+            isHorizontalScrollBarEnabled = false
+            addView(pathRow, LayoutParams(-2, -1))
+            post { fullScroll(android.view.View.FOCUS_RIGHT) }
+        }
+        row.addView(scroller, LinearLayout.LayoutParams(0, Glass.dp(38, d), 1f))
+        row.addView(TextView(act).apply {
+            text = "+ 分类"
+            textSize = 12f
+            setTextColor(T.accent)
+            setTypeface(null, Typeface.BOLD)
+            gravity = Gravity.CENTER
+            background = Glass.pillBg(Color.argb(32, 91, 95, 245))
+            setPadding(Glass.dp(12, d), 0, Glass.dp(12, d), 0)
+            setOnClickListener { newFolderDialog() }
+        }, LinearLayout.LayoutParams(-2, Glass.dp(36, d)).also {
+            it.marginStart = Glass.dp(7, d)
+        })
+        return row
+    }
+
+    /**
+     * Refresh-time fallback for imports whose background extraction had not finished yet.
+     * Successful detection invalidates the placeholder immediately; known misses are cached by
+     * CoverStore and therefore do not repeatedly parse a large PDF/EPUB.
+     */
+    private fun ensureAutomaticCover(book: Book) {
+        if (CoverStore.hasCover(act, book.id)) return
+        val source = File(act.filesDir, book.fileName)
+        if (!source.isFile) return
+        CoverStore.ensureAutoAsync(act, book.id, source, book.format) { generated ->
+            if (!generated || !isAttachedToWindow) return@ensureAutoAsync
+            val query = etSearch.text?.toString()?.trim()?.takeIf { it.isNotEmpty() }
+            refresh(query)
+        }
+    }
+
     fun refresh(query: String? = null) {
         val d = density(act)
         listBox.removeAllViews()
+        // A folder can disappear after restoring a backup or deleting it from another screen.
+        // Never leave the shelf stranded on an invalid level.
+        if (curFolder != 0L && db.getFolder(curFolder) == null) curFolder = 0L
         val searching = !query.isNullOrBlank()
         val rawBooks = if (searching) db.searchBooks(query) else db.listBooks(curFolder)
-        val subs = if (searching) emptyList() else db.listFolders(curFolder)
+        val subs = if (searching) {
+            db.allFolders().filter { it.name.contains(query.orEmpty(), ignoreCase = true) }
+        } else {
+            db.listFolders(curFolder)
+        }
 
         // 排序：最近阅读(默认) / 标题 / 加入时间
         val sortMode = db.getSetting("shelf_sort") ?: "recent"
@@ -536,6 +653,7 @@ class ShelfView(private val act: Activity) : FrameLayout(act) {
             "added" -> filtered.sortedByDescending { it.addedAt }
             else -> filtered.sortedByDescending { it.lastReadAt }
         }
+        books.forEach(::ensureAutomaticCover)
 
         // 筛选 chips（非搜索时显示）
         if (!searching && filterRow != null && filterHost != null) {
@@ -571,39 +689,19 @@ class ShelfView(private val act: Activity) : FrameLayout(act) {
         val sortLabel = when (sortMode) { "title" -> "标题"; "added" -> "加入"; else -> "最近" }
         statTv.text = buildString {
             append("${books.size} 本书")
-            if (subs.isNotEmpty()) append(" · ${subs.size} 个文件夹")
+            if (subs.isNotEmpty()) append(" · ${subs.size} 个分类")
             if (!searching && readingN > 0) append(" · 在读 $readingN")
             if (!searching && finishedN > 0) append(" · 已读完 $finishedN")
         }
         sortBtn.text = "排序：$sortLabel"
         segWrap.visibility = if (searching) View.GONE else View.VISIBLE
 
-        // 面包屑导航行（子目录内显示）
-        if (curFolder != 0L && !searching) {
-            val path = db.folderPath(curFolder).joinToString(" / ") { it.name }
-            val crumb = LinearLayout(act).apply {
-                orientation = LinearLayout.HORIZONTAL
-                gravity = Gravity.CENTER_VERTICAL
-                background = Glass.pillBg(Color.argb(70, 255, 255, 255))
-                setPadding(Glass.dp(14, d), Glass.dp(8, d), Glass.dp(16, d), Glass.dp(8, d))
-                addView(TextView(act).apply {
-                    text = "‹ 上级"
-                    textSize = 13f
-                    setTextColor(Color.WHITE)
-                    setTypeface(null, Typeface.BOLD)
-                })
-                addView(TextView(act).apply {
-                    text = "  $path"
-                    textSize = 13f
-                    setTextColor(Color.argb(220, 255, 255, 255))
-                    maxLines = 1
-                    ellipsize = android.text.TextUtils.TruncateAt.MIDDLE
-                }, LinearLayout.LayoutParams(0, -2, 1f))
-                setOnClickListener { curFolder = db.getFolder(curFolder)?.parentId ?: 0L; refresh() }
-            }
-            val cp0 = LinearLayout.LayoutParams(-1, -2)
-            cp0.setMargins(0, Glass.dp(4, d), 0, 0)
-            listBox.addView(crumb, cp0)
+        // Current-level navigator. Every segment is clickable, so a deep hierarchy never
+        // requires repeatedly backing out one level at a time.
+        if (!searching) {
+            listBox.addView(folderNavigator(d), LinearLayout.LayoutParams(-1, -2).also {
+                it.setMargins(0, Glass.dp(4, d), 0, 0)
+            })
         }
 
         // 「最近在读」横滑条：仅根目录非搜索时展示
@@ -611,6 +709,7 @@ class ShelfView(private val act: Activity) : FrameLayout(act) {
             val recent = db.listBooks().filter { it.progress > 0.005f }
                 .sortedByDescending { it.lastReadAt }
                 .take(6)
+            recent.forEach(::ensureAutomaticCover)
             if (recent.isNotEmpty()) {
                 val sec = LinearLayout(act).apply {
                     orientation = LinearLayout.VERTICAL
@@ -738,7 +837,7 @@ class ShelfView(private val act: Activity) : FrameLayout(act) {
                     addView(TextView(act).apply {
                         text = buildString {
                             append("$childBooks 本书")
-                            if (childFolders > 0) append(" · $childFolders 个文件夹")
+                            if (childFolders > 0) append(" · $childFolders 个子分类")
                         }
                         textSize = 12f
                         setTextColor(T.textS)
@@ -756,19 +855,19 @@ class ShelfView(private val act: Activity) : FrameLayout(act) {
                     }
                     false
                 }
-                setOnClickListener { curFolder = f.id; refresh() }
+                setOnClickListener { enterFolder(f.id) }
                 setOnLongClickListener {
                     val options = arrayOf("打开", "重命名", "移动到…", "删除")
                     AlertDialog.Builder(act)
                         .setTitle("📁 ${f.name}")
                         .setItems(options) { _, which ->
                             when (which) {
-                                0 -> { curFolder = f.id; refresh() }
+                                0 -> enterFolder(f.id)
                                 1 -> renameFolderDialog(f)
                                 2 -> moveDialog(targetFolder = f.id)
                                 3 -> AlertDialog.Builder(act)
-                                    .setTitle("删除文件夹")
-                                    .setMessage("删除「${f.name}」？其中的书和子文件夹会移到上一级。")
+                                    .setTitle("删除分类")
+                                    .setMessage("删除「${f.name}」？其中的书和子分类会移到上一级。")
                                     .setPositiveButton("删除") { _, _ ->
                                         db.deleteFolder(f.id); refresh()
                                     }
@@ -788,8 +887,8 @@ class ShelfView(private val act: Activity) : FrameLayout(act) {
         if (books.size == 0) {
             if (subs.isEmpty()) {
                 val hint = when {
-                    searching -> Glass.emptyState(act, "🔍", "没有匹配的书", "搜索会查找所有文件夹中的书")
-                    else -> Glass.emptyState(act, "📚", "这里还没有书", "点右上 + 导入书籍\n长按书籍可移动到文件夹")
+                    searching -> Glass.emptyState(act, "🔍", "没有匹配的书或分类", "搜索会查找整个书架")
+                    else -> Glass.emptyState(act, "📚", "这一层还是空的", "导入书籍，或在当前层新建分类")
                 }
                 val hp = LinearLayout.LayoutParams(-1, -2)
                 hp.setMargins(0, Glass.dp(60, d), 0, 0)
@@ -1125,6 +1224,7 @@ class ShelfView(private val act: Activity) : FrameLayout(act) {
             text = "📖 $introText\n\n" +
                    "作者：${b.author.ifBlank { "未填写" }}    收藏：${if (b.favorite) "是" else "否"}\n" +
                    "标签：${b.tags.ifBlank { "未填写" }}\n" +
+                   "封面：${CoverStore.sourceLabel(act, b.id)}\n" +
                    "格式：${b.format.uppercase()}    大小：$kb\n" +
                    "阅读进度：$pct    累计时长：$readLabel\n" +
                    "所在位置：$folderName\n" +
@@ -1193,42 +1293,95 @@ class ShelfView(private val act: Activity) : FrameLayout(act) {
 
     /** 书籍长按操作菜单（列表/网格共用） */
     private fun bookLongPress(b: Book): Boolean {
-        val options = arrayOf(
-            "打开", "详情", if (b.favorite) "取消收藏" else "收藏",
-            "编辑作者与标签", "AI 摘要", "笔记", "移动到…", "导出笔记", "删除"
-        )
+        val actions = mutableListOf<Pair<String, () -> Unit>>()
+        actions += "打开" to { openReader(b.id) }
+        actions += "详情" to { bookDetail(b) }
+        actions += (if (b.favorite) "取消收藏" else "收藏") to {
+            db.setFavorite(b.id, !b.favorite)
+            refresh()
+        }
+        actions += "更换封面（当前：${CoverStore.sourceLabel(act, b.id)}）" to {
+            chooseCustomCover(b)
+        }
+        if (CoverStore.isCustom(act, b.id)) {
+            actions += "恢复自动封面" to { confirmRestoreAutomaticCover(b) }
+        }
+        actions += "编辑作者与标签" to { editMetadata(b) }
+        actions += "AI 摘要" to { aiSummary(b) }
+        actions += "笔记" to { (act as MainActivity).showNotes(b.id) }
+        actions += "移动到…" to { moveDialog(targetBook = b.id) }
+        actions += "导出笔记" to { exportNotes(b) }
+        actions += "删除" to {
+            AlertDialog.Builder(act)
+                .setTitle("删除")
+                .setMessage("将《" + b.title + "》移入回收站？原文件会保留，可恢复。")
+                .setPositiveButton("移入回收站") { _, _ ->
+                    db.deleteBook(b.id)
+                    refresh()
+                }
+                .setNegativeButton("取消", null)
+                .show().also { Glass.styleDialog(it, density(act)) }
+        }
         AlertDialog.Builder(act)
             .setTitle(b.title)
-            .setItems(options) { _, which ->
-                when (which) {
-                    0 -> openReader(b.id)
-                    1 -> bookDetail(b)
-                    2 -> { db.setFavorite(b.id, !b.favorite); refresh() }
-                    3 -> editMetadata(b)
-                    4 -> aiSummary(b)
-                    5 -> (act as MainActivity).showNotes(b.id)
-                    6 -> moveDialog(targetBook = b.id)
-                    7 -> exportNotes(b)
-                    8 -> AlertDialog.Builder(act)
-                        .setTitle("删除")
-                        .setMessage("将《" + b.title + "》移入回收站？原文件会保留，可恢复。")
-                        .setPositiveButton("移入回收站") { _, _ ->
-                            db.deleteBook(b.id)
-                            refresh()
-                        }
-                        .setNegativeButton("取消", null)
-                        .show().also { Glass.styleDialog(it, density(act)) }
-                }
+            .setItems(actions.map { it.first }.toTypedArray()) { _, which ->
+                actions.getOrNull(which)?.second?.invoke()
             }
             .show().also { Glass.styleDialog(it, density(act)) }
         return true
     }
 
-    /** 新建文件夹（建在当前目录） */
+    private fun chooseCustomCover(book: Book) {
+        pendingCoverBookId = book.id
+        val intent = Intent(Intent.ACTION_OPEN_DOCUMENT).apply {
+            addCategory(Intent.CATEGORY_OPENABLE)
+            type = "image/*"
+            addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+        }
+        try {
+            @Suppress("DEPRECATION")
+            act.startActivityForResult(intent, REQ_CUSTOM_COVER)
+        } catch (_: Exception) {
+            pendingCoverBookId = -1L
+            android.widget.Toast.makeText(act, "无法打开图片选择器", android.widget.Toast.LENGTH_SHORT).show()
+        }
+    }
+
+    private fun confirmRestoreAutomaticCover(book: Book) {
+        AlertDialog.Builder(act)
+            .setTitle("恢复自动封面")
+            .setMessage("将移除自定义封面，并重新从原书检测封面；检测不到时使用书架占位封面。")
+            .setPositiveButton("恢复") { _, _ -> restoreAutomaticCover(book) }
+            .setNegativeButton("取消", null)
+            .show().also { Glass.styleDialog(it, density(act)) }
+    }
+
+    private fun restoreAutomaticCover(book: Book) {
+        val source = File(act.filesDir, book.fileName)
+        if (!source.isFile) {
+            android.widget.Toast.makeText(act, "原书文件不存在，无法恢复", android.widget.Toast.LENGTH_SHORT).show()
+            return
+        }
+        android.widget.Toast.makeText(act, "正在重新检测自动封面…", android.widget.Toast.LENGTH_SHORT).show()
+        Thread({
+            val detected = CoverStore.regenerateAutoSync(act.applicationContext, book.id, source, book.format)
+            act.runOnUiThread {
+                refresh(etSearch.text?.toString()?.trim()?.takeIf { it.isNotEmpty() })
+                val message = if (detected) "已恢复自动封面" else "原文件没有可识别封面，已使用占位封面"
+                android.widget.Toast.makeText(act, message, android.widget.Toast.LENGTH_SHORT).show()
+            }
+        }, "yeshu-cover-restore-${book.id}").start()
+    }
+
+    /** 新建分类（固定建在打开对话框时所在的层级）。 */
     private fun newFolderDialog() {
         val d = density(act)
+        val parentAtOpen = curFolder
+        val location = if (parentAtOpen == 0L) "根目录" else {
+            db.folderPath(parentAtOpen).joinToString(" / ") { it.name }.ifBlank { "根目录" }
+        }
         val input = EditText(act).apply {
-            hint = "文件夹名称"
+            hint = "分类名称"
             textSize = 15f
             setTextColor(Color.parseColor("#1C1C1E"))
             background = Glass.pillBg()
@@ -1239,18 +1392,35 @@ class ShelfView(private val act: Activity) : FrameLayout(act) {
             setPadding(Glass.dp(24, d), Glass.dp(8, d), Glass.dp(24, d), 0)
             addView(input, LayoutParams(-1, -2))
         }
-        AlertDialog.Builder(act)
-            .setTitle("新建文件夹")
+        val dialog = AlertDialog.Builder(act)
+            .setTitle("新建分类")
+            .setMessage("创建位置：$location")
             .setView(wrap)
-            .setPositiveButton("创建") { _, _ ->
-                val name = input.text.toString().trim()
-                if (name.isNotEmpty()) { db.addFolder(name, curFolder); refresh() }
-            }
+            .setPositiveButton("创建", null)
             .setNegativeButton("取消", null)
-            .show().also {
-                Glass.styleDialog(it, d)
-                it.window?.let { w -> w.setSoftInputMode(android.view.WindowManager.LayoutParams.SOFT_INPUT_STATE_VISIBLE) }
+            .create()
+        dialog.setOnShowListener {
+            Glass.styleDialog(dialog, d)
+            dialog.getButton(AlertDialog.BUTTON_POSITIVE).setOnClickListener {
+                val name = input.text.toString().trim()
+                when {
+                    name.isEmpty() -> input.error = "请输入分类名称"
+                    db.listFolders(parentAtOpen).any { it.name.equals(name, ignoreCase = true) } ->
+                        input.error = "当前层已有同名分类"
+                    else -> {
+                        db.addFolder(name, parentAtOpen)
+                        dialog.dismiss()
+                        if (curFolder == parentAtOpen) refresh()
+                    }
+                }
             }
+            input.requestFocus()
+            dialog.window?.setSoftInputMode(
+                android.view.WindowManager.LayoutParams.SOFT_INPUT_ADJUST_RESIZE or
+                    android.view.WindowManager.LayoutParams.SOFT_INPUT_STATE_ALWAYS_VISIBLE
+            )
+        }
+        dialog.show()
     }
 
     private fun renameFolderDialog(f: Folder) {
@@ -1267,62 +1437,220 @@ class ShelfView(private val act: Activity) : FrameLayout(act) {
             setPadding(Glass.dp(24, d), Glass.dp(8, d), Glass.dp(24, d), 0)
             addView(input, LayoutParams(-1, -2))
         }
-        AlertDialog.Builder(act)
-            .setTitle("重命名文件夹")
+        val dialog = AlertDialog.Builder(act)
+            .setTitle("重命名分类")
             .setView(wrap)
-            .setPositiveButton("保存") { _, _ ->
-                val name = input.text.toString().trim()
-                if (name.isNotEmpty()) { db.renameFolder(f.id, name); refresh() }
-            }
+            .setPositiveButton("保存", null)
             .setNegativeButton("取消", null)
-            .show().also { Glass.styleDialog(it, d) }
+            .create()
+        dialog.setOnShowListener {
+            Glass.styleDialog(dialog, d)
+            dialog.getButton(AlertDialog.BUTTON_POSITIVE).setOnClickListener {
+                val name = input.text.toString().trim()
+                when {
+                    name.isEmpty() -> input.error = "请输入分类名称"
+                    db.listFolders(f.parentId).any { it.id != f.id && it.name.equals(name, ignoreCase = true) } ->
+                        input.error = "同一层已有同名分类"
+                    else -> {
+                        db.renameFolder(f.id, name)
+                        dialog.dismiss()
+                        refresh()
+                    }
+                }
+            }
+        }
+        dialog.show()
     }
 
     /**
-     * 移动对话框：树形缩进列出所有可选目标。
-     * targetBook 非空 = 移动书；targetFolder 非空 = 移动文件夹（跳过自身及子孙防环）。
+     * 移动对话框：逐层浏览分类，避免深层目录被压缩成难以点击的缩进长列表。
+     * targetBook 非空 = 移动书；targetFolder 非空 = 移动分类（跳过自身及子孙防环）。
      */
     private fun moveDialog(targetBook: Long = -1, targetFolder: Long = -1, bookIds: Set<Long> = emptySet()) {
         val d = density(act)
-        data class Node(val id: Long, val label: String)
-        val nodes = mutableListOf(Node(0L, "📂 根目录"))
-        fun walk(parent: Long, depth: Int) {
-            for (f in db.listFolders(parent)) {
-                if (targetFolder == f.id) continue          // 自身不可选
-                if (targetFolder > 0 && db.isSelfOrDescendant(targetFolder, f.id)) continue // 子孙防环
-                nodes.add(Node(f.id, "　".repeat(depth) + "📁 " + f.name))
-                walk(f.id, depth + 1)
-            }
-        }
-        walk(0L, 0)
-
         val title = when {
             bookIds.isNotEmpty() -> "${bookIds.size} 本书"
             targetBook > 0 -> db.getBook(targetBook)?.title ?: return
-            else -> "📁 " + (db.getFolder(targetFolder)?.name ?: "")
+            else -> "分类「" + (db.getFolder(targetFolder)?.name ?: return) + "」"
         }
 
-        AlertDialog.Builder(act)
-            .setTitle("移动「$title」到…")
-            .setItems(nodes.map { it.label }.toTypedArray()) { _, which ->
-                val dest = nodes[which].id
+        val sourceParent = when {
+            targetFolder > 0 -> db.getFolder(targetFolder)?.parentId ?: 0L
+            targetBook > 0 -> db.getBook(targetBook)?.folderId ?: curFolder
+            else -> curFolder
+        }
+        var browsing = sourceParent.takeIf { it == 0L || db.getFolder(it) != null } ?: 0L
+        val destinationText = TextView(act).apply {
+            textSize = 13f
+            setTextColor(T.textS)
+            setPadding(Glass.dp(4, d), 0, Glass.dp(4, d), Glass.dp(8, d))
+        }
+        val pathScroller = android.widget.HorizontalScrollView(act).apply {
+            isHorizontalScrollBarEnabled = false
+        }
+        val folderList = LinearLayout(act).apply { orientation = LinearLayout.VERTICAL }
+        val body = LinearLayout(act).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(Glass.dp(20, d), Glass.dp(8, d), Glass.dp(20, d), Glass.dp(4, d))
+            addView(destinationText, LinearLayout.LayoutParams(-1, -2))
+            addView(pathScroller, LinearLayout.LayoutParams(-1, Glass.dp(42, d)))
+            addView(android.widget.ScrollView(act).apply {
+                addView(folderList, LayoutParams(-1, -2))
+            }, LinearLayout.LayoutParams(-1, Glass.dp(300, d)))
+        }
+
+        fun allowed(folderId: Long): Boolean = targetFolder <= 0L ||
+            !db.isSelfOrDescendant(targetFolder, folderId)
+
+        fun renderLevel() {
+            val path = db.folderPath(browsing)
+            destinationText.text = "目标位置：" + if (path.isEmpty()) {
+                "根目录"
+            } else {
+                "根目录 / " + path.joinToString(" / ") { it.name }
+            }
+
+            val pathRow = LinearLayout(act).apply {
+                orientation = LinearLayout.HORIZONTAL
+                gravity = Gravity.CENTER_VERTICAL
+            }
+            fun pathButton(label: String, id: Long, active: Boolean): TextView = TextView(act).apply {
+                text = label
+                textSize = 13f
+                gravity = Gravity.CENTER
+                setTextColor(if (active) Color.WHITE else T.textS)
+                setTypeface(null, if (active) Typeface.BOLD else Typeface.NORMAL)
+                background = GradientDrawable().apply {
+                    cornerRadius = Glass.dp(10, d).toFloat()
+                    setColor(if (active) T.accent else T.surface2)
+                }
+                setPadding(Glass.dp(12, d), 0, Glass.dp(12, d), 0)
+                setOnClickListener {
+                    browsing = id
+                    renderLevel()
+                }
+            }
+            pathRow.addView(pathButton("根目录", 0L, browsing == 0L),
+                LinearLayout.LayoutParams(-2, Glass.dp(34, d)))
+            path.forEachIndexed { index, folder ->
+                pathRow.addView(TextView(act).apply {
+                    text = "›"
+                    textSize = 16f
+                    setTextColor(T.textT)
+                    gravity = Gravity.CENTER
+                }, LinearLayout.LayoutParams(Glass.dp(24, d), Glass.dp(34, d)))
+                pathRow.addView(pathButton(folder.name, folder.id, index == path.lastIndex),
+                    LinearLayout.LayoutParams(-2, Glass.dp(34, d)))
+            }
+            pathScroller.removeAllViews()
+            pathScroller.addView(pathRow, LayoutParams(-2, -1))
+            pathScroller.post { pathScroller.fullScroll(android.view.View.FOCUS_RIGHT) }
+
+            folderList.removeAllViews()
+            val children = db.listFolders(browsing).filter { allowed(it.id) }
+            if (browsing != 0L) {
+                folderList.addView(TextView(act).apply {
+                    text = "‹  返回上一级"
+                    textSize = 14f
+                    setTextColor(T.accent)
+                    gravity = Gravity.CENTER_VERTICAL
+                    background = Glass.pressFx()
+                    setPadding(Glass.dp(12, d), 0, Glass.dp(12, d), 0)
+                    setOnClickListener {
+                        browsing = db.getFolder(browsing)?.parentId ?: 0L
+                        renderLevel()
+                    }
+                }, LinearLayout.LayoutParams(-1, Glass.dp(48, d)))
+            }
+            children.forEach { folder ->
+                folderList.addView(LinearLayout(act).apply {
+                    orientation = LinearLayout.HORIZONTAL
+                    gravity = Gravity.CENTER_VERTICAL
+                    background = Glass.pressFx()
+                    setPadding(Glass.dp(12, d), 0, Glass.dp(8, d), 0)
+                    addView(IconView(act, "folder", 18), LinearLayout.LayoutParams(
+                        Glass.dp(24, d), Glass.dp(24, d)))
+                    addView(TextView(act).apply {
+                        text = folder.name
+                        textSize = 15f
+                        setTextColor(T.textP)
+                        maxLines = 1
+                        ellipsize = android.text.TextUtils.TruncateAt.END
+                    }, LinearLayout.LayoutParams(0, -2, 1f).also {
+                        it.marginStart = Glass.dp(10, d)
+                    })
+                    addView(IconView(act, "chevron", 15))
+                    setOnClickListener {
+                        browsing = folder.id
+                        renderLevel()
+                    }
+                }, LinearLayout.LayoutParams(-1, Glass.dp(52, d)))
+            }
+            if (children.isEmpty()) {
+                folderList.addView(TextView(act).apply {
+                    text = "没有子分类，可直接移到当前位置"
+                    textSize = 13f
+                    setTextColor(T.textT)
+                    gravity = Gravity.CENTER
+                }, LinearLayout.LayoutParams(-1, Glass.dp(72, d)))
+            }
+        }
+
+        val dialog = AlertDialog.Builder(act)
+            .setTitle("移动「$title」")
+            .setView(body)
+            .setPositiveButton("移到这里", null)
+            .setNegativeButton("取消", null)
+            .create()
+        dialog.setOnShowListener {
+            Glass.styleDialog(dialog, d)
+            dialog.getButton(AlertDialog.BUTTON_POSITIVE).setOnClickListener {
+                val dest = browsing
                 if (bookIds.isNotEmpty()) {
                     bookIds.forEach { db.moveBook(it, dest) }
                     selected.clear()
                     updateMultiCount()
-                }
-                else if (targetBook > 0) db.moveBook(targetBook, dest)
+                } else if (targetBook > 0) db.moveBook(targetBook, dest)
                 else db.moveFolderTo(targetFolder, dest)
+                dialog.dismiss()
                 refresh()
             }
-            .setNegativeButton("取消", null)
-            .show().also { Glass.styleDialog(it, d) }
+        }
+        renderLevel()
+        dialog.show()
     }
 
     fun handleResult(req: Int, data: Intent?) {
+        if (req == REQ_CUSTOM_COVER) {
+            val bookId = pendingCoverBookId
+            pendingCoverBookId = -1L
+            val selected = data?.data
+            if (bookId > 0 && selected != null) importCustomCover(bookId, selected)
+            return
+        }
         val uri: Uri = data?.data ?: return
         if (req == Glass.REQ_BG) importBackground(uri)
         else if (req == Glass.REQ_BOOK) importBook(uri)
+    }
+
+    private fun importCustomCover(bookId: Long, uri: Uri) {
+        val book = db.getBook(bookId)
+        if (book == null) {
+            android.widget.Toast.makeText(act, "这本书已不在书架中", android.widget.Toast.LENGTH_SHORT).show()
+            return
+        }
+        android.widget.Toast.makeText(act, "正在处理封面…", android.widget.Toast.LENGTH_SHORT).show()
+        Thread({
+            val saved = CoverStore.saveCustom(act.applicationContext, bookId, uri)
+            act.runOnUiThread {
+                if (saved) {
+                    refresh(etSearch.text?.toString()?.trim()?.takeIf { it.isNotEmpty() })
+                    android.widget.Toast.makeText(act, "《${book.title}》封面已更新", android.widget.Toast.LENGTH_SHORT).show()
+                } else {
+                    android.widget.Toast.makeText(act, "无法读取这张图片，请选择 JPG、PNG 或 WebP", android.widget.Toast.LENGTH_LONG).show()
+                }
+            }
+        }, "yeshu-cover-custom-$bookId").start()
     }
 
     private fun importBackground(uri: Uri) {
@@ -1438,5 +1766,10 @@ class ShelfView(private val act: Activity) : FrameLayout(act) {
 
     private fun openReader(id: Long) {
         (act as MainActivity).openReader(id)
+    }
+
+    private companion object {
+        // Must not collide with Glass.REQ_SETTINGS (103), which MainActivity intercepts first.
+        const val REQ_CUSTOM_COVER = 104
     }
 }

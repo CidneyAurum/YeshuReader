@@ -10,6 +10,8 @@ data class ProviderPreset(
 
 object AiProviders {
     val presets = listOf(
+        ProviderPreset("compatible", "兼容接口", "", ""),
+        ProviderPreset("tokenrhythm", "基元律动", "https://tokenrhythm.studio/v1", "deepseek-v4-flash"),
         ProviderPreset("deepseek", "DeepSeek", "https://api.deepseek.com", "deepseek-v4-flash"),
         ProviderPreset("openai", "OpenAI", "https://api.openai.com/v1", "gpt-4.1-mini", "gpt-4.1-mini"),
         ProviderPreset("qwen", "通义千问", "https://dashscope.aliyuncs.com/compatible-mode/v1", "qwen-plus", "qwen-vl-max"),

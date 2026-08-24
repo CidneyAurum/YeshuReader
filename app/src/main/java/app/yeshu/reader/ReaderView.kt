@@ -45,13 +45,22 @@ class ReaderView(
         private const val PDF_DEFAULT_PAGE_RATIO = 1.4142f
         private const val PDF_SIZE_SCAN_BATCH = 12
 
-        // 阅读配色（微信读书/Apple Books 式暖纸与低眩光夜色）
-        val PAPER_BG = Color.argb(235, 247, 241, 227)      // 日间：羊皮纸
-        val PAPER_TEXT = Color.parseColor("#2B2620")       // 日间正文墨色（暖黑）
-        val PAPER_HEAD = Color.parseColor("#8A4B2A")       // 日间标题（赭棕）
-        val NIGHT_BG = Color.argb(255, 19, 19, 20)         // 夜间：#131314 防 OLED 拖影
-        val NIGHT_TEXT = Color.parseColor("#C8CBCF")
-        val NIGHT_HEAD = Color.parseColor("#E8A87C")       // 夜间标题（暖橙，低刺激）
+        // 三套阅读配色：背景、正文和标题必须作为一个主题整体切换。
+        val LIGHT_BG = Color.parseColor("#F7F8FB")
+        val LIGHT_TEXT = Color.parseColor("#20232A")
+        val LIGHT_HEAD = Color.parseColor("#4055B8")
+        val PAPER_BG = Color.parseColor("#F4EDDE")
+        val PAPER_TEXT = Color.parseColor("#312B24")
+        val PAPER_HEAD = Color.parseColor("#8A4B2A")
+        val NIGHT_BG = Color.parseColor("#111318")
+        val NIGHT_TEXT = Color.parseColor("#D7DAE2")
+        val NIGHT_HEAD = Color.parseColor("#AAB7FF")
+    }
+
+    private enum class ReaderTheme(val key: String, val title: String, val subtitle: String) {
+        LIGHT("light", "浅色", "清爽白底，适合明亮环境"),
+        PAPER("paper", "纸张", "暖米色，适合长时间阅读"),
+        DARK("dark", "深色", "低眩光，适合夜间阅读")
     }
 
     private val db = Db(act)
@@ -77,7 +86,7 @@ class ReaderView(
     private var documentBar: android.view.View? = null
     private var bottomBar: android.view.View? = null
     private var progBar: android.view.View? = null
-    private var nightCell: FrameLayout? = null
+    private var themeCell: FrameLayout? = null
     private var barsHidden = false
 
     /** 点正文呼出/隐藏工具栏（iBooks 式沉浸阅读） */
@@ -106,7 +115,7 @@ class ReaderView(
         }
     }
     private var styleSp = 17f
-    private var styleNight = false
+    private var readerTheme = ReaderTheme.PAPER
 
     // PDF 惰性渲染状态
     private var pdfRenderer: PdfRenderer? = null
@@ -235,6 +244,133 @@ class ReaderView(
         }
     }
 
+    private fun loadReaderTheme() {
+        val explicit = db.getSetting("reader_theme")
+            ?.let { key -> ReaderTheme.entries.firstOrNull { it.key == key } }
+        readerTheme = explicit ?: run {
+            val followsSystem = db.getSetting("night_follow_sys") == "1"
+            val systemDark =
+                (act.resources.configuration.uiMode and android.content.res.Configuration.UI_MODE_NIGHT_MASK) ==
+                    android.content.res.Configuration.UI_MODE_NIGHT_YES
+            when {
+                followsSystem && systemDark -> ReaderTheme.DARK
+                db.getSetting("night_mode") == "1" -> ReaderTheme.DARK
+                else -> ReaderTheme.PAPER
+            }
+        }
+    }
+
+    private fun themeBackground(theme: ReaderTheme = readerTheme): Int = when (theme) {
+        ReaderTheme.LIGHT -> LIGHT_BG
+        ReaderTheme.PAPER -> PAPER_BG
+        ReaderTheme.DARK -> NIGHT_BG
+    }
+
+    private fun themeText(theme: ReaderTheme = readerTheme): Int = when (theme) {
+        ReaderTheme.LIGHT -> LIGHT_TEXT
+        ReaderTheme.PAPER -> PAPER_TEXT
+        ReaderTheme.DARK -> NIGHT_TEXT
+    }
+
+    private fun themeHeading(theme: ReaderTheme = readerTheme): Int = when (theme) {
+        ReaderTheme.LIGHT -> LIGHT_HEAD
+        ReaderTheme.PAPER -> PAPER_HEAD
+        ReaderTheme.DARK -> NIGHT_HEAD
+    }
+
+    /** PDF 与图片本身不改色，只让画布边缘跟随阅读主题。 */
+    private fun themeStage(theme: ReaderTheme = readerTheme): Int = when (theme) {
+        ReaderTheme.LIGHT -> Color.parseColor("#DDE1E8")
+        ReaderTheme.PAPER -> Color.parseColor("#C9BEAA")
+        ReaderTheme.DARK -> Color.parseColor("#24272E")
+    }
+
+    /** 深色半透明渐变 + 细描边；模糊后的壁纸透出时形成稳定的毛玻璃层次。 */
+    private fun chromeSurface(radiusDp: Int, alpha: Int = 224): android.graphics.drawable.GradientDrawable {
+        val d = density(act)
+        return android.graphics.drawable.GradientDrawable(
+            android.graphics.drawable.GradientDrawable.Orientation.TL_BR,
+            intArrayOf(
+                Color.argb(alpha, 29, 33, 48),
+                Color.argb((alpha - 12).coerceAtLeast(0), 11, 14, 24)
+            )
+        ).apply {
+            cornerRadius = Glass.dp(radiusDp, d).toFloat()
+            setStroke(Glass.dp(1, d), Color.argb(52, 255, 255, 255))
+        }
+    }
+
+    private fun chromeChip(selected: Boolean): android.graphics.drawable.GradientDrawable {
+        val d = density(act)
+        return android.graphics.drawable.GradientDrawable(
+            android.graphics.drawable.GradientDrawable.Orientation.LEFT_RIGHT,
+            if (selected) {
+                intArrayOf(Color.parseColor("#CC5B5FF5"), Color.parseColor("#B56D55E8"))
+            } else {
+                intArrayOf(Color.argb(22, 255, 255, 255), Color.argb(10, 255, 255, 255))
+            }
+        ).apply {
+            cornerRadius = Glass.dp(14, d).toFloat()
+            setStroke(
+                Glass.dp(1, d),
+                if (selected) Color.argb(92, 210, 218, 255) else Color.argb(20, 255, 255, 255)
+            )
+        }
+    }
+
+    private fun themeIcon(theme: ReaderTheme = readerTheme): String = when (theme) {
+        ReaderTheme.LIGHT -> "sun"
+        ReaderTheme.PAPER -> "book"
+        ReaderTheme.DARK -> "moon"
+    }
+
+    private fun renderToolCell(
+        container: FrameLayout,
+        icon: String? = null,
+        glyph: String? = null,
+        label: String,
+        accent: Boolean = false
+    ) {
+        val d = density(act)
+        container.removeAllViews()
+        val primary = if (accent) Color.parseColor("#B7C0FF") else Color.parseColor("#F4F5FA")
+        val inner = LinearLayout(act).apply {
+            orientation = LinearLayout.VERTICAL
+            gravity = Gravity.CENTER
+            importantForAccessibility = View.IMPORTANT_FOR_ACCESSIBILITY_NO
+        }
+        if (icon != null) {
+            inner.addView(
+                IconView(act, icon, 19, primary),
+                LinearLayout.LayoutParams(Glass.dp(21, d), Glass.dp(21, d))
+            )
+        } else {
+            inner.addView(TextView(act).apply {
+                text = glyph.orEmpty()
+                textSize = 15f
+                gravity = Gravity.CENTER
+                setTextColor(primary)
+                setTypeface(null, Typeface.BOLD)
+            }, LinearLayout.LayoutParams(-2, Glass.dp(21, d)))
+        }
+        inner.addView(TextView(act).apply {
+            text = label
+            textSize = 9.5f
+            gravity = Gravity.CENTER
+            setTextColor(if (accent) Color.parseColor("#AAB5FF") else Color.parseColor("#AEB4C2"))
+            setTypeface(null, if (accent) Typeface.BOLD else Typeface.NORMAL)
+        }, LinearLayout.LayoutParams(-2, Glass.dp(17, d)))
+        container.addView(inner, FrameLayout.LayoutParams(-1, -1, Gravity.CENTER))
+    }
+
+    private fun refreshThemeCell() {
+        themeCell?.let { cell ->
+            cell.background = chromeChip(selected = true)
+            cell.contentDescription = "阅读主题：${readerTheme.title}"
+            renderToolCell(cell, icon = themeIcon(), label = readerTheme.title, accent = true)
+        }
+    }
+
     private fun setup(book: Book) {
         val d = density(act)
         // 统一使用 reader_brightness，兼容读取一次旧键后立即清理。
@@ -252,6 +388,8 @@ class ReaderView(
         bookFormat = book.format.ifBlank { DocParser.detect(book.fileName) }
         // 兜底：早期版本把 PDF 误存为 txt，按扩展名纠正
         if (bookFormat != "pdf" && book.fileName.lowercase().endsWith(".pdf")) bookFormat = "pdf"
+        styleSp = db.getSetting("reader_font_sp")?.toFloatOrNull()?.coerceIn(12f, 26f) ?: 17f
+        loadReaderTheme()
 
         val root = FrameLayout(act)
         val iv = ImageView(act).apply {
@@ -281,42 +419,44 @@ class ReaderView(
         addView(root, LayoutParams(-1, -1))
         applySystemBarInsets(col)
 
-        // 顶栏
+        // 顶栏：紧凑悬浮玻璃条，左右等宽使书名真正居中。
         val top = LinearLayout(act).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER_VERTICAL
-            background = Glass.darkCard()
-            setPadding(Glass.dp(16, d), Glass.dp(12, d), Glass.dp(16, d), Glass.dp(12, d))
+            background = chromeSurface(radiusDp = 20)
+            elevation = Glass.dp(8, d).toFloat()
+            setPadding(Glass.dp(7, d), Glass.dp(6, d), Glass.dp(7, d), Glass.dp(6, d))
         }
         val back = FrameLayout(act).apply {
-            background = Glass.iconBg()
+            background = android.graphics.drawable.GradientDrawable().apply {
+                shape = android.graphics.drawable.GradientDrawable.OVAL
+                setColor(Color.argb(35, 255, 255, 255))
+                setStroke(Glass.dp(1, d), Color.argb(42, 255, 255, 255))
+            }
             foreground = Glass.pressFx()
             contentDescription = "返回书架"
-            layoutParams = LinearLayout.LayoutParams(Glass.dp(48, d), Glass.dp(48, d))
-            addView(IconView(act, "back", 22), FrameLayout.LayoutParams(Glass.dp(24, d), Glass.dp(24, d), Gravity.CENTER))
+            layoutParams = LinearLayout.LayoutParams(Glass.dp(40, d), Glass.dp(40, d))
+            addView(IconView(act, "back", 20), FrameLayout.LayoutParams(Glass.dp(22, d), Glass.dp(22, d), Gravity.CENTER))
             setOnClickListener { saveProgress(); closePdf(); (act as MainActivity).showShelf() }
         }
         top.addView(back)
-        // 字号/主题状态（供底部工具条用）
-        val fontSp = db.getSetting("reader_font_sp")?.toFloatOrNull() ?: 17f
-        val night = db.getSetting("night_mode") == "1"
         // 居中书名 + 当前章节副标题（滚动联动）
         val titleTv = TextView(act).apply {
             text = book.title
-            textSize = 18f
-            setTextColor(Color.WHITE)
+            textSize = 16f
+            setTextColor(Color.parseColor("#F7F8FC"))
             setTypeface(null, Typeface.BOLD)
-            maxLines = 1
-            ellipsize = android.text.TextUtils.TruncateAt.MIDDLE
-            gravity = Gravity.CENTER
-        }
-        val curHeadTv = TextView(act).apply {
-            textSize = 11f
-            setTextColor(Color.argb(200, 255, 255, 255))
             maxLines = 1
             ellipsize = android.text.TextUtils.TruncateAt.END
             gravity = Gravity.CENTER
-            visibility = View.GONE
+        }
+        val curHeadTv = TextView(act).apply {
+            text = book.author.ifBlank { "继续阅读" }
+            textSize = 10f
+            setTextColor(Color.parseColor("#AEB4C2"))
+            maxLines = 1
+            ellipsize = android.text.TextUtils.TruncateAt.END
+            gravity = Gravity.CENTER
         }
         val titleCol = LinearLayout(act).apply {
             orientation = LinearLayout.VERTICAL
@@ -325,27 +465,32 @@ class ReaderView(
             addView(curHeadTv, LinearLayout.LayoutParams(-2, -2).also { it.topMargin = Glass.dp(1, d) })
         }
         top.addView(titleCol, LinearLayout.LayoutParams(0, -2, 1f))
-        col.addView(top, LayoutParams(-1, -2))
+        top.addView(View(act), LinearLayout.LayoutParams(Glass.dp(40, d), Glass.dp(40, d)))
+        col.addView(top, LayoutParams(-1, -2).also { lp ->
+            lp.setMargins(Glass.dp(10, d), Glass.dp(6, d), Glass.dp(10, d), Glass.dp(5, d))
+        })
 
         // 文档二层工作台：普通书籍可停留在阅读，资料可进入目录、AI 与笔记。
         val documentTabs = LinearLayout(act).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER_VERTICAL
-            background = Glass.darkCard()
-            setPadding(Glass.dp(10, d), Glass.dp(5, d), Glass.dp(10, d), Glass.dp(7, d))
+            background = chromeSurface(radiusDp = 18, alpha = 210)
+            elevation = Glass.dp(5, d).toFloat()
+            setPadding(Glass.dp(5, d), Glass.dp(4, d), Glass.dp(5, d), Glass.dp(4, d))
         }
         fun documentTab(label: String, selected: Boolean = false, onClick: () -> Unit) =
             TextView(act).apply {
                 text = label
-                textSize = 13f
+                textSize = 12f
                 gravity = Gravity.CENTER
-                setTextColor(Color.WHITE)
+                setTextColor(if (selected) Color.WHITE else Color.parseColor("#B8BECC"))
                 setTypeface(null, if (selected) Typeface.BOLD else Typeface.NORMAL)
-                background = if (selected) Glass.pillBg(Color.argb(175, 91, 95, 245)) else Glass.iconBg()
+                background = chromeChip(selected)
+                foreground = Glass.pressFx()
                 contentDescription = label
-                layoutParams = LinearLayout.LayoutParams(0, Glass.dp(48, d), 1f).also {
-                    it.marginStart = Glass.dp(3, d)
-                    it.marginEnd = Glass.dp(3, d)
+                layoutParams = LinearLayout.LayoutParams(0, Glass.dp(38, d), 1f).also {
+                    it.marginStart = Glass.dp(2, d)
+                    it.marginEnd = Glass.dp(2, d)
                 }
                 setOnClickListener { onClick() }
             }
@@ -354,11 +499,16 @@ class ReaderView(
             documentTabs.addView(documentTab("目录") { listToc() })
             documentTabs.addView(documentTab("AI") { showAiMenu() })
             documentTabs.addView(documentTab("笔记") { (act as MainActivity).showNotes(bookId) })
-            col.addView(documentTabs, LayoutParams(-1, -2))
+            col.addView(documentTabs, LayoutParams(-1, -2).also { lp ->
+                lp.setMargins(Glass.dp(10, d), 0, Glass.dp(10, d), Glass.dp(6, d))
+            })
             documentBar = documentTabs
         }
 
-        val sv = ScrollView(act)
+        val sv = ScrollView(act).apply {
+            isFillViewport = true
+            setBackgroundColor(if (bookFormat == "pdf" || isImageFormat(bookFormat)) themeStage() else themeBackground())
+        }
         col.addView(sv, LinearLayout.LayoutParams(-1, 0, 1f))
         sc = sv
 
@@ -378,11 +528,11 @@ class ReaderView(
             sv.addView(err, LayoutParams(-1, -2))
         }
 
-        // 阅读进度细条（底部工具条上方）
+        // 阅读进度细条（底部工具坞上方）
         val prog = Glass.progressTrack(act)
         progBar = prog
-        col.addView(prog, LayoutParams(-1, Glass.dp(4, d)).also { lp ->
-            lp.setMargins(Glass.dp(14, d), Glass.dp(6, d), Glass.dp(14, d), Glass.dp(3, d))
+        col.addView(prog, LayoutParams(-1, Glass.dp(2, d)).also { lp ->
+            lp.setMargins(Glass.dp(22, d), Glass.dp(5, d), Glass.dp(22, d), Glass.dp(3, d))
         })
         fun updProg() {
             val child = sv.getChildAt(0) ?: return
@@ -429,60 +579,53 @@ class ReaderView(
             }
         }
 
-        // 底部玻璃工具条：搜索 / 目录 / 亮度 / 字号 / 夜间
+        // 底部悬浮工具坞：图标 + 短标签减少猜测，主题作为高层级入口常驻。
         val bottom = LinearLayout(act).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER_VERTICAL
-            background = Glass.darkCard()
-            setPadding(Glass.dp(10, d), Glass.dp(6, d), Glass.dp(10, d), Glass.dp(6, d))
+            background = chromeSurface(radiusDp = 23)
+            elevation = Glass.dp(10, d).toFloat()
+            setPadding(Glass.dp(5, d), Glass.dp(5, d), Glass.dp(5, d), Glass.dp(5, d))
         }
         topBar = top
         bottomBar = bottom
-        fun toolCell(icon: String?, label: String? = null, description: String = label.orEmpty(), onClick: () -> Unit): FrameLayout {
+        fun toolCell(
+            icon: String? = null,
+            glyph: String? = null,
+            label: String,
+            description: String = label,
+            onClick: () -> Unit
+        ): FrameLayout {
             val cell = FrameLayout(act).apply {
-                layoutParams = LinearLayout.LayoutParams(0, Glass.dp(48, d), 1f)
+                layoutParams = LinearLayout.LayoutParams(0, Glass.dp(52, d), 1f).also {
+                    it.marginStart = Glass.dp(1, d)
+                    it.marginEnd = Glass.dp(1, d)
+                }
                 foreground = Glass.pressFx()
                 contentDescription = description
                 setOnClickListener { onClick() }
             }
-            val inner: View = if (icon != null) IconView(act, icon, 22) else TextView(act).apply {
-                text = label
-                textSize = 16f
-                gravity = Gravity.CENTER
-                setTextColor(Color.WHITE)
-                setTypeface(null, Typeface.BOLD)
-            }
-            inner.importantForAccessibility = View.IMPORTANT_FOR_ACCESSIBILITY_NO
-            cell.addView(inner, FrameLayout.LayoutParams(
-                Glass.dp(if (icon != null) 24 else 44, d), Glass.dp(30, d), Gravity.CENTER))
+            renderToolCell(cell, icon = icon, glyph = glyph, label = label)
             return cell
         }
-        fun refreshNightIcon(container: FrameLayout, night: Boolean) {
-            container.removeAllViews()
-            container.addView(IconView(act, if (night) "sun" else "moon", 22).apply {
-                importantForAccessibility = View.IMPORTANT_FOR_ACCESSIBILITY_NO
-            },
-                FrameLayout.LayoutParams(Glass.dp(24, d), Glass.dp(24, d), Gravity.CENTER))
+        bottom.addView(toolCell(icon = "search", label = "搜索", description = "书内搜索") { searchInBook() })
+        bottom.addView(toolCell(icon = "list", label = "目录", description = "文档目录") { listToc() })
+        val tc = toolCell(icon = themeIcon(), label = readerTheme.title, description = "选择阅读主题") {
+            showThemePicker()
         }
-        bottom.addView(toolCell("search", description = "书内搜索") { searchInBook() })
-        bottom.addView(toolCell("list", description = "文档目录") { listToc() })
-        bottom.addView(toolCell("bulb", description = "阅读亮度") { brightnessDialog() })
-        val dec = toolCell(null, "A−", "减小字号") { applyFontSp(styleSp - 1f) }
+        themeCell = tc
+        refreshThemeCell()
+        bottom.addView(tc)
+        bottom.addView(toolCell(icon = "bulb", label = "亮度", description = "阅读亮度") { brightnessDialog() })
+        val dec = toolCell(glyph = "A−", label = "缩小", description = "减小字号") { applyFontSp(styleSp - 1f) }
         setupRepeatable(dec) { applyFontSp(styleSp - 1f) }
         bottom.addView(dec)
-        val nc = FrameLayout(act).apply {
-            layoutParams = LinearLayout.LayoutParams(0, Glass.dp(48, d), 1f)
-            foreground = Glass.pressFx()
-            contentDescription = if (styleNight) "切换日间阅读主题" else "切换夜间阅读主题"
-            setOnClickListener { applyNight(!styleNight) }
-        }
-        refreshNightIcon(nc, styleNight)
-        nightCell = nc
-        bottom.addView(nc)
-        val inc = toolCell(null, "A+", "增大字号") { applyFontSp(styleSp + 1f) }
+        val inc = toolCell(glyph = "A+", label = "放大", description = "增大字号") { applyFontSp(styleSp + 1f) }
         setupRepeatable(inc) { applyFontSp(styleSp + 1f) }
         bottom.addView(inc)
-        col.addView(bottom, LayoutParams(-1, -2))
+        col.addView(bottom, LayoutParams(-1, -2).also { lp ->
+            lp.setMargins(Glass.dp(10, d), Glass.dp(2, d), Glass.dp(10, d), Glass.dp(8, d))
+        })
     }
 
     /** 长按连发：按下 380ms 后每 130ms 重复执行；长按后的 click 被吞掉防双重 */
@@ -519,16 +662,6 @@ class ReaderView(
 
     private fun setupBlocks(f: File, sv: ScrollView) {
         val d = density(act)
-        styleSp = db.getSetting("reader_font_sp")?.toFloatOrNull() ?: 17f
-        // 夜间：跟随系统深色模式优先于手动开关
-        val followSys = db.getSetting("night_follow_sys") == "1"
-        styleNight = if (followSys) {
-            (act.resources.configuration.uiMode and android.content.res.Configuration.UI_MODE_NIGHT_MASK) ==
-                android.content.res.Configuration.UI_MODE_NIGHT_YES
-        } else {
-            db.getSetting("night_mode") == "1"
-        }
-        val boxBg = if (styleNight) NIGHT_BG else PAPER_BG
         val doc = DocParser.parseText(f)
         docBlocks = doc.blocks
         tocHeads = doc.blocks.mapIndexedNotNull { i, b ->
@@ -537,7 +670,7 @@ class ReaderView(
         docFullText = doc.fullText
         val box = LinearLayout(act).apply {
             orientation = LinearLayout.VERTICAL
-            setBackgroundColor(boxBg)
+            setBackgroundColor(themeBackground())
             setPadding(0, Glass.dp(14, d), 0, 0)
         }
         boxRef = box
@@ -575,7 +708,7 @@ class ReaderView(
             tv.text = b.text
             tv.textSize = styleSp + 4f
             tv.setTypeface(null, Typeface.BOLD)
-            tv.setTextColor(if (styleNight) NIGHT_HEAD else PAPER_HEAD)
+            tv.setTextColor(themeHeading())
             tv.setLineSpacing(Glass.dp(3, d).toFloat(), 1.15f)
             tv.setPadding(Glass.dp(20, d), Glass.dp(26, d), Glass.dp(20, d), Glass.dp(10, d))
             // 标题同样参与沉浸切换
@@ -583,7 +716,7 @@ class ReaderView(
         } else {
             tv.text = b.text
             tv.textSize = styleSp
-            tv.setTextColor(if (styleNight) NIGHT_TEXT else PAPER_TEXT)
+            tv.setTextColor(themeText())
             // 成熟阅读器共识：1.38 倍行距最舒适
             tv.setLineSpacing(0f, 1.38f)
             tv.setPadding(Glass.dp(20, d), Glass.dp(6, d), Glass.dp(20, d), Glass.dp(6, d))
@@ -609,29 +742,121 @@ class ReaderView(
         }
     }
 
-    /** 就地切换夜间模式：重刷正文颜色与底色 */
-    private fun applyNight(night: Boolean) {
-        if (bookFormat == "pdf" || pdfRenderer != null) return
-        styleNight = night
-        db.setSetting("night_mode", if (night) "1" else "0")
-        nightCell?.let { nc ->
-            nc.removeAllViews()
-            val d = density(act)
-            nc.addView(IconView(act, if (night) "sun" else "moon", 22),
-                FrameLayout.LayoutParams(Glass.dp(24, d), Glass.dp(24, d), Gravity.CENTER))
-        }
-        val box = boxRef ?: return
-        box.setBackgroundColor(if (night) NIGHT_BG else PAPER_BG)
-        for (i in 0 until box.childCount) {
-            val v = box.getChildAt(i)
-            if (v is TextView) {
-                if (v.tag == "head") {
-                    v.setTextColor(if (night) NIGHT_HEAD else PAPER_HEAD)
-                } else {
-                    v.setTextColor(if (night) NIGHT_TEXT else PAPER_TEXT)
+    /** 三套主题即时切换：正文背景、正文文字和标题同时刷新。 */
+    private fun applyReaderTheme(theme: ReaderTheme) {
+        readerTheme = theme
+        db.setSetting("reader_theme", theme.key)
+        db.setSetting("night_mode", if (theme == ReaderTheme.DARK) "1" else "0")
+        db.setSetting("night_follow_sys", "0")
+        refreshThemeCell()
+
+        val textBox = boxRef
+        if (textBox != null) {
+            textBox.setBackgroundColor(themeBackground())
+            sc?.setBackgroundColor(themeBackground())
+            for (i in 0 until textBox.childCount) {
+                val view = textBox.getChildAt(i)
+                if (view is TextView) {
+                    view.setTextColor(if (view.tag == "head") themeHeading() else themeText())
                 }
             }
+        } else {
+            sc?.setBackgroundColor(themeStage())
+            pdfBody?.setBackgroundColor(themeStage())
+            (sc?.getChildAt(0) as? ImageView)?.setBackgroundColor(themeStage())
         }
+    }
+
+    /** 阅读器专用主题面板，避免系统浅色对话框破坏夜间阅读。 */
+    private fun showThemePicker() {
+        val d = density(act)
+        val dialog = android.app.Dialog(act)
+        val panel = LinearLayout(act).apply {
+            orientation = LinearLayout.VERTICAL
+            background = chromeSurface(radiusDp = 24, alpha = 246)
+            setPadding(Glass.dp(18, d), Glass.dp(18, d), Glass.dp(18, d), Glass.dp(12, d))
+        }
+        panel.addView(TextView(act).apply {
+            text = "阅读主题"
+            textSize = 19f
+            setTextColor(Color.parseColor("#F7F8FC"))
+            setTypeface(null, Typeface.BOLD)
+        }, LinearLayout.LayoutParams(-1, -2))
+        panel.addView(TextView(act).apply {
+            text = "背景与文字会一起切换"
+            textSize = 12f
+            setTextColor(Color.parseColor("#AEB4C2"))
+            setPadding(0, Glass.dp(3, d), 0, Glass.dp(12, d))
+        }, LinearLayout.LayoutParams(-1, -2))
+
+        ReaderTheme.entries.forEach { option ->
+            val selected = option == readerTheme
+            val row = LinearLayout(act).apply {
+                orientation = LinearLayout.HORIZONTAL
+                gravity = Gravity.CENTER_VERTICAL
+                background = chromeChip(selected)
+                foreground = Glass.pressFx()
+                contentDescription = "${option.title}主题：${option.subtitle}"
+                setPadding(Glass.dp(12, d), Glass.dp(8, d), Glass.dp(12, d), Glass.dp(8, d))
+                setOnClickListener {
+                    applyReaderTheme(option)
+                    dialog.dismiss()
+                }
+            }
+            row.addView(View(act).apply {
+                background = android.graphics.drawable.GradientDrawable().apply {
+                    shape = android.graphics.drawable.GradientDrawable.OVAL
+                    setColor(themeBackground(option))
+                    setStroke(Glass.dp(1, d), Color.argb(100, 255, 255, 255))
+                }
+            }, LinearLayout.LayoutParams(Glass.dp(30, d), Glass.dp(30, d)).also {
+                it.marginEnd = Glass.dp(12, d)
+            })
+            val copy = LinearLayout(act).apply {
+                orientation = LinearLayout.VERTICAL
+                addView(TextView(act).apply {
+                    text = option.title
+                    textSize = 14f
+                    setTextColor(Color.parseColor("#F7F8FC"))
+                    setTypeface(null, if (selected) Typeface.BOLD else Typeface.NORMAL)
+                })
+                addView(TextView(act).apply {
+                    text = option.subtitle
+                    textSize = 10.5f
+                    setTextColor(Color.parseColor("#AEB4C2"))
+                })
+            }
+            row.addView(copy, LinearLayout.LayoutParams(0, -2, 1f))
+            row.addView(TextView(act).apply {
+                text = if (selected) "✓" else ""
+                textSize = 18f
+                gravity = Gravity.CENTER
+                setTextColor(Color.parseColor("#B7C0FF"))
+            }, LinearLayout.LayoutParams(Glass.dp(30, d), Glass.dp(30, d)))
+            panel.addView(row, LinearLayout.LayoutParams(-1, Glass.dp(58, d)).also {
+                it.bottomMargin = Glass.dp(7, d)
+            })
+        }
+        panel.addView(TextView(act).apply {
+            text = "取消"
+            textSize = 13f
+            gravity = Gravity.CENTER
+            setTextColor(Color.parseColor("#B8BECC"))
+            background = chromeChip(selected = false)
+            foreground = Glass.pressFx()
+            setOnClickListener { dialog.dismiss() }
+        }, LinearLayout.LayoutParams(-1, Glass.dp(42, d)))
+
+        dialog.setContentView(panel)
+        dialog.setCanceledOnTouchOutside(true)
+        dialog.window?.apply {
+            setBackgroundDrawable(android.graphics.drawable.ColorDrawable(Color.TRANSPARENT))
+            addFlags(android.view.WindowManager.LayoutParams.FLAG_DIM_BEHIND)
+            attributes = attributes.apply { dimAmount = 0.56f }
+        }
+        dialog.show()
+        val available = act.resources.displayMetrics.widthPixels - Glass.dp(32, d)
+        dialog.window?.setLayout(min(available, Glass.dp(420, d)), android.view.ViewGroup.LayoutParams.WRAP_CONTENT)
     }
 
     /** 追加渲染下一块文本（插入到底部留白之前） */
@@ -682,11 +907,11 @@ class ReaderView(
         val image = ImageView(act).apply {
             adjustViewBounds = true
             scaleType = ImageView.ScaleType.FIT_CENTER
-            setBackgroundColor(Color.parseColor("#111827"))
+            setBackgroundColor(themeStage())
             setImageBitmap(bitmap)
             setOnClickListener { toggleBars() }
         }
-        sv.setBackgroundColor(Color.parseColor("#111827"))
+        sv.setBackgroundColor(themeStage())
         sv.addView(image, LayoutParams(-1, -2))
         restoreScroll(sv)
     }
@@ -708,7 +933,7 @@ class ReaderView(
         val d = density(act)
         val box = LinearLayout(act).apply {
             orientation = LinearLayout.VERTICAL
-            setBackgroundColor(Color.parseColor("#525659"))
+            setBackgroundColor(themeStage())
         }
         pdfBody = box
         pageViews = arrayOfNulls(n)
@@ -1661,7 +1886,7 @@ class ReaderView(
         if (flash) {
             // 命中段高亮：金黄停留后渐隐回底色
             v.post {
-                val to = if (styleNight) Color.rgb(19, 19, 20) else Color.rgb(247, 241, 227)
+                val to = themeBackground()
                 v.setBackgroundColor(Color.argb(255, 255, 213, 79))
                 android.animation.ValueAnimator.ofFloat(0f, 1f).apply {
                     duration = 1100

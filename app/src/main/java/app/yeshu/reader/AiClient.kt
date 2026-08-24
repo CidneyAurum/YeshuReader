@@ -99,6 +99,7 @@ object AiClient {
     fun endpointError(c: Config): String? {
         if (c.baseUrl.isBlank()) return "请填写接口地址"
         val uri = runCatching { URI(normalizeBase(c.baseUrl)) }.getOrNull() ?: return "接口地址格式不正确"
+        if (uri.host.isNullOrBlank()) return "接口地址格式不正确"
         if (uri.scheme.equals("https", true)) return null
         if (!uri.scheme.equals("http", true)) return "只支持 HTTPS，或经确认的局域网 HTTP"
         if (!c.allowPrivateHttp) return "HTTP 仅用于本机/局域网服务，请先开启局域网 HTTP"
@@ -144,17 +145,37 @@ object AiClient {
 
     /**
      * 地址规范化：容错用户输入——
-     * 1) 去尾部斜杠；2) 只有域名没有路径时自动补 /v1（OpenAI 惯例）。
+     * 1) 去尾部斜杠；2) 只有域名没有路径时自动补 /v1（OpenAI 惯例）；
+     * 3) 用户误填完整 /chat/completions 或 /models 地址时还原为 API Base URL。
      * 例：https://tokenrhythm.studio → https://tokenrhythm.studio/v1
      */
     fun normalizeBase(raw: String): String {
-        var u = raw.trim()
-        if (!u.startsWith("http", ignoreCase = true)) u = "https://$u"
-        u = u.trimEnd('/')
-        val schemeEnd = u.indexOf("://") + 3
-        val hasPath = u.indexOf('/', schemeEnd) != -1   // host 后还有路径段
-        return if (hasPath) u else "$u/v1"
+        var candidate = raw.trim()
+        if (!candidate.startsWith("http://", true) && !candidate.startsWith("https://", true)) {
+            candidate = "https://$candidate"
+        }
+        val uri = runCatching { URI(candidate) }.getOrNull()
+            ?: return candidate.trimEnd('/')
+        val authority = uri.rawAuthority ?: return candidate.trimEnd('/')
+        var path = uri.rawPath.orEmpty().trimEnd('/')
+        path = when {
+            path.endsWith("/chat/completions", true) -> path.dropLast("/chat/completions".length)
+            path.endsWith("/models", true) -> path.dropLast("/models".length)
+            else -> path
+        }.trimEnd('/')
+        if (path.isBlank()) path = "/v1"
+        val scheme = uri.scheme?.lowercase().orEmpty()
+        return "$scheme://$authority$path"
     }
+
+    internal fun chatCompletionsEndpoint(raw: String): String =
+        normalizeBase(raw).trimEnd('/') + "/chat/completions"
+
+    internal fun modelsEndpoint(raw: String): String =
+        normalizeBase(raw).trimEnd('/') + "/models"
+
+    internal fun authorizationHeader(key: String): String? =
+        key.takeIf { it.isNotBlank() }?.let { "Bearer $it" }
 
     /** Stable scheme/host/port identity used to bind an encrypted key to one provider. */
     fun endpointOrigin(raw: String): String {
@@ -166,28 +187,47 @@ object AiClient {
         return "$scheme://$host:$port"
     }
 
-    /** OpenAI-compatible model discovery. Never logs the Authorization header or response. */
+    /**
+     * OpenAI-compatible model discovery. Never logs the Authorization header or response.
+     * Some compatible providers intentionally omit /models. In that case a minimal chat request
+     * using the user-selected model verifies the actual endpoint instead of reporting a false
+     * connection failure.
+     */
     fun listModels(cfg: Config, timeoutMs: Int = 20_000): List<String> {
         endpointError(cfg)?.let { throw IllegalArgumentException(it) }
-        val conn = URL(normalizeBase(cfg.baseUrl) + "/models").openConnection() as HttpURLConnection
-        return try {
-            conn.instanceFollowRedirects = false
-            conn.requestMethod = "GET"
-            conn.connectTimeout = 10_000
-            conn.readTimeout = timeoutMs
-            if (cfg.key.isNotBlank()) conn.setRequestProperty("Authorization", "Bearer ${cfg.key}")
-            val code = conn.responseCode
-            if (code !in 200..299) throw RuntimeException("HTTP $code")
-            val root = JSONObject(conn.inputStream.use { it.readBytes().toString(Charsets.UTF_8) })
-            val data = root.optJSONArray("data") ?: JSONArray()
-            buildList {
-                for (index in 0 until data.length()) {
-                    data.optJSONObject(index)?.optString("id")?.takeIf { it.isNotBlank() }?.let(::add)
-                }
-            }.distinct().sorted()
-        } finally {
-            conn.disconnect()
+        val discovery = runCatching {
+            val conn = URL(modelsEndpoint(cfg.baseUrl)).openConnection() as HttpURLConnection
+            try {
+                conn.instanceFollowRedirects = false
+                conn.requestMethod = "GET"
+                conn.connectTimeout = 10_000
+                conn.readTimeout = timeoutMs
+                authorizationHeader(cfg.key)?.let { conn.setRequestProperty("Authorization", it) }
+                val code = conn.responseCode
+                if (code !in 200..299) throw RuntimeException("HTTP $code")
+                val response = conn.inputStream.use { it.readBytes().toString(Charsets.UTF_8) }
+                val root = JSONObject(response)
+                val data = root.optJSONArray("data") ?: throw RuntimeException("模型列表格式不兼容")
+                buildList {
+                    for (index in 0 until data.length()) {
+                        data.optJSONObject(index)?.optString("id")?.takeIf { it.isNotBlank() }?.let(::add)
+                    }
+                }.distinct().sorted()
+            } finally {
+                conn.disconnect()
+            }
         }
+        discovery.getOrNull()?.let { return it }
+
+        // Discovery is optional in the OpenAI-compatible ecosystem. Verify chat itself before
+        // surfacing a failure; the custom model name and arbitrary key value are passed unchanged.
+        chat(
+            cfg = cfg,
+            system = null,
+            user = "Reply with OK.",
+            timeoutMs = timeoutMs
+        )
+        return emptyList()
     }
 
     /**
@@ -325,7 +365,7 @@ object AiClient {
         val token = cancellation.get()
         token?.ensureActive()
         endpointError(cfg)?.let { throw IllegalArgumentException(it) }
-        val urlStr = normalizeBase(cfg.baseUrl) + "/chat/completions"
+        val urlStr = chatCompletionsEndpoint(cfg.baseUrl)
         val conn = URL(urlStr).openConnection() as HttpURLConnection
         token?.attach(conn)
         try {
@@ -335,14 +375,18 @@ object AiClient {
             conn.readTimeout = timeoutMs
             conn.doOutput = true
             conn.setRequestProperty("Content-Type", "application/json")
-            if (cfg.key.isNotBlank()) conn.setRequestProperty("Authorization", "Bearer " + cfg.key)
+            authorizationHeader(cfg.key)?.let { conn.setRequestProperty("Authorization", it) }
 
             val body = JSONObject()
                 .put("model", cfg.model)
                 .put("messages", msgs)
-                .put("stream", onDelta != null)
+                // Use Object overload as well as Android's boolean overload; this keeps local JVM
+                // tests compatible with the lightweight org.json implementation on their classpath.
+                .put("stream", (onDelta != null) as Any)
+            val bodyBytes = body.toString().toByteArray(Charsets.UTF_8)
+            conn.setFixedLengthStreamingMode(bodyBytes.size)
             conn.outputStream.use { os ->
-                os.write(body.toString().toByteArray(Charsets.UTF_8))
+                os.write(bodyBytes)
                 os.flush()
             }
 

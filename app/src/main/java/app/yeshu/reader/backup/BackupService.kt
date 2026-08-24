@@ -66,7 +66,8 @@ object BackupService {
                     .put("author", book.author).put("itemType", book.itemType)
                     .put("status", book.status).put("favorite", book.favorite)
                     .put("tags", book.tags).put("contentHash", book.contentHash)
-                    .put("totalReadMs", book.totalReadMs))
+                    .put("totalReadMs", book.totalReadMs)
+                    .put("coverSource", if (CoverStore.isCustom(context, book.id)) "custom" else "auto"))
             }
         })
         root.put("readLogs", JSONArray().apply {
@@ -294,6 +295,10 @@ object BackupService {
                         val cover = CoverStore.file(context, newId)
                         createdFiles += cover
                         stagedCover.copyTo(cover, overwrite = false)
+                        val customCover = item.optString("coverSource") == "custom"
+                        if (CoverStore.restoreCustomFlag(context, newId, customCover) && customCover) {
+                            createdFiles += File(context.filesDir, "cover_$newId.custom")
+                        }
                     }
                     added++
                 }

@@ -4,10 +4,13 @@ import android.graphics.BitmapFactory
 import android.text.format.DateUtils
 import android.view.View
 import androidx.annotation.DrawableRes
+import androidx.compose.animation.core.animateFloatAsState
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.horizontalScroll
+import androidx.compose.foundation.interaction.MutableInteractionSource
+import androidx.compose.foundation.interaction.collectIsPressedAsState
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.BoxWithConstraints
@@ -34,6 +37,7 @@ import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.material3.AssistChip
+import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.ExperimentalMaterial3Api
@@ -44,6 +48,10 @@ import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.OutlinedTextFieldDefaults
 import androidx.compose.material3.Scaffold
+import androidx.compose.material3.SnackbarDuration
+import androidx.compose.material3.SnackbarHost
+import androidx.compose.material3.SnackbarHostState
+import androidx.compose.material3.SnackbarResult
 import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
@@ -61,6 +69,7 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.BiasAlignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.draw.scale
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.ImageBitmap
@@ -68,6 +77,7 @@ import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.graphics.luminance
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalHapticFeedback
 import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.KeyboardType
@@ -76,6 +86,7 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.viewinterop.AndroidView
+import androidx.compose.ui.hapticfeedback.HapticFeedbackType
 import androidx.core.view.WindowCompat
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import app.yeshu.reader.AiClient
@@ -271,7 +282,7 @@ private fun DestinationContent(
     when (destination) {
         Destination.Workbench -> WorkbenchScreen(activity, revision, showIllustrations, onNavigate)
         Destination.Shelf -> LegacyHost(activity) { ShelfView(activity) }
-        Destination.Notes -> NotesHubScreen(activity, revision, onNavigate)
+        Destination.Notes -> NotesHubScreen(activity, revision)
         Destination.Settings -> SettingsScreen(activity)
         Destination.Stats -> LegacyHost(activity) { StatsView(activity) }
         is Destination.Reader -> DocumentWorkbenchScreen(activity, destination.bookId, onNavigate)
@@ -415,7 +426,6 @@ private fun WorkbenchScreen(
                     QuickAction("▦", "打开书架", "日常阅读与管理", ActiveViolet, Modifier.weight(1f)) { onNavigate(Destination.Shelf) }
                 }
             }
-            if (showIllustrations) item { CharacterRibbon() }
             if (recent.isNotEmpty()) {
                 item { SectionHeader("最近内容", "继续小说，或打开刚收到的资料") }
                 item {
@@ -609,72 +619,6 @@ private fun QuickAction(glyph: String, title: String, subtitle: String, accent: 
 }
 
 @Composable
-private fun CharacterRibbon() {
-    val portraits = listOf(
-        Triple(R.drawable.yeshu_art_yellow, Color(0xFFFFC857), -0.40f),
-        Triple(R.drawable.yeshu_art_blue, Color(0xFF5E81D1), -0.40f),
-        Triple(R.drawable.yeshu_art_pink, Color(0xFFFF8FB8), -0.42f),
-        Triple(R.drawable.yeshu_art_red, Color(0xFFE95D64), -0.48f)
-    )
-    GlassPanel(
-        modifier = Modifier.fillMaxWidth(),
-        shape = RoundedCornerShape(30.dp),
-        contentPadding = PaddingValues(15.dp),
-        elevation = 12.dp
-    ) {
-        BoxWithConstraints(Modifier.fillMaxWidth()) {
-            val roomy = maxWidth >= 620.dp
-            if (roomy) {
-                Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
-                    Column(Modifier.width(220.dp)) {
-                        GlassPill(color = ActiveViolet) { Text("书架心情", color = ActiveViolet, fontSize = 10.sp, fontWeight = FontWeight.Bold) }
-                        Spacer(Modifier.height(9.dp))
-                        Text("给阅读留一点颜色", fontWeight = FontWeight.Black, fontSize = 18.sp)
-                        Text("人物只作点缀，内容永远是主角。", fontSize = 11.sp, color = secondaryText())
-                    }
-                    Spacer(Modifier.width(18.dp))
-                    PortraitRow(portraits, Modifier.weight(1f))
-                }
-            } else {
-                Column {
-                    Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
-                        Column(Modifier.weight(1f)) {
-                            Text("给阅读留一点颜色", fontWeight = FontWeight.Black, fontSize = 17.sp)
-                            Text("人物装饰与你的内容分开呈现", fontSize = 10.sp, color = secondaryText())
-                        }
-                        GlassPill(color = ActiveViolet) { Text("书架心情", color = ActiveViolet, fontSize = 10.sp, fontWeight = FontWeight.Bold) }
-                    }
-                    Spacer(Modifier.height(12.dp))
-                    PortraitRow(portraits, Modifier.fillMaxWidth())
-                }
-            }
-        }
-    }
-}
-
-@Composable
-private fun PortraitRow(portraits: List<Triple<Int, Color, Float>>, modifier: Modifier = Modifier) {
-    Row(modifier.horizontalScroll(rememberScrollState()), horizontalArrangement = Arrangement.spacedBy(10.dp)) {
-        portraits.forEach { (resource, accent, verticalBias) ->
-            GlassPanel(
-                modifier = Modifier.width(82.dp).height(96.dp),
-                shape = RoundedCornerShape(24.dp),
-                elevation = 5.dp
-            ) {
-                SampledResourceImage(
-                    resource = resource,
-                    modifier = Modifier.fillMaxSize(),
-                    contentScale = ContentScale.Crop,
-                    sampleSize = 4,
-                    alignment = BiasAlignment(0f, verticalBias)
-                )
-                Box(Modifier.fillMaxSize().background(Brush.verticalGradient(listOf(Color.Transparent, accent.copy(alpha = 0.20f)))))
-            }
-        }
-    }
-}
-
-@Composable
 private fun SampledResourceImage(
     @DrawableRes resource: Int,
     modifier: Modifier,
@@ -746,10 +690,37 @@ private fun SectionHeader(title: String, subtitle: String) {
 }
 
 @Composable
-private fun NotesHubScreen(activity: MainActivity, revision: Int, onNavigate: (Destination) -> Unit) {
+private fun NotesHubScreen(activity: MainActivity, revision: Int) {
     val db = remember { Db(activity) }
-    val notes = remember(revision) { db.recentNotes(80) }
-    val books = remember(revision) { db.listBooks().associateBy { it.id } }
+    var localRevision by remember { mutableStateOf(0) }
+    val notes = remember(revision, localRevision) { db.recentNotes(80) }
+    val books = remember(revision, localRevision) { db.listBooks().associateBy { it.id } }
+    val sourcedNotes = remember(notes, books) {
+        notes.mapNotNull { note -> books[note.bookId]?.let { book -> note to book } }
+    }
+    var pendingDelete by remember { mutableStateOf<app.yeshu.reader.NoteRow?>(null) }
+    val snackbarHostState = remember { SnackbarHostState() }
+    val scope = rememberCoroutineScope()
+
+    fun deleteWithUndo(note: app.yeshu.reader.NoteRow) {
+        pendingDelete = null
+        db.deleteNote(note.id)
+        localRevision++
+        scope.launch {
+            val result = snackbarHostState.showSnackbar(
+                message = "笔记已删除",
+                actionLabel = "撤销",
+                withDismissAction = true,
+                duration = SnackbarDuration.Long
+            )
+            if (result == SnackbarResult.ActionPerformed) {
+                withContext(Dispatchers.IO) {
+                    db.addNote(note.bookId, note.kind, note.content)
+                }
+                localRevision++
+            }
+        }
+    }
 
     BoxWithConstraints(Modifier.fillMaxSize()) {
         val pageWidth = if (maxWidth > 900.dp) 900.dp else maxWidth
@@ -759,7 +730,7 @@ private fun NotesHubScreen(activity: MainActivity, revision: Int, onNavigate: (D
             verticalArrangement = Arrangement.spacedBy(12.dp)
         ) {
             item { ScreenHeader("NOTES", "笔记中枢", "阅读摘记、AI 摘要和问答都汇在这里") }
-            if (notes.isEmpty()) {
+            if (sourcedNotes.isEmpty()) {
                 item {
                     GlassPanel(
                         modifier = Modifier.fillMaxWidth(),
@@ -773,49 +744,129 @@ private fun NotesHubScreen(activity: MainActivity, revision: Int, onNavigate: (D
                                 contentAlignment = Alignment.Center
                             ) { Text("✎", fontSize = 27.sp, color = ElectricBlue) }
                             Spacer(Modifier.height(12.dp))
-                            Text("还没有笔记", fontWeight = FontWeight.Black, fontSize = 18.sp)
-                            Text("打开一本书或资料开始标记", color = secondaryText(), fontSize = 12.sp)
+                            Text("笔记还在等第一句话", fontWeight = FontWeight.Black, fontSize = 18.sp)
+                            Text("打开书籍或资料，摘录重点、生成摘要或记录想法", color = secondaryText(), fontSize = 12.sp)
                         }
                     }
                 }
             } else {
-                items(notes, key = { it.id }) { note ->
-                    val book = books[note.bookId]
-                    GlassPanel(
-                        modifier = Modifier.fillMaxWidth(),
-                        shape = RoundedCornerShape(24.dp),
-                        contentPadding = PaddingValues(17.dp),
-                        elevation = 8.dp,
-                        onClick = { if (book != null) onNavigate(Destination.BookNotes(book.id)) }
-                    ) {
-                        Column {
-                            Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
-                                Text(
-                                    book?.title ?: "已移除的内容",
-                                    modifier = Modifier.weight(1f),
-                                    fontWeight = FontWeight.Bold,
-                                    color = ElectricBlue,
-                                    maxLines = 1,
-                                    overflow = TextOverflow.Ellipsis
-                                )
-                                GlassPill(color = ActiveViolet) {
-                                    Text(note.kind.uppercase(), fontSize = 9.sp, color = ActiveViolet, fontWeight = FontWeight.Bold)
-                                }
-                            }
-                            Spacer(Modifier.height(9.dp))
-                            Text(
-                                note.content.removePrefix("U:").removePrefix("A:"),
-                                maxLines = 3,
-                                overflow = TextOverflow.Ellipsis,
-                                color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.86f)
-                            )
-                        }
+                items(sourcedNotes, key = { it.first.id }) { (note, book) ->
+                    NoteHubCard(
+                        title = book.title,
+                        kind = noteKindLabel(note.kind, note.content),
+                        content = cleanNoteContent(note.content),
+                        onOpen = { activity.openReader(book.id) },
+                        onDelete = { pendingDelete = note }
+                    )
+                }
+            }
+        }
+        SnackbarHost(
+            hostState = snackbarHostState,
+            modifier = Modifier.align(Alignment.BottomCenter).padding(16.dp)
+        )
+    }
+
+    pendingDelete?.let { note ->
+        AlertDialog(
+            onDismissRequest = { pendingDelete = null },
+            title = { Text("删除这条笔记？", fontWeight = FontWeight.Black) },
+            text = { Text("删除后可在底部提示中撤销。") },
+            confirmButton = {
+                TextButton(
+                    onClick = { deleteWithUndo(note) },
+                    colors = ButtonDefaults.textButtonColors(contentColor = MaterialTheme.colorScheme.error)
+                ) { Text("删除笔记", fontWeight = FontWeight.Bold) }
+            },
+            dismissButton = {
+                TextButton(onClick = { pendingDelete = null }) { Text("取消") }
+            }
+        )
+    }
+}
+
+@Composable
+private fun NoteHubCard(
+    title: String,
+    kind: String,
+    content: String,
+    onOpen: () -> Unit,
+    onDelete: () -> Unit
+) {
+    val interactionSource = remember { MutableInteractionSource() }
+    val pressed by interactionSource.collectIsPressedAsState()
+    val cardScale by animateFloatAsState(if (pressed) 0.982f else 1f, label = "note-card-press")
+    val haptics = LocalHapticFeedback.current
+
+    GlassPanel(
+        modifier = Modifier
+            .fillMaxWidth()
+            .scale(cardScale)
+            .clickable(
+                interactionSource = interactionSource,
+                indication = null,
+                onClick = {
+                    haptics.performHapticFeedback(HapticFeedbackType.TextHandleMove)
+                    onOpen()
+                }
+            ),
+        shape = RoundedCornerShape(24.dp),
+        contentPadding = PaddingValues(17.dp),
+        elevation = 8.dp
+    ) {
+        if (pressed) {
+            Box(Modifier.matchParentSize().background(ElectricBlue.copy(alpha = 0.08f)))
+        }
+        Column {
+            Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+                Text(
+                    title,
+                    modifier = Modifier.weight(1f),
+                    fontWeight = FontWeight.Bold,
+                    color = ElectricBlue,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis
+                )
+                GlassPill(color = ActiveViolet) {
+                    Text(kind, fontSize = 10.sp, color = ActiveViolet, fontWeight = FontWeight.Bold)
+                }
+            }
+            Spacer(Modifier.height(9.dp))
+            Text(
+                content,
+                maxLines = 3,
+                overflow = TextOverflow.Ellipsis,
+                color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.86f)
+            )
+            Spacer(Modifier.height(10.dp))
+            Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+                Text("点击打开来源", modifier = Modifier.weight(1f), fontSize = 11.sp, color = secondaryText())
+                TextButton(
+                    onClick = {
+                        haptics.performHapticFeedback(HapticFeedbackType.LongPress)
+                        onDelete()
                     }
+                ) {
+                    Text("删除", color = MaterialTheme.colorScheme.error, fontWeight = FontWeight.Bold)
                 }
             }
         }
     }
 }
+
+private fun noteKindLabel(kind: String, content: String): String = when (kind) {
+    "summary" -> "摘要"
+    "ask" -> "问答"
+    "quiz" -> "自测"
+    "chat" -> if (content.startsWith("U:")) "我的提问" else "AI 回复"
+    "quote" -> "摘录"
+    "digest" -> "精读整理"
+    "report" -> "阅读报告"
+    else -> "笔记"
+}
+
+private fun cleanNoteContent(content: String): String =
+    content.removePrefix("U:").removePrefix("A:").trim()
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable

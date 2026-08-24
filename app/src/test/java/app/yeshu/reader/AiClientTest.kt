@@ -1,14 +1,20 @@
 package app.yeshu.reader
 
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertThrows
 import org.junit.Assert.assertTrue
 import org.junit.Test
 import java.io.ByteArrayInputStream
+import java.io.ByteArrayOutputStream
 import java.lang.reflect.InvocationTargetException
 import java.net.HttpURLConnection
+import java.net.InetAddress
+import java.net.ServerSocket
 import java.net.URL
+import java.util.concurrent.atomic.AtomicReference
+import kotlin.concurrent.thread
 
 class AiClientTest {
 
@@ -30,6 +36,48 @@ class AiClientTest {
             "http://localhost:11434/v1",
             AiClient.normalizeBase("http://localhost:11434/")
         )
+    }
+
+    @Test
+    fun compatibleEndpoints_appendOnceForBaseOrFullChatUrl() {
+        assertEquals(
+            "https://token.example/v1/chat/completions",
+            AiClient.chatCompletionsEndpoint("https://token.example/v1")
+        )
+        assertEquals(
+            "https://token.example/v1/chat/completions",
+            AiClient.chatCompletionsEndpoint("https://token.example/v1/chat/completions/")
+        )
+        assertEquals(
+            "https://token.example/v1/models",
+            AiClient.modelsEndpoint("https://token.example/v1/chat/completions")
+        )
+    }
+
+    @Test
+    fun listModels_fallsBackToChatWithCustomKeyPrefix() {
+        val server = CompatibilityServer()
+
+        try {
+            val customKey = "token_custom_prefix_for_test"
+            val models = AiClient.listModels(
+                AiClient.Config(
+                    baseUrl = "http://127.0.0.1:${server.port}/v1",
+                    key = customKey,
+                    model = "vendor-custom-model",
+                    allowPrivateHttp = true
+                ),
+                timeoutMs = 5_000
+            )
+
+            server.awaitRequests()
+            assertTrue(models.isEmpty())
+            assertEquals("Bearer $customKey", server.modelRequestAuthorization.get())
+            assertEquals("Bearer $customKey", server.chatRequestAuthorization.get())
+            assertTrue("Chat request did not declare a body", server.chatContentLength.get() > 0)
+        } finally {
+            server.close()
+        }
     }
 
     @Test
@@ -93,8 +141,7 @@ class AiClientTest {
             "http://172.32.0.1",
             "http://10.attacker.example",
             "http://127.attacker.example",
-            "http://192.168.attacker.example",
-            "http://10.999.1.1"
+            "http://192.168.attacker.example"
         )
 
         publicEndpoints.forEach { endpoint ->
@@ -104,6 +151,10 @@ class AiClientTest {
                 AiClient.endpointError(config(endpoint, allowPrivateHttp = true))
             )
         }
+        assertEquals(
+            "接口地址格式不正确",
+            AiClient.endpointError(config("http://10.999.1.1", allowPrivateHttp = true))
+        )
     }
 
     @Test
@@ -212,5 +263,80 @@ class AiClientTest {
         override fun disconnect() = Unit
 
         override fun usingProxy() = false
+    }
+
+    private class CompatibilityServer : AutoCloseable {
+        private val socket = ServerSocket(0, 2, InetAddress.getByName("127.0.0.1"))
+        private val failure = AtomicReference<Throwable>()
+        val modelRequestAuthorization = AtomicReference<String>()
+        val chatRequestAuthorization = AtomicReference<String>()
+        val chatContentLength = java.util.concurrent.atomic.AtomicInteger()
+        val port: Int = socket.localPort
+        private val worker = thread(name = "ai-client-test-server", isDaemon = true) {
+            try {
+                repeat(2) { serve(socket.accept()) }
+            } catch (error: Throwable) {
+                if (!socket.isClosed) failure.set(error)
+            }
+        }
+
+        fun awaitRequests() {
+            worker.join(5_000)
+            assertFalse("Timed out waiting for compatibility requests", worker.isAlive)
+            failure.get()?.let { throw AssertionError("Compatibility server failed", it) }
+        }
+
+        private fun serve(client: java.net.Socket) = client.use { connection ->
+            connection.soTimeout = 5_000
+            val input = connection.getInputStream()
+            val headerBytes = ByteArrayOutputStream()
+            var matched = 0
+            val terminator = byteArrayOf('\r'.code.toByte(), '\n'.code.toByte(), '\r'.code.toByte(), '\n'.code.toByte())
+            while (matched < terminator.size) {
+                val value = input.read()
+                if (value < 0) break
+                headerBytes.write(value)
+                matched = if (value.toByte() == terminator[matched]) matched + 1 else 0
+            }
+            val headerLines = headerBytes.toString(Charsets.US_ASCII).lineSequence().toList()
+            val path = headerLines.firstOrNull().orEmpty().split(' ').getOrNull(1).orEmpty()
+            val headers = linkedMapOf<String, String>()
+            headerLines.drop(1).forEach { line ->
+                val separator = line.indexOf(':')
+                if (separator > 0) headers[line.substring(0, separator).lowercase()] = line.substring(separator + 1).trim()
+            }
+            val contentLength = headers["content-length"]?.toIntOrNull() ?: 0
+            input.readNBytes(contentLength)
+
+            val response = if (path == "/v1/models") {
+                modelRequestAuthorization.set(headers["authorization"])
+                HttpResponse(404, "Not Found", ByteArray(0))
+            } else {
+                chatRequestAuthorization.set(headers["authorization"])
+                chatContentLength.set(contentLength)
+                HttpResponse(
+                    200,
+                    "OK",
+                    """{"choices":[{"message":{"content":"OK"}}]}""".toByteArray(Charsets.UTF_8)
+                )
+            }
+            connection.getOutputStream().use { output ->
+                output.write(
+                    ("HTTP/1.1 ${response.code} ${response.reason}\r\n" +
+                        "Content-Type: application/json\r\n" +
+                        "Content-Length: ${response.body.size}\r\n" +
+                        "Connection: close\r\n\r\n").toByteArray(Charsets.US_ASCII)
+                )
+                output.write(response.body)
+                output.flush()
+            }
+        }
+
+        override fun close() {
+            socket.close()
+            worker.join(1_000)
+        }
+
+        private data class HttpResponse(val code: Int, val reason: String, val body: ByteArray)
     }
 }
