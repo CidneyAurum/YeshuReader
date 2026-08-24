@@ -7,6 +7,7 @@ import androidx.datastore.preferences.core.stringPreferencesKey
 import androidx.datastore.preferences.preferencesDataStore
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.catch
+import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.map
 import java.io.IOException
 
@@ -14,6 +15,8 @@ private val Context.yeshuPreferences by preferencesDataStore(name = "yeshu_prefe
 
 /** Non-secret UI preferences. API keys intentionally live only in Android Keystore. */
 class UserPreferences(private val context: Context) {
+    data class Snapshot(val themeMode: String = "system", val showIllustrations: Boolean = true)
+
     val themeMode: Flow<String> = context.yeshuPreferences.data
         .catch { if (it is IOException) emit(androidx.datastore.preferences.core.emptyPreferences()) else throw it }
         .map { it[THEME_MODE] ?: "system" }
@@ -28,6 +31,23 @@ class UserPreferences(private val context: Context) {
 
     suspend fun setShowIllustrations(value: Boolean) {
         context.yeshuPreferences.edit { it[SHOW_ILLUSTRATIONS] = value }
+    }
+
+    suspend fun snapshot(): Snapshot = context.yeshuPreferences.data
+        .catch { if (it is IOException) emit(androidx.datastore.preferences.core.emptyPreferences()) else throw it }
+        .map { preferences ->
+            Snapshot(
+                themeMode = preferences[THEME_MODE]?.takeIf { it in MODES } ?: "system",
+                showIllustrations = preferences[SHOW_ILLUSTRATIONS] ?: true
+            )
+        }
+        .first()
+
+    suspend fun restore(snapshot: Snapshot) {
+        context.yeshuPreferences.edit { preferences ->
+            preferences[THEME_MODE] = snapshot.themeMode.takeIf { it in MODES } ?: "system"
+            preferences[SHOW_ILLUSTRATIONS] = snapshot.showIllustrations
+        }
     }
 
     companion object {

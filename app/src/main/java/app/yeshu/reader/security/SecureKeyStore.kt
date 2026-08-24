@@ -16,26 +16,27 @@ class SecureKeyStore(context: Context) {
 
     fun readApiKey(expectedOrigin: String): String {
         if (expectedOrigin.isBlank()) return ""
-        val payload = prefs.getString(KEY_PAYLOAD, null) ?: return ""
-        val value = runCatching {
-            val parts = payload.split(':', limit = 2)
-            require(parts.size == 2)
-            val cipher = Cipher.getInstance(TRANSFORMATION)
-            cipher.init(
-                Cipher.DECRYPT_MODE,
-                getOrCreateKey(),
-                GCMParameterSpec(128, Base64.decode(parts[0], Base64.NO_WRAP))
-            )
-            cipher.doFinal(Base64.decode(parts[1], Base64.NO_WRAP)).toString(Charsets.UTF_8)
-        }.getOrElse { "" }
-        if (value.isBlank()) return ""
         val storedOrigin = prefs.getString(KEY_ORIGIN, "").orEmpty()
-        if (storedOrigin.isBlank()) {
-            // Bind payloads written by the pre-profile build to the currently configured origin once.
-            prefs.edit().putString(KEY_ORIGIN, expectedOrigin).apply()
-            return value
-        }
-        return value.takeIf { storedOrigin == expectedOrigin }.orEmpty()
+        // An origin-less payload may have come from an older build. Never silently send it to
+        // whichever provider the user happens to configure first; the UI must explicitly bind it.
+        if (storedOrigin.isBlank() || storedOrigin != expectedOrigin) return ""
+        return decryptPayload()
+    }
+
+    fun hasUnboundApiKey(): Boolean =
+        prefs.getString(KEY_PAYLOAD, null).orEmpty().isNotBlank() &&
+            prefs.getString(KEY_ORIGIN, "").orEmpty().isBlank()
+
+    fun hasApiKey(): Boolean = prefs.getString(KEY_PAYLOAD, null).orEmpty().isNotBlank()
+
+    /** Explicit user-confirmed migration for a key whose original provider is unknown. */
+    fun bindUnboundApiKey(origin: String): Boolean {
+        require(origin.isNotBlank()) { "API Key 必须绑定有效的服务地址" }
+        if (!hasUnboundApiKey()) return false
+        val value = decryptPayload()
+        if (value.isBlank()) return false
+        writeApiKey(value, origin)
+        return true
     }
 
     fun writeApiKey(value: String, origin: String) {
@@ -44,6 +45,16 @@ class SecureKeyStore(context: Context) {
             return
         }
         require(origin.isNotBlank()) { "API Key 必须绑定有效的服务地址" }
+        writeEncrypted(value, origin)
+    }
+
+    /** Stores a migrated legacy key without authorizing it for any provider. */
+    fun writeUnboundApiKey(value: String) {
+        if (value.isBlank()) return
+        writeEncrypted(value, "")
+    }
+
+    private fun writeEncrypted(value: String, origin: String) {
         val cipher = Cipher.getInstance(TRANSFORMATION)
         cipher.init(Cipher.ENCRYPT_MODE, getOrCreateKey())
         val encrypted = cipher.doFinal(value.toByteArray(Charsets.UTF_8))
@@ -51,6 +62,19 @@ class SecureKeyStore(context: Context) {
             Base64.encodeToString(encrypted, Base64.NO_WRAP)
         prefs.edit().putString(KEY_PAYLOAD, payload).putString(KEY_ORIGIN, origin).apply()
     }
+
+    private fun decryptPayload(): String = runCatching {
+        val payload = prefs.getString(KEY_PAYLOAD, null) ?: return ""
+        val parts = payload.split(':', limit = 2)
+        require(parts.size == 2)
+        val cipher = Cipher.getInstance(TRANSFORMATION)
+        cipher.init(
+            Cipher.DECRYPT_MODE,
+            getOrCreateKey(),
+            GCMParameterSpec(128, Base64.decode(parts[0], Base64.NO_WRAP))
+        )
+        cipher.doFinal(Base64.decode(parts[1], Base64.NO_WRAP)).toString(Charsets.UTF_8)
+    }.getOrElse { "" }
 
     private fun getOrCreateKey(): SecretKey {
         val store = KeyStore.getInstance("AndroidKeyStore").apply { load(null) }

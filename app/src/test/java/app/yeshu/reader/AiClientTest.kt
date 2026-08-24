@@ -49,23 +49,37 @@ class AiClientTest {
     }
 
     @Test
-    fun endpointError_acceptsLoopbackAndPrivateHttpAfterOptIn() {
+    fun endpointError_acceptsSystemWhitelistedPrivateHttpAfterOptIn() {
         val privateEndpoints = listOf(
             "http://localhost:11434",
             "http://127.0.0.1:8080",
-            "http://10.42.0.5:8080",
-            "http://172.16.0.1:8080",
-            "http://172.31.255.254:8080",
-            "http://192.168.1.2:8080",
-            "http://169.254.1.2:8080",
-            "http://reader.local:8080",
-            "http://[::1]:11434"
+            "http://10.0.2.2:11434",
+            "http://reader.local:8080"
         )
 
         privateEndpoints.forEach { endpoint ->
             assertNull(
                 "Expected private endpoint to be accepted: $endpoint",
                 AiClient.endpointError(config(endpoint, allowPrivateHttp = true))
+            )
+        }
+    }
+
+    @Test
+    fun endpointError_requiresLocalHostnameForLanCleartext() {
+        val privateIpEndpoints = listOf(
+            "http://10.42.0.5:8080",
+            "http://172.16.0.1:8080",
+            "http://172.31.255.254:8080",
+            "http://192.168.1.2:8080",
+            "http://169.254.1.2:8080",
+            "http://[::1]:11434"
+        )
+
+        privateIpEndpoints.forEach { endpoint ->
+            assertTrue(
+                AiClient.endpointError(config(endpoint, allowPrivateHttp = true))
+                    .orEmpty().contains(".local")
             )
         }
     }

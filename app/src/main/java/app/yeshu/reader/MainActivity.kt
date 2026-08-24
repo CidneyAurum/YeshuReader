@@ -112,9 +112,11 @@ class MainActivity : ComponentActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        // Opening Room performs the legacy schema migration; reading the key performs the
-        // one-time plaintext -> Android Keystore migration before any screen can use AI.
-        Db(this).getAiKey()
+        // Room migration and the one-time plaintext -> Keystore migration must not delay the
+        // first Compose frame and keep the Android 12 splash screen visible.
+        lifecycleScope.launch(Dispatchers.IO) {
+            runCatching { Db(applicationContext).getAiKey() }
+        }
         WindowCompat.setDecorFitsSystemWindows(window, false)
         val requestedBook = intent.getStringExtra("bookId")?.toLongOrNull() ?: -1L
         destination = if (requestedBook > 0) Destination.Reader(requestedBook) else Destination.Workbench

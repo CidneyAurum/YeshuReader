@@ -76,18 +76,49 @@ object AiClient {
 
     fun isReady(c: Config): Boolean = c.model.isNotBlank() && endpointError(c) == null
 
+    /** Converts transport/provider failures to safe UI text without echoing response bodies. */
+    fun userFacingError(error: Throwable): String {
+        if (error is CancellationException) return "请求已取消"
+        val message = error.message.orEmpty()
+        if (message.startsWith("HTTP ")) return "服务端拒绝请求（${message.removePrefix("HTTP ").trim()}）"
+        return when (error) {
+            is java.net.SocketTimeoutException -> "连接超时"
+            is java.net.UnknownHostException -> "域名解析失败"
+            is java.io.IOException -> "网络连接失败"
+            else -> message.takeIf { it.isNotBlank() }?.let { safeValidationMessage(it) } ?: "请求失败"
+        }
+    }
+
+    private fun safeValidationMessage(message: String): String = when {
+        message.contains("HTTPS", true) || message.contains("HTTP", true) -> message
+        message.contains("地址", true) -> message
+        message.contains("模型", true) -> message
+        else -> "请求失败"
+    }
+
     fun endpointError(c: Config): String? {
         if (c.baseUrl.isBlank()) return "请填写接口地址"
         val uri = runCatching { URI(normalizeBase(c.baseUrl)) }.getOrNull() ?: return "接口地址格式不正确"
         if (uri.scheme.equals("https", true)) return null
         if (!uri.scheme.equals("http", true)) return "只支持 HTTPS，或经确认的局域网 HTTP"
         if (!c.allowPrivateHttp) return "HTTP 仅用于本机/局域网服务，请先开启局域网 HTTP"
-        return if (isPrivateHost(uri.host.orEmpty())) null else "公网接口必须使用 HTTPS"
+        val host = uri.host.orEmpty()
+        if (isAllowedCleartextHost(host)) return null
+        return if (isPrivateNetworkHost(host)) {
+            "局域网 HTTP 请使用 .local 主机名；系统仅放行 localhost、10.0.2.2 与 .local"
+        } else {
+            "公网接口必须使用 HTTPS"
+        }
     }
 
-    private fun isPrivateHost(host: String): Boolean {
+    private fun isAllowedCleartextHost(host: String): Boolean {
         val value = host.lowercase().removePrefix("[").removeSuffix("]")
-        if (value == "localhost" || value == "::1" || value.endsWith(".local")) return true
+        return value == "localhost" || value == "127.0.0.1" || value == "10.0.2.2" ||
+            value.endsWith(".local")
+    }
+
+    private fun isPrivateNetworkHost(host: String): Boolean {
+        val value = host.lowercase().removePrefix("[").removeSuffix("]")
         val parts = value.split('.')
         if (parts.size == 4) {
             val octets = parts.map { it.toIntOrNull() ?: return false }
@@ -162,7 +193,7 @@ object AiClient {
     /**
      * 同步调用（调用方负责放子线程）。返回 assistant 回复文本。
      * onDelta 非空时走流式请求并逐段回调（打字机效果）；服务端不支持时自动回退一次性解析。
-     * 失败抛 RuntimeException，message 含 HTTP 状态与响应片段。
+     * 失败抛 RuntimeException；HTTP 错误仅暴露状态码，不回显服务端响应正文。
      */
     fun chat(
         cfg: Config,
@@ -317,8 +348,9 @@ object AiClient {
 
             val code = conn.responseCode
             if (code !in 200..299) {
-                val err = conn.errorStream?.use { it.readBytes().toString(Charsets.UTF_8) } ?: ""
-                throw RuntimeException("HTTP $code ${err.take(300)}")
+                // Do not surface provider response bodies: proxies sometimes echo request
+                // diagnostics, authorization data, or other sensitive material.
+                throw RuntimeException("HTTP $code")
             }
 
             if (onDelta == null) {

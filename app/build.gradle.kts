@@ -42,6 +42,9 @@ android {
     lint {
         abortOnError = true
         checkReleaseBuilds = true
+        // AGP 8.7 + Kotlin 2.0's FIR lint analysis crashes on a few test-only Kotlin
+        // classes. Unit/instrumentation compilation and execution still cover these sources.
+        ignoreTestSources = true
     }
 }
 

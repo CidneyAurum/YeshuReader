@@ -1,7 +1,9 @@
 package app.yeshu.reader.ui
 
+import android.graphics.BitmapFactory
 import android.text.format.DateUtils
 import android.view.View
+import androidx.annotation.DrawableRes
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
@@ -48,6 +50,7 @@ import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.CompositionLocalProvider
 import androidx.compose.runtime.DisposableEffect
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.SideEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
@@ -60,8 +63,11 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.ImageBitmap
+import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.graphics.luminance
 import androidx.compose.ui.layout.ContentScale
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.KeyboardType
@@ -90,6 +96,12 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 
 private data class TopDestination(val label: String, val glyph: String, val destination: Destination)
+
+private data class WorkbenchSnapshot(
+    val books: List<LibraryItem>,
+    val noteCount: Int,
+    val minutes: Long
+)
 
 private val topDestinations = listOf(
     TopDestination("工作台", "⌂", Destination.Workbench),
@@ -125,7 +137,12 @@ fun YeshuApp(
             if (topLevel && wide) {
                 Row(Modifier.fillMaxSize()) {
                     SideDock(destination = destination, onNavigate = onNavigate)
-                    Box(Modifier.weight(1f)) {
+                    Box(
+                        Modifier
+                            .weight(1f)
+                            .statusBarsPadding()
+                            .navigationBarsPadding()
+                    ) {
                         DestinationContent(activity, destination, libraryRevision, showIllustrations, onNavigate)
                     }
                 }
@@ -354,17 +371,30 @@ private fun WorkbenchScreen(
     showIllustrations: Boolean,
     onNavigate: (Destination) -> Unit
 ) {
-    val db = remember { Db(activity) }
-    val books = remember(revision) { db.listBooks() }
+    var snapshot by remember { mutableStateOf<WorkbenchSnapshot?>(null) }
+    LaunchedEffect(revision) {
+        snapshot = withContext(Dispatchers.IO) {
+            runCatching {
+                val db = Db(activity)
+                WorkbenchSnapshot(
+                    books = db.listBooks(),
+                    noteCount = db.noteCount(),
+                    minutes = db.totalAllReadMs() / 60_000
+                )
+            }.getOrNull()
+        }
+    }
+    val books = snapshot?.books.orEmpty()
     val reading = books.firstOrNull { it.progress in 0.006f..0.989f } ?: books.firstOrNull()
     val recent = books.take(8)
-    val minutes = db.totalAllReadMs() / 60_000
+    val noteCount = snapshot?.noteCount ?: 0
+    val minutes = snapshot?.minutes ?: 0
 
     BoxWithConstraints(Modifier.fillMaxSize()) {
         val pageWidth = if (maxWidth > 1180.dp) 1180.dp else maxWidth
         val horizontal = if (maxWidth >= 700.dp) 28.dp else 16.dp
         LazyColumn(
-            modifier = Modifier.width(pageWidth).fillMaxHeight().align(Alignment.TopCenter).statusBarsPadding(),
+            modifier = Modifier.width(pageWidth).fillMaxHeight().align(Alignment.TopCenter),
             contentPadding = PaddingValues(horizontal, 18.dp, horizontal, 32.dp),
             verticalArrangement = Arrangement.spacedBy(18.dp)
         ) {
@@ -373,7 +403,7 @@ private fun WorkbenchScreen(
             item {
                 Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(10.dp)) {
                     MetricCard("${books.size}", "藏书与资料", ElectricBlue, Modifier.weight(1f))
-                    MetricCard("${db.noteCount()}", "笔记", ActiveViolet, Modifier.weight(1f))
+                    MetricCard("$noteCount", "笔记", ActiveViolet, Modifier.weight(1f))
                     MetricCard("$minutes", "阅读分钟", LuminousCyan, Modifier.weight(1f))
                 }
             }
@@ -479,11 +509,11 @@ private fun HeroCard(reading: LibraryItem?, activity: MainActivity, showIllustra
                     Box(
                         Modifier.width(artWidth).fillMaxHeight().padding(top = 9.dp, end = 9.dp, bottom = 9.dp).clip(RoundedCornerShape(26.dp))
                     ) {
-                        Image(
-                            painter = painterResource(R.drawable.yeshu_art_festival),
-                            contentDescription = null,
+                        SampledResourceImage(
+                            resource = R.drawable.yeshu_art_festival,
                             modifier = Modifier.fillMaxSize(),
                             contentScale = ContentScale.Crop,
+                            sampleSize = 2,
                             alignment = BiasAlignment(0f, -0.12f)
                         )
                         Box(
@@ -631,16 +661,49 @@ private fun PortraitRow(portraits: List<Triple<Int, Color, Float>>, modifier: Mo
                 shape = RoundedCornerShape(24.dp),
                 elevation = 5.dp
             ) {
-                Image(
-                    painter = painterResource(resource),
-                    contentDescription = null,
+                SampledResourceImage(
+                    resource = resource,
                     modifier = Modifier.fillMaxSize(),
                     contentScale = ContentScale.Crop,
+                    sampleSize = 4,
                     alignment = BiasAlignment(0f, verticalBias)
                 )
                 Box(Modifier.fillMaxSize().background(Brush.verticalGradient(listOf(Color.Transparent, accent.copy(alpha = 0.20f)))))
             }
         }
+    }
+}
+
+@Composable
+private fun SampledResourceImage(
+    @DrawableRes resource: Int,
+    modifier: Modifier,
+    contentScale: ContentScale,
+    sampleSize: Int,
+    alignment: Alignment
+) {
+    val resources = LocalContext.current.resources
+    var bitmap by remember(resource, sampleSize) { mutableStateOf<ImageBitmap?>(null) }
+    LaunchedEffect(resource, sampleSize) {
+        bitmap = withContext(Dispatchers.IO) {
+            BitmapFactory.decodeResource(
+                resources,
+                resource,
+                BitmapFactory.Options().apply {
+                    inSampleSize = sampleSize.coerceAtLeast(1)
+                    inPreferredConfig = android.graphics.Bitmap.Config.ARGB_8888
+                }
+            )?.asImageBitmap()
+        }
+    }
+    bitmap?.let { image ->
+        Image(
+            bitmap = image,
+            contentDescription = null,
+            modifier = modifier,
+            contentScale = contentScale,
+            alignment = alignment
+        )
     }
 }
 
@@ -691,7 +754,7 @@ private fun NotesHubScreen(activity: MainActivity, revision: Int, onNavigate: (D
     BoxWithConstraints(Modifier.fillMaxSize()) {
         val pageWidth = if (maxWidth > 900.dp) 900.dp else maxWidth
         LazyColumn(
-            modifier = Modifier.width(pageWidth).fillMaxHeight().align(Alignment.TopCenter).statusBarsPadding(),
+            modifier = Modifier.width(pageWidth).fillMaxHeight().align(Alignment.TopCenter),
             contentPadding = PaddingValues(18.dp, 20.dp, 18.dp, 34.dp),
             verticalArrangement = Arrangement.spacedBy(12.dp)
         ) {
@@ -763,6 +826,7 @@ private fun SettingsScreen(activity: MainActivity) {
     var visionModel by remember { mutableStateOf(db.getSetting("ai_vision_model").orEmpty()) }
     var keyInput by remember { mutableStateOf("") }
     var hasSavedKey by remember { mutableStateOf(db.getAiKey(baseUrl).isNotBlank()) }
+    var hasUnboundKey by remember { mutableStateOf(db.hasUnboundAiKey()) }
     var allowPrivateHttp by remember { mutableStateOf(db.getSetting("ai_allow_private_http") == "1") }
     var status by remember { mutableStateOf<String?>(null) }
     var testing by remember { mutableStateOf(false) }
@@ -773,7 +837,7 @@ private fun SettingsScreen(activity: MainActivity) {
     BoxWithConstraints(Modifier.fillMaxSize()) {
         val pageWidth = if (maxWidth > 900.dp) 900.dp else maxWidth
         LazyColumn(
-            modifier = Modifier.width(pageWidth).fillMaxHeight().align(Alignment.TopCenter).statusBarsPadding(),
+            modifier = Modifier.width(pageWidth).fillMaxHeight().align(Alignment.TopCenter),
             contentPadding = PaddingValues(18.dp, 20.dp, 18.dp, 38.dp),
             verticalArrangement = Arrangement.spacedBy(15.dp)
         ) {
@@ -859,10 +923,41 @@ private fun SettingsScreen(activity: MainActivity) {
                             visualTransformation = PasswordVisualTransformation(),
                             colors = glassTextFieldColors()
                         )
+                        if (hasUnboundKey) {
+                            GlassPanel(
+                                modifier = Modifier.fillMaxWidth(),
+                                shape = RoundedCornerShape(18.dp),
+                                tint = ActiveViolet.copy(alpha = 0.08f),
+                                contentPadding = PaddingValues(12.dp),
+                                elevation = 0.dp
+                            ) {
+                                Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                                    Text("发现一个未绑定服务商的旧 Key", fontWeight = FontWeight.Bold, color = ActiveViolet)
+                                    Text(
+                                        "为避免误发给其他服务商，它不会自动使用。确认当前地址属于原服务商后再绑定。",
+                                        fontSize = 10.sp,
+                                        color = secondaryText()
+                                    )
+                                    OutlinedButton(
+                                        onClick = {
+                                            val result = runCatching { db.bindUnboundAiKey(baseUrl) }
+                                            if (result.getOrNull() == true) {
+                                                hasUnboundKey = false
+                                                hasSavedKey = db.getAiKey(baseUrl).isNotBlank()
+                                                status = "旧 Key 已绑定到当前服务"
+                                            } else {
+                                                status = "绑定失败：请先填写有效的服务地址"
+                                            }
+                                        },
+                                        shape = RoundedCornerShape(14.dp)
+                                    ) { Text("确认绑定到当前服务") }
+                                }
+                            }
+                        }
                         Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
                             Column(Modifier.weight(1f)) {
                                 Text("允许局域网 HTTP", fontWeight = FontWeight.Medium)
-                                Text("仅本机、严格私网 IP 与 .local 地址；重定向会被拒绝", fontSize = 10.sp, color = secondaryText())
+                                Text("仅 localhost、模拟器 10.0.2.2 与 .local 主机名；重定向会被拒绝", fontSize = 10.sp, color = secondaryText())
                             }
                             Switch(checked = allowPrivateHttp, onCheckedChange = { enabled ->
                                 if (!enabled) {
@@ -870,7 +965,7 @@ private fun SettingsScreen(activity: MainActivity) {
                                 } else {
                                     android.app.AlertDialog.Builder(activity)
                                         .setTitle("允许局域网明文 HTTP？")
-                                        .setMessage("HTTP 流量可能被同一网络中的设备监听。页枢只允许回环或私网地址，并会拒绝重定向；请仅连接你信任的本地服务。")
+                                        .setMessage("HTTP 流量可能被同一网络中的设备监听。页枢只允许 localhost、模拟器 10.0.2.2 或 .local 主机名，并会拒绝重定向；请仅连接你信任的本地服务。")
                                         .setPositiveButton("我了解，启用") { _, _ -> allowPrivateHttp = true }
                                         .setNegativeButton("取消", null)
                                         .show()
@@ -908,7 +1003,7 @@ private fun SettingsScreen(activity: MainActivity) {
                                                 val cfg = AiClient.Config(baseUrl, key, textModel, visionModel, allowPrivateHttp)
                                                 val models = AiClient.listModels(cfg)
                                                 if (models.isEmpty()) "连接成功，服务未返回模型列表" else "连接成功，可用模型 ${models.size} 个"
-                                            }.getOrElse { "连接失败：${it.message}" }
+                                            }.getOrElse { "连接失败：${AiClient.userFacingError(it)}" }
                                         }
                                         testing = false
                                         status = result

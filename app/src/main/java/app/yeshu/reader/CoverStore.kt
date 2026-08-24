@@ -4,7 +4,9 @@ import android.content.Context
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
 import android.graphics.Color
+import android.graphics.Matrix
 import android.graphics.pdf.PdfRenderer
+import android.media.ExifInterface
 import android.os.ParcelFileDescriptor
 import app.yeshu.reader.parse.DocParser
 import java.io.File
@@ -12,6 +14,8 @@ import kotlin.math.max
 
 /** 书籍封面缓存：filesDir/cover_<id>.img (JPEG) + 进程内 LruBitmapCache */
 object CoverStore {
+
+    private const val COVER_MAX_DIMENSION = 480
 
     private val mem = object : android.util.LruCache<Long, Bitmap>(24) {
         override fun sizeOf(key: Long, value: Bitmap) = 1
@@ -23,7 +27,7 @@ object CoverStore {
     fun load(ctx: Context, bookId: Long): Bitmap? {
         if (!file(ctx, bookId).exists()) return null
         mem.get(bookId)?.let { return it }
-        val bmp = BitmapFactory.decodeFile(file(ctx, bookId).absolutePath) ?: return null
+        val bmp = decodeSampledBitmap(file(ctx, bookId), COVER_MAX_DIMENSION) ?: return null
         mem.put(bookId, bmp)
         return bmp
     }
@@ -42,6 +46,7 @@ object CoverStore {
                 "pdf" -> renderFirstPage(f)
                 "epub" -> DocParser.parseText(f).coverBytes
                     ?.let { BitmapFactory.decodeByteArray(it, 0, it.size) }
+                "jpg", "jpeg", "png" -> decodeSampledBitmap(f, COVER_MAX_DIMENSION)
                 else -> null
             }
         } catch (e: Exception) { null }
@@ -49,6 +54,60 @@ object CoverStore {
             out.outputStream().use { bmp.compress(Bitmap.CompressFormat.JPEG, 82, it) }
         }
         bmp?.recycle()
+    }
+
+    /** Reads only a thumbnail-sized bitmap, then applies the source EXIF orientation. */
+    private fun decodeSampledBitmap(f: File, maxDimension: Int): Bitmap? {
+        val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
+        BitmapFactory.decodeFile(f.absolutePath, bounds)
+        if (bounds.outWidth <= 0 || bounds.outHeight <= 0) return null
+
+        val options = BitmapFactory.Options().apply {
+            inSampleSize = sampleSize(bounds.outWidth, bounds.outHeight, maxDimension)
+            inPreferredConfig = Bitmap.Config.ARGB_8888
+        }
+        val decoded = BitmapFactory.decodeFile(f.absolutePath, options) ?: return null
+        return orientBitmap(f, decoded)
+    }
+
+    private fun sampleSize(width: Int, height: Int, maxDimension: Int): Int {
+        var sample = 1
+        while (max(width / sample, height / sample) > maxDimension) {
+            sample *= 2
+        }
+        return sample
+    }
+
+    private fun orientBitmap(f: File, source: Bitmap): Bitmap {
+        val orientation = try {
+            ExifInterface(f.absolutePath).getAttributeInt(
+                ExifInterface.TAG_ORIENTATION,
+                ExifInterface.ORIENTATION_NORMAL
+            )
+        } catch (_: Exception) {
+            ExifInterface.ORIENTATION_NORMAL
+        }
+        val matrix = Matrix()
+        when (orientation) {
+            ExifInterface.ORIENTATION_FLIP_HORIZONTAL -> matrix.setScale(-1f, 1f)
+            ExifInterface.ORIENTATION_ROTATE_180 -> matrix.setRotate(180f)
+            ExifInterface.ORIENTATION_FLIP_VERTICAL -> matrix.setScale(1f, -1f)
+            ExifInterface.ORIENTATION_TRANSPOSE -> {
+                matrix.setRotate(90f)
+                matrix.postScale(-1f, 1f)
+            }
+            ExifInterface.ORIENTATION_ROTATE_90 -> matrix.setRotate(90f)
+            ExifInterface.ORIENTATION_TRANSVERSE -> {
+                matrix.setRotate(-90f)
+                matrix.postScale(-1f, 1f)
+            }
+            ExifInterface.ORIENTATION_ROTATE_270 -> matrix.setRotate(-90f)
+            else -> return source
+        }
+
+        val oriented = Bitmap.createBitmap(source, 0, 0, source.width, source.height, matrix, true)
+        if (oriented !== source) source.recycle()
+        return oriented
     }
 
     /** 无封面格式的占位色（书架卡片背景） */

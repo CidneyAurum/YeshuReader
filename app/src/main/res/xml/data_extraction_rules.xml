@@ -2,8 +2,10 @@
 <data-extraction-rules>
     <cloud-backup disableIfNoEncryptionCapabilities="true">
         <exclude domain="sharedpref" path="yeshu_secure.xml" />
+        <exclude domain="database" path="bookshelf.db" />
     </cloud-backup>
     <device-transfer>
         <exclude domain="sharedpref" path="yeshu_secure.xml" />
+        <exclude domain="database" path="bookshelf.db" />
     </device-transfer>
 </data-extraction-rules>

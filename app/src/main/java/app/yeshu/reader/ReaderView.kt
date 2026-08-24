@@ -1,6 +1,7 @@
 package app.yeshu.reader
 
 import android.app.Activity
+import android.content.Context
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
 import android.graphics.Color
@@ -26,6 +27,9 @@ import app.yeshu.reader.parse.Block
 import app.yeshu.reader.parse.DocParser
 import java.io.File
 import java.net.URI
+import java.util.concurrent.Executors
+import java.util.concurrent.RejectedExecutionException
+import java.util.concurrent.atomic.AtomicBoolean
 import kotlin.math.max
 import kotlin.math.min
 
@@ -38,6 +42,8 @@ class ReaderView(
     companion object {
         private const val SYS_PROMPT = "你是专业的中文阅读助手。用简体中文回答，输出简洁、结构化。"
         private const val CHUNK = 300
+        private const val PDF_DEFAULT_PAGE_RATIO = 1.4142f
+        private const val PDF_SIZE_SCAN_BATCH = 12
 
         // 阅读配色（微信读书/Apple Books 式暖纸与低眩光夜色）
         val PAPER_BG = Color.argb(235, 247, 241, 227)      // 日间：羊皮纸
@@ -104,11 +110,121 @@ class ReaderView(
 
     // PDF 惰性渲染状态
     private var pdfRenderer: PdfRenderer? = null
-    private val pdfLock = Any()
+    private var pdfSession: PdfSession? = null
+    private var pdfPageCount = 0
     private val pageBitmaps = SparseArray<Bitmap>()
-    private var pageViews: Array<ImageView?> = emptyArray()
+    private var pageViews: Array<PdfPageView?> = emptyArray()
+    private var pageRenderPending = BooleanArray(0)
     private var pdfBody: LinearLayout? = null
     private var imageBitmap: Bitmap? = null
+
+    private class PdfPageView(context: Context) : ImageView(context) {
+        private var heightToWidth = PDF_DEFAULT_PAGE_RATIO
+
+        fun setPageSize(width: Int, height: Int) {
+            if (width <= 0 || height <= 0) return
+            val next = height.toFloat() / width.toFloat()
+            if (kotlin.math.abs(next - heightToWidth) < 0.0001f) return
+            heightToWidth = next
+            requestLayout()
+        }
+
+        fun estimatedHeight(containerWidth: Int): Int =
+            max(1, (containerWidth.coerceAtLeast(1) * heightToWidth).toInt())
+
+        override fun onMeasure(widthMeasureSpec: Int, heightMeasureSpec: Int) {
+            val widthMode = MeasureSpec.getMode(widthMeasureSpec)
+            val widthSize = MeasureSpec.getSize(widthMeasureSpec)
+            val measuredWidth = when (widthMode) {
+                MeasureSpec.EXACTLY, MeasureSpec.AT_MOST -> widthSize
+                else -> suggestedMinimumWidth
+            }
+            val contentWidth = (measuredWidth - paddingLeft - paddingRight).coerceAtLeast(1)
+            val desiredHeight =
+                (contentWidth * heightToWidth).toInt() + paddingTop + paddingBottom
+            setMeasuredDimension(
+                measuredWidth,
+                resolveSize(max(suggestedMinimumHeight, desiredHeight), heightMeasureSpec)
+            )
+        }
+    }
+
+    private class PdfSession(val renderer: PdfRenderer) {
+        private val closed = AtomicBoolean(false)
+        private val executor = Executors.newSingleThreadExecutor { task ->
+            Thread(task, "reader-pdf").apply { isDaemon = true }
+        }
+
+        fun isClosed(): Boolean = closed.get()
+
+        fun execute(block: (PdfRenderer) -> Unit): Boolean {
+            if (closed.get()) return false
+            return try {
+                executor.execute {
+                    if (!closed.get()) block(renderer)
+                }
+                true
+            } catch (_: RejectedExecutionException) {
+                false
+            }
+        }
+
+        fun renderPages(indices: List<Int>, pageCount: Int, maxWidth: Int): List<Bitmap> {
+            if (closed.get()) return emptyList()
+            if (android.os.Looper.myLooper() == android.os.Looper.getMainLooper()) return emptyList()
+            val future = try {
+                executor.submit<List<Bitmap>> {
+                    if (closed.get()) return@submit emptyList()
+                    val out = mutableListOf<Bitmap>()
+                    for (index in indices.distinct().filter { it in 0 until pageCount }) {
+                        if (closed.get()) break
+                        var bitmap: Bitmap? = null
+                        try {
+                            renderer.openPage(index).use { page ->
+                                val width = min(maxWidth, page.width).coerceAtLeast(1)
+                                val height = max(1, page.height * width / page.width)
+                                bitmap = Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888)
+                                bitmap!!.eraseColor(Color.WHITE)
+                                page.render(
+                                    bitmap,
+                                    null,
+                                    null,
+                                    PdfRenderer.Page.RENDER_MODE_FOR_DISPLAY
+                                )
+                            }
+                            bitmap?.let(out::add)
+                        } catch (_: Exception) {
+                            bitmap?.recycle()
+                        }
+                    }
+                    out
+                }
+            } catch (_: RejectedExecutionException) {
+                return emptyList()
+            }
+            return try {
+                future.get()
+            } catch (_: InterruptedException) {
+                Thread.currentThread().interrupt()
+                emptyList()
+            } catch (_: Exception) {
+                emptyList()
+            }
+        }
+
+        fun close() {
+            if (!closed.compareAndSet(false, true)) return
+            try {
+                executor.execute {
+                    try { renderer.close() } catch (_: Exception) {}
+                }
+            } catch (_: RejectedExecutionException) {
+                try { renderer.close() } catch (_: Exception) {}
+            } finally {
+                executor.shutdown()
+            }
+        }
+    }
 
     init {
         val book = db.getBook(bookId)
@@ -577,9 +693,17 @@ class ReaderView(
 
     private fun setupPdf(f: File, sv: ScrollView) {
         val fd = ParcelFileDescriptor.open(f, ParcelFileDescriptor.MODE_READ_ONLY)
-        val renderer = PdfRenderer(fd)
+        val renderer = try {
+            PdfRenderer(fd)
+        } catch (t: Throwable) {
+            try { fd.close() } catch (_: Exception) {}
+            throw t
+        }
+        val session = PdfSession(renderer)
         pdfRenderer = renderer
+        pdfSession = session
         val n = renderer.pageCount
+        pdfPageCount = n
 
         val d = density(act)
         val box = LinearLayout(act).apply {
@@ -588,12 +712,11 @@ class ReaderView(
         }
         pdfBody = box
         pageViews = arrayOfNulls(n)
+        pageRenderPending = BooleanArray(n)
 
-        // 预取每页尺寸，生成占位 ImageView
+        // 先用稳定纸张比例占位；真实页面比例由 PDF 单线程后台读取后批量更新。
         for (i in 0 until n) {
-            val size = renderer.openPage(i).use { p -> Pair(p.width, p.height) }
-            val iv = ImageView(act).apply {
-                adjustViewBounds = true
+            val iv = PdfPageView(act).apply {
                 scaleType = ImageView.ScaleType.FIT_CENTER
                 setBackgroundColor(Color.parseColor("#3B3F43"))
                 setOnClickListener { toggleBars() }
@@ -604,24 +727,24 @@ class ReaderView(
             }
             box.addView(iv, lp)
             pageViews[i] = iv
-            // 记录宽高比供布局前占位
-            iv.tag = Pair(size.first, size.second)
         }
         val tail = View(act)
         box.addView(tail, LayoutParams(-1, Glass.dp(50, d)))
         sv.addView(box, LayoutParams(-1, -2))
 
         sv.post {
-            restoreScroll(sv)
+            restoreScrollNow(sv, db.getBook(bookId)?.progress ?: 0f)
             renderPdfWindow(force = true)
+            scanPdfPageSizes(session, arrayOfNulls(n), 0)
         }
     }
 
     /** 渲染当前可见页 ±1，回收远离窗口的位图 */
     private fun renderPdfWindow(force: Boolean = false) {
-        val renderer = pdfRenderer ?: return
+        val session = pdfSession ?: return
+        if (session.isClosed()) return
         val sv = sc ?: return
-        val box = pdfBody ?: return
+        pdfBody ?: return
         if (pageViews.isEmpty()) return
 
         val scrollY = sv.scrollY
@@ -634,7 +757,7 @@ class ReaderView(
         for (i in pageViews.indices) {
             val v = pageViews[i] ?: continue
             val top = acc + (v.layoutParams as MarginLayoutParams).topMargin
-            val h = if (v.height > 0) v.height else estimatePageHeight(i, v, sv.width)
+            val h = if (v.height > 0) v.height else v.estimatedHeight(sv.width)
             val bottom = top + h
             acc = bottom + (v.layoutParams as MarginLayoutParams).bottomMargin
             if (bottom >= scrollY && firstVis == -1) firstVis = i
@@ -643,54 +766,133 @@ class ReaderView(
         if (firstVis == -1) return
 
         for (i in max(0, firstVis - 1)..min(pageViews.size - 1, lastVis + 1)) {
-            if (pageBitmaps.get(i) == null) renderPage(renderer, i, sv.width)
+            if (pageBitmaps.get(i) == null && !pageRenderPending[i]) {
+                renderPage(session, i, sv.width)
+            }
         }
         // 回收远离当前窗口的页
-        for (i in 0 until pageBitmaps.size()) {
+        for (i in pageBitmaps.size() - 1 downTo 0) {
             val key = pageBitmaps.keyAt(i)
             if (key < firstVis - 8 || key > lastVis + 8) {
-                pageBitmaps.get(key)?.recycle()
-                pageBitmaps.remove(key)
                 pageViews[key]?.setImageDrawable(null)
+                pageBitmaps.valueAt(i)?.recycle()
+                pageBitmaps.removeAt(i)
             }
         }
     }
 
-    private fun estimatePageHeight(i: Int, v: View, containerW: Int): Int {
-        val ratio = v.tag as? Pair<*, *> ?: return 800
-        val pw = (ratio.first as Int).toFloat()
-        val ph = (ratio.second as Int).toFloat()
-        return if (pw <= 0 || containerW <= 0) 800
-               else (ph / pw * containerW).toInt()
-    }
-
-    private fun renderPage(renderer: PdfRenderer, index: Int, containerW: Int) {
+    private fun renderPage(session: PdfSession, index: Int, containerW: Int) {
         // API 35 的 PdfRenderer 仅支持 ARGB_8888；宽度封顶控制内存
         val targetW = min(containerW, 900)
         if (targetW <= 0) return
-        synchronized(pdfLock) {
+        val targetView = pageViews.getOrNull(index) ?: return
+        pageRenderPending[index] = true
+        val accepted = session.execute { renderer ->
+            var bitmap: Bitmap? = null
+            var pageWidth = 0
+            var pageHeight = 0
             try {
                 renderer.openPage(index).use { p ->
+                    pageWidth = p.width
+                    pageHeight = p.height
                     val scale = targetW.toFloat() / p.width
                     val w = targetW
                     val h = max(1, (p.height * scale).toInt())
-                    val bmp = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888)
-                    bmp.eraseColor(android.graphics.Color.WHITE)
-                    p.render(bmp, null, null, PdfRenderer.Page.RENDER_MODE_FOR_DISPLAY)
-                    pageBitmaps.put(index, bmp)
-                    pageViews[index]?.setImageBitmap(bmp)
+                    bitmap = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888)
+                    bitmap!!.eraseColor(Color.WHITE)
+                    p.render(bitmap, null, null, PdfRenderer.Page.RENDER_MODE_FOR_DISPLAY)
                 }
-            } catch (_: Exception) { }
+            } catch (_: Exception) {
+                bitmap?.recycle()
+                bitmap = null
+            }
+            val result = bitmap
+            act.runOnUiThread {
+                val stillCurrent =
+                    pdfSession === session && !session.isClosed() &&
+                        pageViews.getOrNull(index) === targetView && isAttachedToWindow
+                if (pdfSession === session && index in pageRenderPending.indices) {
+                    pageRenderPending[index] = false
+                }
+                if (!stillCurrent || result == null) {
+                    result?.recycle()
+                    return@runOnUiThread
+                }
+                targetView.setPageSize(pageWidth, pageHeight)
+                val old = pageBitmaps.get(index)
+                if (old != null && old !== result) {
+                    targetView.setImageDrawable(null)
+                    old.recycle()
+                }
+                pageBitmaps.put(index, result)
+                targetView.setImageBitmap(result)
+            }
+        }
+        if (!accepted) {
+            pageRenderPending[index] = false
+        }
+    }
+
+    private fun scanPdfPageSizes(
+        session: PdfSession,
+        sizes: Array<Pair<Int, Int>?>,
+        start: Int
+    ) {
+        if (start >= sizes.size || session.isClosed()) return
+        session.execute { renderer ->
+            val end = min(sizes.size, start + PDF_SIZE_SCAN_BATCH)
+            for (index in start until end) {
+                if (session.isClosed()) return@execute
+                try {
+                    renderer.openPage(index).use { page ->
+                        sizes[index] = page.width to page.height
+                    }
+                } catch (_: Exception) {}
+            }
+            if (end < sizes.size) {
+                scanPdfPageSizes(session, sizes, end)
+            } else {
+                act.runOnUiThread { applyPdfPageSizes(session, sizes) }
+            }
+        }
+    }
+
+    private fun applyPdfPageSizes(session: PdfSession, sizes: Array<Pair<Int, Int>?>) {
+        if (pdfSession !== session || session.isClosed() || !isAttachedToWindow) return
+        val sv = sc ?: return
+        val body = pdfBody ?: return
+        val oldRange = (body.height - sv.height).coerceAtLeast(0)
+        val progress = if (oldRange > 0) {
+            (sv.scrollY.toFloat() / oldRange.toFloat()).coerceIn(0f, 1f)
+        } else {
+            db.getBook(bookId)?.progress ?: 0f
+        }
+        for (index in sizes.indices) {
+            val size = sizes[index] ?: continue
+            pageViews.getOrNull(index)?.setPageSize(size.first, size.second)
+        }
+        body.post {
+            if (pdfSession !== session || session.isClosed() || !isAttachedToWindow) return@post
+            restoreScrollNow(sv, progress)
+            renderPdfWindow(force = true)
         }
     }
 
     private fun closePdf() {
-        try {
-            for (i in 0 until pageBitmaps.size()) pageBitmaps.valueAt(i)?.recycle()
-            pageBitmaps.clear()
-            pdfRenderer?.close()
-        } catch (e: Exception) {}
+        val session = pdfSession
+        pdfSession = null
         pdfRenderer = null
+        pdfPageCount = 0
+        for (i in pageBitmaps.size() - 1 downTo 0) {
+            val key = pageBitmaps.keyAt(i)
+            pageViews.getOrNull(key)?.setImageDrawable(null)
+            pageBitmaps.valueAt(i)?.recycle()
+            pageBitmaps.removeAt(i)
+        }
+        pageRenderPending = BooleanArray(0)
+        pageViews = emptyArray()
+        pdfBody = null
+        session?.close()
     }
 
     // ---------- AI 功能 ----------
@@ -934,29 +1136,14 @@ class ReaderView(
 
     /** PDF：渲染前几页给视觉模型 */
     private fun collectPdfPages(maxPages: Int): List<Bitmap> {
-        val renderer = pdfRenderer ?: return emptyList()
-        return collectPdfPages((0 until min(renderer.pageCount, maxPages)).toList())
+        if (pdfSession == null) return emptyList()
+        return collectPdfPages((0 until min(pdfPageCount, maxPages)).toList())
     }
 
     /** PDF：只渲染用户明确选择的页面，索引为 0-based。 */
     private fun collectPdfPages(indices: List<Int>): List<Bitmap> {
-        val renderer = pdfRenderer ?: return emptyList()
-        val out = mutableListOf<Bitmap>()
-        synchronized(pdfLock) {
-            for (i in indices.distinct().filter { it in 0 until renderer.pageCount }) {
-                try {
-                    renderer.openPage(i).use { p ->
-                        val w = min(720, p.width)
-                        val h = max(1, p.height * w / p.width)
-                        val bmp = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888)
-                        bmp.eraseColor(Color.WHITE)
-                        p.render(bmp, null, null, PdfRenderer.Page.RENDER_MODE_FOR_DISPLAY)
-                        out.add(bmp)
-                    }
-                } catch (_: Exception) { }
-            }
-        }
-        return out
+        val session = pdfSession ?: return emptyList()
+        return session.renderPages(indices, pdfPageCount, 720)
     }
 
     private fun currentPdfPageIndex(): Int {
@@ -1392,7 +1579,8 @@ class ReaderView(
 
     /** PDF 页码跳转：列出全部页，点击滚到对应页 */
     private fun listPdfPages() {
-        val n = pdfRenderer?.pageCount ?: return
+        val n = pdfPageCount
+        if (n <= 0) return
         val labels = Array(n) { "第 ${it + 1} 页" }
         android.app.AlertDialog.Builder(act)
             .setTitle("跳转到页 · 共 $n 页")
@@ -1498,12 +1686,17 @@ class ReaderView(
         val p = book?.progress ?: 0f
         if (p > 0.001f && p < 0.999f) {
             sv.post {
-                val child = sv.getChildAt(0) ?: return@post
-                val range = (child.height - sv.height).coerceAtLeast(0)
-                sv.scrollTo(0, (range * p).toInt())
+                restoreScrollNow(sv, p)
                 if (pdfRenderer != null) renderPdfWindow(force = true)
             }
         }
+    }
+
+    private fun restoreScrollNow(sv: ScrollView, progress: Float) {
+        if (progress <= 0.001f || progress >= 0.999f) return
+        val child = sv.getChildAt(0) ?: return
+        val range = (child.height - sv.height).coerceAtLeast(0)
+        sv.scrollTo(0, (range * progress.coerceIn(0f, 1f)).toInt())
     }
 
     private fun saveProgress() {

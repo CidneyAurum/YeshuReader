@@ -39,7 +39,8 @@ class Db(context: Context) {
         status = status,
         favorite = favorite,
         tags = tags,
-        contentHash = contentHash
+        contentHash = contentHash,
+        totalReadMs = totalReadMs
     )
 
     private fun NoteEntity.toModel() = NoteRow(id, kind, content, bookId, createdAt)
@@ -84,7 +85,8 @@ class Db(context: Context) {
         status: String = statusFor(progress),
         favorite: Boolean = false,
         tags: String = "",
-        contentHash: String = ""
+        contentHash: String = "",
+        totalReadMs: Long = 0
     ): Long = dao.insertBook(
         LibraryItemEntity(
             title = title,
@@ -100,7 +102,8 @@ class Db(context: Context) {
             status = status,
             favorite = favorite,
             tags = tags,
-            contentHash = contentHash
+            contentHash = contentHash,
+            totalReadMs = totalReadMs
         )
     )
 
@@ -156,7 +159,13 @@ class Db(context: Context) {
     fun deleteBook(id: Long) = dao.softDeleteBook(id, System.currentTimeMillis())
     fun listDeletedBooks(): List<Book> = dao.listDeletedBooks().map { it.toModel() }
     fun restoreDeletedBook(id: Long) = dao.restoreDeletedBook(id)
-    fun purgeBook(id: Long) = dao.purgeBook(id)
+    fun purgeBook(id: Long) {
+        room.runInTransaction {
+            dao.deleteNotesForBook(id)
+            dao.deleteArtifactsForBook(id)
+            dao.purgeBook(id)
+        }
+    }
 
     fun addFolder(name: String, parentId: Long): Long = dao.insertFolder(FolderEntity(name = name.trim(), parentId = parentId))
     fun renameFolder(id: Long, name: String) = dao.renameFolder(id, name.trim())
@@ -209,14 +218,22 @@ class Db(context: Context) {
     fun getAiKey(baseUrl: String = dao.getSetting("ai_base_url").orEmpty()): String {
         val secure = SecureKeyStore(appContext)
         val origin = runCatching { AiClient.endpointOrigin(baseUrl) }.getOrDefault("")
-        secure.readApiKey(origin).takeIf { it.isNotBlank() }?.let { return it }
+        val stored = secure.readApiKey(origin)
         val legacy = dao.getSetting("ai_key").orEmpty()
-        if (legacy.isNotBlank() && origin.isNotBlank()) {
-            secure.writeApiKey(legacy, origin)
+        if (legacy.isNotBlank()) {
+            // Remove the plaintext row even when the old base URL is missing or invalid. The
+            // migrated value remains encrypted but unbound until the user confirms a provider.
+            if (!secure.hasApiKey()) secure.writeUnboundApiKey(legacy)
             dao.deleteSetting("ai_key")
-            return legacy
         }
-        return ""
+        return stored
+    }
+
+    fun hasUnboundAiKey(): Boolean = SecureKeyStore(appContext).hasUnboundApiKey()
+
+    fun bindUnboundAiKey(baseUrl: String): Boolean {
+        val origin = AiClient.endpointOrigin(baseUrl)
+        return SecureKeyStore(appContext).bindUnboundApiKey(origin)
     }
 
     fun setAiKey(value: String, baseUrl: String = dao.getSetting("ai_base_url").orEmpty()) {

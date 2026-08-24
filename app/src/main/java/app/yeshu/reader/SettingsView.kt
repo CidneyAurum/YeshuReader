@@ -153,7 +153,7 @@ class SettingsView(private val act: Activity) : FrameLayout(act) {
             setOnClickListener { v ->
                 val btn = v as TextView
                 val url = etUrl.text.toString().trim()
-                val key = etKey.text.toString().trim()
+                val key = etKey.text.toString().trim().ifBlank { db.getAiKey(url) }
                 val model = etModel.text.toString().trim()
                 if (url.isEmpty() || model.isEmpty()) {
                     android.widget.Toast.makeText(act, "请先填接口地址和模型", android.widget.Toast.LENGTH_SHORT).show()
@@ -168,14 +168,7 @@ class SettingsView(private val act: Activity) : FrameLayout(act) {
                         val r = AiClient.chat(cfg, null, "回复OK两个字母即可", timeoutMs = 45_000)
                         msg = if (r.isNotBlank()) "✓ 连接成功：${r.take(24)}" else "✗ 返回为空"
                     } catch (e: Exception) {
-                        val raw = (e.message ?: e.javaClass.simpleName)
-                        msg = when {
-                            raw.contains("timeout", true) || raw.contains("timed out", true) ->
-                                "✗ 连接超时——检查网络/该中转站是否可达，或稍后再试"
-                            raw.contains("Unable to resolve host", true) ->
-                                "✗ 域名解析失败——检查地址拼写与网络"
-                            else -> "✗ $raw".take(120)
-                        }
+                        msg = "✗ ${AiClient.userFacingError(e)}"
                     }
                     act.runOnUiThread {
                         btn.text = "测试连接"
@@ -391,13 +384,15 @@ class SettingsView(private val act: Activity) : FrameLayout(act) {
 
     private fun load() {
         etUrl.setText(db.getSetting("ai_base_url") ?: "")
-        etKey.setText(db.getAiKey())
+        etKey.setText("")
+        etKey.hint = if (db.getAiKey().isNotBlank()) "API Key（已安全保存，留空不修改）" else "API Key"
         etModel.setText(db.getSetting("ai_model") ?: "")
     }
 
     private fun save() {
-        db.setSetting("ai_base_url", etUrl.text.toString().trim())
-        db.setAiKey(etKey.text.toString())
+        val baseUrl = etUrl.text.toString().trim()
+        db.setSetting("ai_base_url", baseUrl)
+        if (etKey.text.isNotBlank()) db.setAiKey(etKey.text.toString(), baseUrl)
         db.setSetting("ai_model", etModel.text.toString().trim())
         Toast.makeText(act, "已保存", Toast.LENGTH_SHORT).show()
     }

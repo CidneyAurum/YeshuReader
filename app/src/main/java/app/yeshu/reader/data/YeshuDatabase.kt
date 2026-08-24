@@ -93,6 +93,9 @@ interface YeshuDao {
     @Query("SELECT * FROM books WHERE deleted_at=0 AND title=:title AND size_bytes=:sizeBytes LIMIT 1")
     fun findBook(title: String, sizeBytes: Long): LibraryItemEntity?
 
+    @Query("SELECT * FROM books WHERE deleted_at=0 AND lower(content_hash)=lower(:contentHash) LIMIT 1")
+    fun findBookByContentHash(contentHash: String): LibraryItemEntity?
+
     @Query("UPDATE books SET last_read_at=:openedAt WHERE id=:id")
     fun markOpened(id: Long, openedAt: Long)
 
@@ -120,11 +123,20 @@ interface YeshuDao {
     @Query("DELETE FROM books WHERE id=:id")
     fun purgeBook(id: Long)
 
+    @Query("DELETE FROM notes WHERE book_id=:bookId")
+    fun deleteNotesForBook(bookId: Long)
+
+    @Query("DELETE FROM ai_artifacts WHERE book_id=:bookId")
+    fun deleteArtifactsForBook(bookId: Long)
+
     @Query("UPDATE books SET total_read_ms=total_read_ms+:delta WHERE id=:id")
     fun addReadTime(id: Long, delta: Long)
 
     @Query("SELECT total_read_ms FROM books WHERE id=:id")
     fun totalReadMs(id: Long): Long?
+
+    @Query("UPDATE books SET total_read_ms=CASE WHEN total_read_ms<:totalReadMs THEN :totalReadMs ELSE total_read_ms END WHERE id=:id")
+    fun mergeTotalReadMs(id: Long, totalReadMs: Long)
 
     @Query("SELECT COALESCE(SUM(total_read_ms),0) FROM books WHERE deleted_at=0")
     fun totalAllReadMs(): Long
@@ -140,6 +152,12 @@ interface YeshuDao {
 
     @Query("SELECT * FROM read_log ORDER BY day DESC LIMIT :limit")
     fun recentReadLog(limit: Int): List<ReadLogEntity>
+
+    @Query("SELECT * FROM read_log ORDER BY day")
+    fun allReadLogs(): List<ReadLogEntity>
+
+    @Query("UPDATE read_log SET ms=CASE WHEN ms<:ms THEN :ms ELSE ms END WHERE day=:day")
+    fun mergeReadLog(day: String, ms: Long)
 
     @Query("SELECT COUNT(*) FROM read_log WHERE ms>0")
     fun activeDays(): Int
@@ -204,6 +222,9 @@ interface YeshuDao {
     @Query("DELETE FROM notes WHERE id=:id")
     fun deleteNote(id: Long)
 
+    @Query("SELECT id FROM notes WHERE book_id=:bookId AND kind=:kind AND content=:content AND created_at=:createdAt LIMIT 1")
+    fun findNote(bookId: Long, kind: String, content: String, createdAt: Long): Long?
+
     @Insert(onConflict = OnConflictStrategy.REPLACE)
     fun saveArtifact(artifact: AiArtifactEntity): Long
 
@@ -212,6 +233,12 @@ interface YeshuDao {
 
     @Query("SELECT * FROM ai_artifacts ORDER BY id")
     fun allArtifacts(): List<AiArtifactEntity>
+
+    @Query("SELECT id FROM ai_artifacts WHERE book_id=:bookId AND kind=:kind AND lower(document_hash)=lower(:documentHash) AND model=:model AND prompt_version=:promptVersion LIMIT 1")
+    fun findArtifact(bookId: Long, kind: String, documentHash: String, model: String, promptVersion: Int): Long?
+
+    @Query("SELECT * FROM ai_artifacts WHERE book_id=:bookId AND kind=:kind AND lower(document_hash)=lower(:documentHash) AND model=:model AND prompt_version=:promptVersion LIMIT 1")
+    fun findArtifactEntity(bookId: Long, kind: String, documentHash: String, model: String, promptVersion: Int): AiArtifactEntity?
 }
 
 data class TopBookRow(

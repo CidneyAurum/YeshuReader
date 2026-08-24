@@ -16,7 +16,8 @@ data class LibraryItem(
     val status: String = "unread",
     val favorite: Boolean = false,
     val tags: String = "",
-    val contentHash: String = ""
+    val contentHash: String = "",
+    val totalReadMs: Long = 0
 )
 
 /** Backward-compatible name retained while legacy Views are migrated to Compose. */
@@ -70,7 +71,7 @@ data class AiArtifact(
 
 data class BackupManifest(
     val app: String = "yeshu",
-    val version: Int = 2,
+    val version: Int = 3,
     val exportedAt: Long,
     val includesOriginalFiles: Boolean,
     val includesSecrets: Boolean = false

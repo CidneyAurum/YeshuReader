@@ -8,7 +8,6 @@ import android.graphics.Color
 import android.graphics.Typeface
 import android.graphics.drawable.GradientDrawable
 import android.net.Uri
-import android.provider.OpenableColumns
 import android.view.Gravity
 import android.view.View
 import android.widget.EditText
@@ -17,6 +16,7 @@ import android.widget.ImageView
 import android.widget.LinearLayout
 import android.widget.ScrollView
 import android.widget.TextView
+import app.yeshu.reader.data.LibraryImporter
 import app.yeshu.reader.parse.DocParser
 import java.io.File
 
@@ -1342,39 +1342,17 @@ class ShelfView(private val act: Activity) : FrameLayout(act) {
     }
 
     private fun importBook(uri: Uri) {
-        var name = queryName(uri)
-        if (name == null || name.isEmpty()) name = "book_" + System.currentTimeMillis().toString() + ".txt"
-        val fmt = DocParser.detect(name)
-        val title = if (fmt.isNotEmpty() && '.' in name)
-            name.substringBeforeLast('.')
-        else name
-        val dest = File(act.filesDir, System.currentTimeMillis().toString() + "_" + name)
-        // 后台复制+入库，避免大文件阻塞主线程
+        // 旧 View 入口也统一走 LibraryImporter，避免绕过 MIME/魔数复核和内容哈希去重。
         Thread {
-            var size = 0L
-            var ok = false
-            try {
-                act.contentResolver.openInputStream(uri)?.use { input ->
-                    dest.outputStream().use { output -> size = input.copyTo(output) }
+            val result = LibraryImporter.import(act, uri)
+            act.runOnUiThread {
+                val message = when {
+                    result.id <= 0 -> result.error ?: "导入失败"
+                    result.error != null -> result.error
+                    else -> "已导入《${result.title}》"
                 }
-                ok = size > 0
-            } catch (_: Exception) { }
-            val id = if (ok) db.insertBook(title, dest.name, fmt.ifEmpty { "txt" }, size) else -1L
-            if (id > 0) {
-                CoverStore.generateAsync(act, id, dest, fmt.ifEmpty { "txt" })
-                act.runOnUiThread {
-                    android.widget.Toast.makeText(
-                        act,
-                        if (fmt.isEmpty()) "已导入《$title》（未知格式按 TXT 处理）" else "已导入《$title》",
-                        android.widget.Toast.LENGTH_SHORT
-                    ).show()
-                    refresh()
-                }
-            } else {
-                dest.delete()
-                act.runOnUiThread {
-                    android.widget.Toast.makeText(act, "导入失败", android.widget.Toast.LENGTH_SHORT).show()
-                }
+                android.widget.Toast.makeText(act, message, android.widget.Toast.LENGTH_SHORT).show()
+                if (result.id > 0) refresh()
             }
         }.start()
     }
@@ -1456,15 +1434,6 @@ class ShelfView(private val act: Activity) : FrameLayout(act) {
             putExtra(Intent.EXTRA_TEXT, md.toString())
         }
         act.startActivity(Intent.createChooser(intent, "导出笔记"))
-    }
-
-    private fun queryName(uri: Uri): String? {
-        val c = act.contentResolver.query(uri, null, null, null, null) ?: return null
-        c.use { cc ->
-            val idx = cc.getColumnIndex(OpenableColumns.DISPLAY_NAME)
-            if (idx >= 0 && cc.moveToFirst()) return cc.getString(idx)
-        }
-        return null
     }
 
     private fun openReader(id: Long) {
