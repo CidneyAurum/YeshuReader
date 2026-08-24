@@ -23,6 +23,7 @@ import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.heightIn
+import androidx.compose.foundation.layout.imePadding
 import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
@@ -289,7 +290,10 @@ private fun DestinationContent(
         Destination.Stats -> LegacyHost(activity) { StatsView(activity) }
         is Destination.Reader -> DocumentWorkbenchScreen(activity, destination.bookId, onNavigate)
         is Destination.BookNotes -> LegacyHost(activity) { NotesView(activity, destination.bookId) }
-        is Destination.Chat -> LegacyHost(activity) { ChatView(activity, destination.bookId, destination.chapterContext) }
+        is Destination.Chat -> LegacyHost(
+            activity,
+            Modifier.statusBarsPadding().navigationBarsPadding().imePadding()
+        ) { ChatView(activity, destination.bookId, destination.chapterContext) }
     }
 }
 
@@ -897,7 +901,7 @@ private fun SettingsScreen(activity: MainActivity) {
     var testing by remember { mutableStateOf(false) }
     var discoveredModels by remember { mutableStateOf<List<String>>(emptyList()) }
     var modelPickerTarget by remember { mutableStateOf<String?>(null) }
-    var modelSearch by remember { mutableStateOf("") }
+    var modelDraft by remember { mutableStateOf("") }
     var confirmDeleteProfile by remember { mutableStateOf(false) }
     val scope = rememberCoroutineScope()
     val themeMode by activity.userPreferences.themeMode.collectAsStateWithLifecycle(initialValue = "system")
@@ -945,29 +949,83 @@ private fun SettingsScreen(activity: MainActivity) {
         }
     }
 
+    fun applyPickedModel(rawModel: String) {
+        val target = modelPickerTarget ?: return
+        val chosen = rawModel.trim().take(240)
+        if (target == "text" && chosen.isBlank()) {
+            status = "文本模型不能为空"
+            return
+        }
+        val updated = if (target == "vision") {
+            draftProfile().copy(visionModel = chosen)
+        } else {
+            draftProfile().copy(textModel = chosen)
+        }
+        runCatching { AiProfileStore.save(db, updated, activate = true) }
+            .onSuccess { saved ->
+                if (target == "vision") visionModel = saved.visionModel else textModel = saved.textModel
+                profiles = AiProfileStore.list(db)
+                activeProfileId = saved.id
+                modelPickerTarget = null
+                modelDraft = ""
+                status = if (target == "vision" && chosen.isBlank()) {
+                    "视觉模型已清空"
+                } else {
+                    "已选择并保存模型：$chosen"
+                }
+            }
+            .onFailure { status = "保存模型失败：${AiClient.userFacingError(it)}" }
+    }
+
     if (modelPickerTarget != null) {
-        val filtered = discoveredModels.filter { it.contains(modelSearch, ignoreCase = true) }
+        val isVisionPicker = modelPickerTarget == "vision"
+        val presetModels = AiProviders.presets.mapNotNull { preset ->
+            (if (isVisionPicker) preset.visionModelHint else preset.textModelHint).takeIf(String::isNotBlank)
+        }
+        val currentModel = if (isVisionPicker) visionModel else textModel
+        val modelOptions = (discoveredModels + presetModels + listOf(currentModel))
+            .filter(String::isNotBlank)
+            .distinct()
+        val filtered = modelOptions
         AlertDialog(
             onDismissRequest = { modelPickerTarget = null },
-            title = { Text(if (modelPickerTarget == "vision") "选择视觉模型" else "选择文本模型") },
+            title = { Text(if (isVisionPicker) "选择视觉模型" else "选择文本模型") },
             text = {
-                Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                    GlassTextField(modelSearch, { modelSearch = it }, "搜索 ${discoveredModels.size} 个模型")
-                    LazyColumn(Modifier.fillMaxWidth().heightIn(max = 360.dp)) {
+                Column(
+                    modifier = Modifier.imePadding(),
+                    verticalArrangement = Arrangement.spacedBy(8.dp)
+                ) {
+                    Text(
+                        "直接输入任意模型 ID，或从接口返回与常用候选中选择。选择后立即保存到当前配置。",
+                        fontSize = 11.sp,
+                        color = secondaryText()
+                    )
+                    GlassTextField(modelDraft, { modelDraft = it }, "模型 ID")
+                    if (filtered.isNotEmpty()) Text("候选模型（${filtered.size}）", fontWeight = FontWeight.Medium)
+                    LazyColumn(Modifier.fillMaxWidth().heightIn(max = 280.dp)) {
                         items(filtered, key = { it }) { model ->
                             TextButton(
-                                onClick = {
-                                    if (modelPickerTarget == "vision") visionModel = model else textModel = model
-                                    modelPickerTarget = null
-                                    modelSearch = ""
-                                },
+                                onClick = { applyPickedModel(model) },
                                 modifier = Modifier.fillMaxWidth()
                             ) { Text(model, modifier = Modifier.fillMaxWidth()) }
                         }
                     }
                 }
             },
-            confirmButton = { TextButton(onClick = { modelPickerTarget = null }) { Text("关闭") } }
+            confirmButton = {
+                TextButton(
+                    enabled = modelDraft.isNotBlank(),
+                    onClick = { applyPickedModel(modelDraft) }
+                ) { Text("使用此模型") }
+            },
+            dismissButton = {
+                Row {
+                    if (isVisionPicker && visionModel.isNotBlank()) {
+                        TextButton(onClick = { applyPickedModel("") }) { Text("清空") }
+                    }
+                    TextButton(onClick = { modelPickerTarget = null }) { Text("取消") }
+                }
+            }
         )
     }
 
@@ -1045,6 +1103,15 @@ private fun SettingsScreen(activity: MainActivity) {
                 ) {
                     Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
                         SettingsSectionTitle("AI 服务", "◇", ElectricBlue)
+                        val effectiveProfile = profiles.firstOrNull { it.id == activeProfileId }
+                        GlassPill(color = LuminousCyan) {
+                            Text(
+                                "当前调用：${effectiveProfile?.name ?: profileName} · " +
+                                    effectiveProfile?.textModel.orEmpty().ifBlank { "未选择文本模型" },
+                                fontSize = 11.sp,
+                                color = MaterialTheme.colorScheme.onSurface
+                            )
+                        }
                         Text("已保存配置", fontWeight = FontWeight.Bold)
                         Row(
                             Modifier.horizontalScroll(rememberScrollState()),
@@ -1135,14 +1202,14 @@ private fun SettingsScreen(activity: MainActivity) {
                             onValueChange = { textModel = it },
                             label = "文本模型（可手输任意名称）",
                             availableCount = discoveredModels.size,
-                            onPick = { modelSearch = ""; modelPickerTarget = "text" }
+                            onPick = { modelDraft = textModel; modelPickerTarget = "text" }
                         )
                         ModelTextField(
                             value = visionModel,
                             onValueChange = { visionModel = it },
                             label = "视觉模型（可留空）",
                             availableCount = discoveredModels.size,
-                            onPick = { modelSearch = ""; modelPickerTarget = "vision" }
+                            onPick = { modelDraft = visionModel; modelPickerTarget = "vision" }
                         )
                         GlassTextField(chatPath, { chatPath = it }, "Chat 接口路径或完整 URL")
                         GlassTextField(modelsPath, { modelsPath = it }, "模型列表路径（留空则不读取）")
@@ -1255,7 +1322,9 @@ private fun SettingsScreen(activity: MainActivity) {
                                             status = if (models.isEmpty()) {
                                                 "模型列表接口已关闭，请手动填写模型"
                                             } else {
-                                                "已读取 ${models.size} 个模型，可点击模型框右侧选择"
+                                                modelDraft = textModel
+                                                modelPickerTarget = "text"
+                                                "已读取 ${models.size} 个模型，请选择本次调用模型"
                                             }
                                         }.onFailure {
                                             status = "读取失败：${AiClient.userFacingError(it)}；仍可手动填写模型"
@@ -1404,8 +1473,8 @@ private fun ModelTextField(
         label = { Text(label) },
         singleLine = true,
         trailingIcon = {
-            TextButton(enabled = availableCount > 0, onClick = onPick) {
-                Text(if (availableCount > 0) "选择" else "手输")
+            TextButton(onClick = onPick) {
+                Text(if (availableCount > 0) "选择 $availableCount" else "选择")
             }
         },
         shape = RoundedCornerShape(18.dp),

@@ -4,18 +4,15 @@ import android.app.Activity
 import android.graphics.Color
 import android.graphics.Typeface
 import android.graphics.drawable.GradientDrawable
+import android.text.TextUtils
 import android.view.Gravity
-import android.view.ViewGroup
-import android.view.WindowManager
 import android.widget.EditText
 import android.widget.FrameLayout
 import android.widget.LinearLayout
 import android.widget.ScrollView
 import android.widget.TextView
-import androidx.core.view.ViewCompat
-import androidx.core.view.WindowInsetsAnimationCompat
-import androidx.core.view.WindowInsetsCompat
-import kotlin.math.max
+import android.widget.Toast
+import app.yeshu.reader.ai.AiProfileStore
 
 /**
  * 与书聊天：带全书上下文的多轮对话伴侣。
@@ -34,6 +31,7 @@ class ChatView(
     private lateinit var sc: ScrollView
     private lateinit var etInput: EditText
     private lateinit var btnSend: TextView
+    private lateinit var modelChip: TextView
     private var busy = false
     private val scrollToBottomAction = Runnable {
         if (::sc.isInitialized) sc.fullScroll(ScrollView.FOCUS_DOWN)
@@ -48,7 +46,6 @@ class ChatView(
         setBackgroundColor(Color.parseColor("#10141C"))
         val col = LinearLayout(act).apply { orientation = LinearLayout.VERTICAL }
         addView(col, LayoutParams(-1, -1))
-        act.window.setSoftInputMode(WindowManager.LayoutParams.SOFT_INPUT_ADJUST_RESIZE)
 
         val d = density(act)
         // 顶栏
@@ -74,7 +71,21 @@ class ChatView(
             lp.marginStart = Glass.dp(12, d)
             layoutParams = lp
         })
+        modelChip = TextView(act).apply {
+            textSize = 10f
+            setTextColor(Color.parseColor("#B8C6FF"))
+            gravity = Gravity.CENTER
+            maxLines = 1
+            ellipsize = TextUtils.TruncateAt.END
+            maxWidth = Glass.dp(132, d)
+            setPadding(Glass.dp(10, d), Glass.dp(7, d), Glass.dp(10, d), Glass.dp(7, d))
+            background = Glass.pillBg(Color.argb(48, 91, 95, 245))
+            contentDescription = "选择 AI 调用配置"
+            setOnClickListener { showModelProfilePicker() }
+        }
+        top.addView(modelChip, LinearLayout.LayoutParams(-2, -2))
         col.addView(top, LinearLayout.LayoutParams(-1, -2))
+        refreshModelChip()
 
         // 气泡列表
         sc = ScrollView(act).apply { isVerticalScrollBarEnabled = false }
@@ -118,7 +129,6 @@ class ChatView(
         inputBar.addView(btnSend)
         col.addView(inputBar, LinearLayout.LayoutParams(-1, -2))
 
-        installKeyboardInsets(col)
         etInput.setOnFocusChangeListener { _, focused ->
             if (focused) scrollToBottom()
         }
@@ -239,47 +249,30 @@ class ChatView(
         sc.post(scrollToBottomAction)
     }
 
-    /** Edge-to-edge 下显式使用 IME inset，避免键盘覆盖输入栏和最后一条消息。 */
-    private fun installKeyboardInsets(content: LinearLayout) {
-        var lastImeBottom = -1
-        ViewCompat.setOnApplyWindowInsetsListener(this) { root, insets ->
-            val systemBars = insets.getInsets(
-                WindowInsetsCompat.Type.statusBars() or
-                    WindowInsetsCompat.Type.displayCutout() or
-                    WindowInsetsCompat.Type.navigationBars()
-            )
-            val navigation = insets.getInsets(WindowInsetsCompat.Type.navigationBars())
-            val ime = insets.getInsets(WindowInsetsCompat.Type.ime())
-            root.setPadding(systemBars.left, systemBars.top, systemBars.right, 0)
+    /** Quick switch for the active profile used by the very next chat request. */
+    private fun showModelProfilePicker() {
+        val profiles = AiProfileStore.list(db)
+        val active = AiProfileStore.active(db)
+        val labels = profiles.map { profile ->
+            "${profile.name}  ·  ${profile.textModel.ifBlank { "未填写模型" }}"
+        }.toTypedArray()
+        val selected = profiles.indexOfFirst { it.id == active.id }
+        android.app.AlertDialog.Builder(act)
+            .setTitle("选择本次调用配置")
+            .setSingleChoiceItems(labels, selected) { dialog, which ->
+                AiProfileStore.setActive(db, profiles[which].id)
+                refreshModelChip()
+                Toast.makeText(act, "已切换到 ${labels[which]}", Toast.LENGTH_SHORT).show()
+                dialog.dismiss()
+            }
+            .setNeutralButton("管理模型") { _, _ -> (act as MainActivity).showSettings() }
+            .setNegativeButton("取消", null)
+            .show()
+    }
 
-            val bottomInset = max(navigation.bottom, ime.bottom)
-            val params = content.layoutParams as ViewGroup.MarginLayoutParams
-            if (params.bottomMargin != bottomInset) {
-                params.bottomMargin = bottomInset
-                content.layoutParams = params
-            }
-            if (ime.bottom != lastImeBottom) {
-                lastImeBottom = ime.bottom
-                if (ime.bottom > 0) scrollToBottom()
-            }
-            insets
-        }
-        ViewCompat.setWindowInsetsAnimationCallback(
-            this,
-            object : WindowInsetsAnimationCompat.Callback(DISPATCH_MODE_CONTINUE_ON_SUBTREE) {
-                override fun onProgress(
-                    insets: WindowInsetsCompat,
-                    runningAnimations: MutableList<WindowInsetsAnimationCompat>
-                ): WindowInsetsCompat {
-                    if (insets.isVisible(WindowInsetsCompat.Type.ime())) scrollToBottom()
-                    return insets
-                }
-
-                override fun onEnd(animation: WindowInsetsAnimationCompat) {
-                    if (etInput.hasFocus()) scrollToBottom()
-                }
-            }
-        )
-        ViewCompat.requestApplyInsets(this)
+    private fun refreshModelChip() {
+        if (!::modelChip.isInitialized) return
+        val active = AiProfileStore.active(db)
+        modelChip.text = "${active.textModel.ifBlank { "选择模型" }}  ▾"
     }
 }
