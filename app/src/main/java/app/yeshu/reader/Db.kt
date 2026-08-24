@@ -242,6 +242,22 @@ class Db(context: Context) {
         dao.deleteSetting("ai_key")
     }
 
+    /** Profile-scoped Key storage allows several providers, including two on the same host. */
+    fun getAiKey(profileId: String, baseUrl: String): String {
+        val origin = runCatching { AiClient.endpointOrigin(baseUrl) }.getOrDefault("")
+        return SecureKeyStore(appContext).readProfileApiKey(profileId, origin)
+    }
+
+    fun hasAiKey(profileId: String): Boolean = SecureKeyStore(appContext).hasProfileApiKey(profileId)
+
+    fun setAiKey(profileId: String, value: String, baseUrl: String) {
+        val origin = runCatching { AiClient.endpointOrigin(baseUrl) }.getOrDefault("")
+        SecureKeyStore(appContext).writeProfileApiKey(profileId, value.trim(), origin)
+        dao.deleteSetting("ai_key")
+    }
+
+    fun removeAiKey(profileId: String) = SecureKeyStore(appContext).removeProfileApiKey(profileId)
+
     fun addNote(bookId: Long, kind: String, content: String): Long = dao.addNote(
         NoteEntity(bookId = bookId, kind = kind, content = content, createdAt = System.currentTimeMillis())
     )

@@ -8,6 +8,7 @@ import org.junit.Assert.assertTrue
 import org.junit.Test
 import java.io.ByteArrayInputStream
 import java.io.ByteArrayOutputStream
+import java.io.File
 import java.lang.reflect.InvocationTargetException
 import java.net.HttpURLConnection
 import java.net.InetAddress
@@ -17,6 +18,24 @@ import java.util.concurrent.atomic.AtomicReference
 import kotlin.concurrent.thread
 
 class AiClientTest {
+
+    @Test
+    fun productionNetworkEntryPointsRemainCentralizedInAiClient() {
+        val sourceRoot = sequenceOf(File("src/main"), File("app/src/main"))
+            .firstOrNull(File::isDirectory)
+        assertTrue("Production source root was not found", sourceRoot != null)
+        val networkApi = Regex(
+            "openConnection\\s*\\(|java\\.net\\.URL\\b|java\\.net\\.Socket\\b|" +
+                "import\\s+java\\.net\\.HttpURLConnection|okhttp3|android\\.webkit\\.WebView"
+        )
+        val offenders = sourceRoot!!.walkTopDown()
+            .filter { it.isFile && it.extension in setOf("kt", "java") && it.name != "AiClient.kt" }
+            .filter { networkApi.containsMatchIn(it.readText()) }
+            .map { it.relativeTo(sourceRoot).invariantSeparatorsPath }
+            .toList()
+
+        assertEquals("All outbound networking must pass through AiClient's HTTPS/LAN policy", emptyList<String>(), offenders)
+    }
 
     @Test
     fun normalizeBase_addsHttpsAndOpenAiPathForBareHost() {
@@ -52,6 +71,64 @@ class AiClientTest {
             "https://token.example/v1/models",
             AiClient.modelsEndpoint("https://token.example/v1/chat/completions")
         )
+    }
+
+    @Test
+    fun compatibleEndpoints_supportCustomRelativeAndFullUrlsWithQuery() {
+        assertEquals(
+            "https://api.example.com/openai/v1/custom/chat",
+            AiClient.chatCompletionsEndpoint("https://api.example.com/openai/v1", "/custom/chat")
+        )
+        assertEquals(
+            "https://api.example.com/deployments/demo/chat/completions?api-version=2025-01-01",
+            AiClient.chatCompletionsEndpoint(
+                "https://api.example.com/v1",
+                "https://api.example.com/deployments/demo/chat/completions?api-version=2025-01-01"
+            )
+        )
+    }
+
+    @Test
+    fun extractModelIds_acceptsOpenAiOllamaAndStringLists() {
+        assertEquals(
+            listOf("alpha", "beta"),
+            AiClient.extractModelIds("""{"data":[{"id":"beta"},{"id":"alpha"}]}""")
+        )
+        assertEquals(
+            listOf("qwen:latest"),
+            AiClient.extractModelIds("""{"models":[{"name":"qwen:latest"}]}""")
+        )
+        assertEquals(
+            listOf("model-a", "model-b"),
+            AiClient.extractModelIds("""{"data":{"models":["model-b","model-a"]}}""")
+        )
+    }
+
+    @Test
+    fun chat_supportsCustomPathHeaderAndPrefixlessKey() {
+        val server = CompatibilityServer(expectedRequests = 1)
+        try {
+            val result = AiClient.chat(
+                AiClient.Config(
+                    baseUrl = "http://127.0.0.1:${server.port}/gateway",
+                    key = "custom_test_secret",
+                    model = "manual-model",
+                    allowPrivateHttp = true,
+                    chatPath = "/invoke/chat",
+                    authHeader = "api-key",
+                    authPrefix = ""
+                ),
+                system = null,
+                user = "ping",
+                timeoutMs = 5_000
+            )
+            server.awaitRequests()
+            assertEquals("OK", result)
+            assertEquals("/gateway/invoke/chat", server.lastRequestPath.get())
+            assertEquals("custom_test_secret", server.customRequestAuthorization.get())
+        } finally {
+            server.close()
+        }
     }
 
     @Test
@@ -114,7 +191,7 @@ class AiClientTest {
     }
 
     @Test
-    fun endpointError_requiresLocalHostnameForLanCleartext() {
+    fun endpointError_acceptsPrivateLanAddressesAfterOptIn() {
         val privateIpEndpoints = listOf(
             "http://10.42.0.5:8080",
             "http://172.16.0.1:8080",
@@ -125,9 +202,9 @@ class AiClientTest {
         )
 
         privateIpEndpoints.forEach { endpoint ->
-            assertTrue(
+            assertNull(
+                "Expected LAN endpoint to be accepted: $endpoint",
                 AiClient.endpointError(config(endpoint, allowPrivateHttp = true))
-                    .orEmpty().contains(".local")
             )
         }
     }
@@ -167,6 +244,33 @@ class AiClientTest {
     fun endpointError_reportsMissingAndMalformedAddresses() {
         assertEquals("请填写接口地址", AiClient.endpointError(config("   ")))
         assertEquals("接口地址格式不正确", AiClient.endpointError(config("https://[broken")))
+    }
+
+    @Test
+    fun endpointError_rejectsCrossOriginEndpointAndInvalidAuthHeader() {
+        assertEquals(
+            "Chat 接口不能切换到其他服务商域名",
+            AiClient.endpointError(config("https://api.example.com").copy(
+                chatPath = "https://other.example.com/chat"
+            ))
+        )
+        assertEquals(
+            "鉴权 Header 名称不正确",
+            AiClient.endpointError(config("https://api.example.com").copy(
+                key = "test-key",
+                authHeader = "Bad Header"
+            ))
+        )
+        listOf("Host", "Content-Length", "Proxy-Authorization").forEach { header ->
+            assertEquals(
+                "Unexpected policy result for $header",
+                "鉴权 Header 不能使用 HTTP 协议保留字段",
+                AiClient.endpointError(config("https://api.example.com").copy(
+                    key = "test-key",
+                    authHeader = header
+                ))
+            )
+        }
     }
 
     @Test
@@ -265,16 +369,18 @@ class AiClientTest {
         override fun usingProxy() = false
     }
 
-    private class CompatibilityServer : AutoCloseable {
+    private class CompatibilityServer(private val expectedRequests: Int = 2) : AutoCloseable {
         private val socket = ServerSocket(0, 2, InetAddress.getByName("127.0.0.1"))
         private val failure = AtomicReference<Throwable>()
         val modelRequestAuthorization = AtomicReference<String>()
         val chatRequestAuthorization = AtomicReference<String>()
+        val customRequestAuthorization = AtomicReference<String>()
+        val lastRequestPath = AtomicReference<String>()
         val chatContentLength = java.util.concurrent.atomic.AtomicInteger()
         val port: Int = socket.localPort
         private val worker = thread(name = "ai-client-test-server", isDaemon = true) {
             try {
-                repeat(2) { serve(socket.accept()) }
+                repeat(expectedRequests) { serve(socket.accept()) }
             } catch (error: Throwable) {
                 if (!socket.isClosed) failure.set(error)
             }
@@ -300,6 +406,7 @@ class AiClientTest {
             }
             val headerLines = headerBytes.toString(Charsets.US_ASCII).lineSequence().toList()
             val path = headerLines.firstOrNull().orEmpty().split(' ').getOrNull(1).orEmpty()
+            lastRequestPath.set(path)
             val headers = linkedMapOf<String, String>()
             headerLines.drop(1).forEach { line ->
                 val separator = line.indexOf(':')
@@ -313,6 +420,7 @@ class AiClientTest {
                 HttpResponse(404, "Not Found", ByteArray(0))
             } else {
                 chatRequestAuthorization.set(headers["authorization"])
+                customRequestAuthorization.set(headers["api-key"])
                 chatContentLength.set(contentLength)
                 HttpResponse(
                     200,

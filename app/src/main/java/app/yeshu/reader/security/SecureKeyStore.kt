@@ -5,6 +5,7 @@ import android.security.keystore.KeyGenParameterSpec
 import android.security.keystore.KeyProperties
 import android.util.Base64
 import java.security.KeyStore
+import java.security.MessageDigest
 import javax.crypto.Cipher
 import javax.crypto.KeyGenerator
 import javax.crypto.SecretKey
@@ -20,8 +21,20 @@ class SecureKeyStore(context: Context) {
         // An origin-less payload may have come from an older build. Never silently send it to
         // whichever provider the user happens to configure first; the UI must explicitly bind it.
         if (storedOrigin.isBlank() || storedOrigin != expectedOrigin) return ""
-        return decryptPayload()
+        return decryptPayload(KEY_PAYLOAD)
     }
+
+    /** Reads one profile's independently encrypted key and verifies its provider origin. */
+    fun readProfileApiKey(profileId: String, expectedOrigin: String): String {
+        if (profileId.isBlank() || expectedOrigin.isBlank()) return ""
+        val slot = profileSlot(profileId)
+        val storedOrigin = prefs.getString("${slot}_origin", "").orEmpty()
+        if (storedOrigin != expectedOrigin) return ""
+        return decryptPayload("${slot}_payload")
+    }
+
+    fun hasProfileApiKey(profileId: String): Boolean =
+        prefs.getString("${profileSlot(profileId)}_payload", null).orEmpty().isNotBlank()
 
     fun hasUnboundApiKey(): Boolean =
         prefs.getString(KEY_PAYLOAD, null).orEmpty().isNotBlank() &&
@@ -33,7 +46,7 @@ class SecureKeyStore(context: Context) {
     fun bindUnboundApiKey(origin: String): Boolean {
         require(origin.isNotBlank()) { "API Key 必须绑定有效的服务地址" }
         if (!hasUnboundApiKey()) return false
-        val value = decryptPayload()
+        val value = decryptPayload(KEY_PAYLOAD)
         if (value.isBlank()) return false
         writeApiKey(value, origin)
         return true
@@ -48,23 +61,46 @@ class SecureKeyStore(context: Context) {
         writeEncrypted(value, origin)
     }
 
+    fun writeProfileApiKey(profileId: String, value: String, origin: String) {
+        require(profileId.isNotBlank()) { "AI 配置 ID 不能为空" }
+        val slot = profileSlot(profileId)
+        val payloadKey = "${slot}_payload"
+        val originKey = "${slot}_origin"
+        if (value.isBlank()) {
+            prefs.edit().remove(payloadKey).remove(originKey).apply()
+            return
+        }
+        require(origin.isNotBlank()) { "API Key 必须绑定有效的服务地址" }
+        writeEncrypted(value, origin, payloadKey, originKey)
+    }
+
+    fun removeProfileApiKey(profileId: String) {
+        val slot = profileSlot(profileId)
+        prefs.edit().remove("${slot}_payload").remove("${slot}_origin").apply()
+    }
+
     /** Stores a migrated legacy key without authorizing it for any provider. */
     fun writeUnboundApiKey(value: String) {
         if (value.isBlank()) return
         writeEncrypted(value, "")
     }
 
-    private fun writeEncrypted(value: String, origin: String) {
+    private fun writeEncrypted(
+        value: String,
+        origin: String,
+        payloadKey: String = KEY_PAYLOAD,
+        originKey: String = KEY_ORIGIN
+    ) {
         val cipher = Cipher.getInstance(TRANSFORMATION)
         cipher.init(Cipher.ENCRYPT_MODE, getOrCreateKey())
         val encrypted = cipher.doFinal(value.toByteArray(Charsets.UTF_8))
         val payload = Base64.encodeToString(cipher.iv, Base64.NO_WRAP) + ":" +
             Base64.encodeToString(encrypted, Base64.NO_WRAP)
-        prefs.edit().putString(KEY_PAYLOAD, payload).putString(KEY_ORIGIN, origin).apply()
+        prefs.edit().putString(payloadKey, payload).putString(originKey, origin).apply()
     }
 
-    private fun decryptPayload(): String = runCatching {
-        val payload = prefs.getString(KEY_PAYLOAD, null) ?: return ""
+    private fun decryptPayload(payloadKey: String): String = runCatching {
+        val payload = prefs.getString(payloadKey, null) ?: return ""
         val parts = payload.split(':', limit = 2)
         require(parts.size == 2)
         val cipher = Cipher.getInstance(TRANSFORMATION)
@@ -75,6 +111,12 @@ class SecureKeyStore(context: Context) {
         )
         cipher.doFinal(Base64.decode(parts[1], Base64.NO_WRAP)).toString(Charsets.UTF_8)
     }.getOrElse { "" }
+
+    private fun profileSlot(profileId: String): String {
+        val digest = MessageDigest.getInstance("SHA-256")
+            .digest(profileId.toByteArray(Charsets.UTF_8))
+        return "ai_profile_" + digest.take(12).joinToString("") { "%02x".format(it.toInt() and 0xff) }
+    }
 
     private fun getOrCreateKey(): SecretKey {
         val store = KeyStore.getInstance("AndroidKeyStore").apply { load(null) }

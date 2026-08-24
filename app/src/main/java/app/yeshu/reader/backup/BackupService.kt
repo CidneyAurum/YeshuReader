@@ -36,7 +36,9 @@ object BackupService {
     private val backupSettingKeys = setOf(
         "reader_font_sp", "reader_brightness", "night_mode",
         "shelf_sort", "shelf_filter", "shelf_view",
-        "ai_base_url", "ai_model", "ai_vision_model", "ai_allow_private_http"
+        "ai_base_url", "ai_model", "ai_vision_model", "ai_allow_private_http",
+        "ai_chat_path", "ai_models_path", "ai_auth_header", "ai_auth_prefix",
+        "ai_profiles_json", "ai_active_profile_id"
     )
 
     fun export(context: Context, uri: Uri): String = runCatching {

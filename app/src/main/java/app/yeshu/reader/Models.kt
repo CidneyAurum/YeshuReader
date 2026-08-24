@@ -52,7 +52,11 @@ data class AiProviderProfile(
     val visionModel: String,
     val supportsStreaming: Boolean = true,
     val supportsVision: Boolean = false,
-    val allowPrivateHttp: Boolean = false
+    val allowPrivateHttp: Boolean = false,
+    val chatPath: String = "/chat/completions",
+    val modelsPath: String = "/models",
+    val authHeader: String = "Authorization",
+    val authPrefix: String = "Bearer"
 )
 
 data class AiArtifact(

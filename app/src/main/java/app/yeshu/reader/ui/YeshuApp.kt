@@ -101,7 +101,9 @@ import app.yeshu.reader.ReaderView
 import app.yeshu.reader.SettingsView
 import app.yeshu.reader.ShelfView
 import app.yeshu.reader.StatsView
+import app.yeshu.reader.ai.AiProfileStore
 import app.yeshu.reader.ai.AiProviders
+import app.yeshu.reader.ai.SavedAiProfile
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
@@ -297,15 +299,18 @@ private fun DocumentWorkbenchScreen(
     bookId: Long,
     onNavigate: (Destination) -> Unit
 ) {
-    BoxWithConstraints(Modifier.fillMaxSize()) {
+    BoxWithConstraints(Modifier.fillMaxSize().background(Color(0xFF090D1A))) {
         if (maxWidth < 840.dp) {
-            LegacyHost(activity) { ReaderView(activity, bookId, showDocumentTabs = true) }
+            LegacyHost(
+                activity,
+                Modifier.statusBarsPadding().navigationBarsPadding()
+            ) { ReaderView(activity, bookId, showDocumentTabs = true) }
         } else {
             val reader = remember(bookId) { ReaderView(activity, bookId, showDocumentTabs = false) }
             val book = remember(bookId) { Db(activity).getBook(bookId) }
             Row(Modifier.fillMaxSize()) {
                 AndroidView(
-                    modifier = Modifier.weight(1f).fillMaxHeight(),
+                    modifier = Modifier.weight(1f).fillMaxHeight().statusBarsPadding().navigationBarsPadding(),
                     factory = { reader.also(activity::registerLegacy) },
                     update = { activity.registerLegacy(it) }
                 )
@@ -366,9 +371,9 @@ private fun DocumentTool(
 }
 
 @Composable
-private fun LegacyHost(activity: MainActivity, factory: () -> View) {
+private fun LegacyHost(activity: MainActivity, modifier: Modifier = Modifier, factory: () -> View) {
     AndroidView(
-        modifier = Modifier.fillMaxSize(),
+        modifier = modifier.fillMaxSize(),
         factory = { factory().also(activity::registerLegacy) },
         update = { activity.registerLegacy(it) }
     )
@@ -872,18 +877,117 @@ private fun cleanNoteContent(content: String): String =
 @Composable
 private fun SettingsScreen(activity: MainActivity) {
     val db = remember { Db(activity) }
-    var baseUrl by remember { mutableStateOf(db.getSetting("ai_base_url").orEmpty()) }
-    var textModel by remember { mutableStateOf(db.getSetting("ai_model").orEmpty()) }
-    var visionModel by remember { mutableStateOf(db.getSetting("ai_vision_model").orEmpty()) }
+    val initialProfiles = remember { AiProfileStore.list(db) }
+    val initialProfile = remember { AiProfileStore.active(db) }
+    var profiles by remember { mutableStateOf(initialProfiles) }
+    var activeProfileId by remember { mutableStateOf(initialProfile.id) }
+    var profileName by remember { mutableStateOf(initialProfile.name) }
+    var baseUrl by remember { mutableStateOf(initialProfile.baseUrl) }
+    var textModel by remember { mutableStateOf(initialProfile.textModel) }
+    var visionModel by remember { mutableStateOf(initialProfile.visionModel) }
+    var chatPath by remember { mutableStateOf(initialProfile.chatPath) }
+    var modelsPath by remember { mutableStateOf(initialProfile.modelsPath) }
+    var authHeader by remember { mutableStateOf(initialProfile.authHeader) }
+    var authPrefix by remember { mutableStateOf(initialProfile.authPrefix) }
     var keyInput by remember { mutableStateOf("") }
-    var hasSavedKey by remember { mutableStateOf(db.getAiKey(baseUrl).isNotBlank()) }
+    var hasSavedKey by remember { mutableStateOf(db.getAiKey(initialProfile.id, initialProfile.baseUrl).isNotBlank()) }
     var hasUnboundKey by remember { mutableStateOf(db.hasUnboundAiKey()) }
-    var allowPrivateHttp by remember { mutableStateOf(db.getSetting("ai_allow_private_http") == "1") }
+    var allowPrivateHttp by remember { mutableStateOf(initialProfile.allowPrivateHttp) }
     var status by remember { mutableStateOf<String?>(null) }
     var testing by remember { mutableStateOf(false) }
+    var discoveredModels by remember { mutableStateOf<List<String>>(emptyList()) }
+    var modelPickerTarget by remember { mutableStateOf<String?>(null) }
+    var modelSearch by remember { mutableStateOf("") }
+    var confirmDeleteProfile by remember { mutableStateOf(false) }
     val scope = rememberCoroutineScope()
     val themeMode by activity.userPreferences.themeMode.collectAsStateWithLifecycle(initialValue = "system")
     val showIllustrations by activity.userPreferences.showIllustrations.collectAsStateWithLifecycle(initialValue = true)
+
+    fun draftProfile() = SavedAiProfile(
+        id = activeProfileId,
+        name = profileName,
+        baseUrl = baseUrl,
+        textModel = textModel,
+        visionModel = visionModel,
+        chatPath = chatPath,
+        modelsPath = modelsPath,
+        authHeader = authHeader,
+        authPrefix = authPrefix,
+        allowPrivateHttp = allowPrivateHttp
+    )
+
+    fun loadProfile(profile: SavedAiProfile) {
+        activeProfileId = profile.id
+        profileName = profile.name
+        baseUrl = profile.baseUrl
+        textModel = profile.textModel
+        visionModel = profile.visionModel
+        chatPath = profile.chatPath
+        modelsPath = profile.modelsPath
+        authHeader = profile.authHeader
+        authPrefix = profile.authPrefix
+        allowPrivateHttp = profile.allowPrivateHttp
+        keyInput = ""
+        hasSavedKey = db.getAiKey(profile.id, profile.baseUrl).isNotBlank()
+        discoveredModels = emptyList()
+    }
+
+    fun saveDraft(activate: Boolean = true): Result<SavedAiProfile> = runCatching {
+        AiProfileStore.save(
+            db = db,
+            raw = draftProfile(),
+            key = keyInput.takeIf { it.isNotBlank() },
+            activate = activate
+        ).also { saved ->
+            if (keyInput.isNotBlank()) keyInput = ""
+            profiles = AiProfileStore.list(db)
+            loadProfile(saved)
+        }
+    }
+
+    if (modelPickerTarget != null) {
+        val filtered = discoveredModels.filter { it.contains(modelSearch, ignoreCase = true) }
+        AlertDialog(
+            onDismissRequest = { modelPickerTarget = null },
+            title = { Text(if (modelPickerTarget == "vision") "选择视觉模型" else "选择文本模型") },
+            text = {
+                Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                    GlassTextField(modelSearch, { modelSearch = it }, "搜索 ${discoveredModels.size} 个模型")
+                    LazyColumn(Modifier.fillMaxWidth().heightIn(max = 360.dp)) {
+                        items(filtered, key = { it }) { model ->
+                            TextButton(
+                                onClick = {
+                                    if (modelPickerTarget == "vision") visionModel = model else textModel = model
+                                    modelPickerTarget = null
+                                    modelSearch = ""
+                                },
+                                modifier = Modifier.fillMaxWidth()
+                            ) { Text(model, modifier = Modifier.fillMaxWidth()) }
+                        }
+                    }
+                }
+            },
+            confirmButton = { TextButton(onClick = { modelPickerTarget = null }) { Text("关闭") } }
+        )
+    }
+
+    if (confirmDeleteProfile) {
+        AlertDialog(
+            onDismissRequest = { confirmDeleteProfile = false },
+            title = { Text("删除 AI 配置？") },
+            text = { Text("将删除“$profileName”及其单独保存的 API Key，其他配置不受影响。") },
+            confirmButton = {
+                TextButton(onClick = {
+                    val next = AiProfileStore.delete(db, activeProfileId)
+                    profiles = AiProfileStore.list(db)
+                    loadProfile(next)
+                    confirmDeleteProfile = false
+                    status = "配置已删除"
+                }) { Text("删除", color = MaterialTheme.colorScheme.error) }
+            },
+            dismissButton = { TextButton(onClick = { confirmDeleteProfile = false }) { Text("取消") } }
+        )
+    }
 
     BoxWithConstraints(Modifier.fillMaxSize()) {
         val pageWidth = if (maxWidth > 900.dp) 900.dp else maxWidth
@@ -941,6 +1045,60 @@ private fun SettingsScreen(activity: MainActivity) {
                 ) {
                     Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
                         SettingsSectionTitle("AI 服务", "◇", ElectricBlue)
+                        Text("已保存配置", fontWeight = FontWeight.Bold)
+                        Row(
+                            Modifier.horizontalScroll(rememberScrollState()),
+                            horizontalArrangement = Arrangement.spacedBy(8.dp)
+                        ) {
+                            profiles.forEach { profile ->
+                                FilterChip(
+                                    selected = profile.id == activeProfileId,
+                                    onClick = {
+                                        val saved = saveDraft(activate = false)
+                                        if (saved.isFailure) {
+                                            status = "切换失败：${AiClient.userFacingError(saved.exceptionOrNull()!!)}"
+                                        } else {
+                                            AiProfileStore.setActive(db, profile.id)?.let(::loadProfile)
+                                            status = "已切换到 ${profile.name}"
+                                        }
+                                    },
+                                    label = { Text(profile.name) },
+                                    shape = RoundedCornerShape(16.dp)
+                                )
+                            }
+                        }
+                        Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                            OutlinedButton(
+                                onClick = {
+                                    saveDraft(activate = false)
+                                    val created = AiProfileStore.create(db, "新配置")
+                                    profiles = AiProfileStore.list(db)
+                                    loadProfile(created)
+                                    status = "已新建独立配置"
+                                },
+                                modifier = Modifier.weight(1f),
+                                shape = RoundedCornerShape(15.dp)
+                            ) { Text("新建") }
+                            OutlinedButton(
+                                onClick = {
+                                    saveDraft().getOrNull()?.let { saved ->
+                                        val copy = AiProfileStore.duplicate(db, saved)
+                                        profiles = AiProfileStore.list(db)
+                                        loadProfile(copy)
+                                        status = "已复制配置及其 Key"
+                                    }
+                                },
+                                modifier = Modifier.weight(1f),
+                                shape = RoundedCornerShape(15.dp)
+                            ) { Text("复制") }
+                            OutlinedButton(
+                                onClick = { confirmDeleteProfile = true },
+                                modifier = Modifier.weight(1f),
+                                shape = RoundedCornerShape(15.dp)
+                            ) { Text("删除") }
+                        }
+                        GlassTextField(profileName, { profileName = it }, "配置名称")
+                        Text("接口预设", fontWeight = FontWeight.Bold)
                         Row(Modifier.horizontalScroll(rememberScrollState()), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                             AiProviders.presets.forEach { preset ->
                                 AssistChip(
@@ -948,8 +1106,13 @@ private fun SettingsScreen(activity: MainActivity) {
                                         baseUrl = preset.baseUrl
                                         textModel = preset.textModelHint
                                         visionModel = preset.visionModelHint
+                                        chatPath = AiClient.DEFAULT_CHAT_PATH
+                                        modelsPath = AiClient.DEFAULT_MODELS_PATH
+                                        authHeader = AiClient.DEFAULT_AUTH_HEADER
+                                        authPrefix = AiClient.DEFAULT_AUTH_PREFIX
                                         allowPrivateHttp = false
-                                        hasSavedKey = db.getAiKey(preset.baseUrl).isNotBlank()
+                                        hasSavedKey = db.getAiKey(activeProfileId, preset.baseUrl).isNotBlank()
+                                        discoveredModels = emptyList()
                                         if (preset.id == "ollama") status = "本地 Ollama 使用 HTTP 时，请手动开启并确认局域网 HTTP"
                                     },
                                     label = { Text(preset.name) },
@@ -959,10 +1122,43 @@ private fun SettingsScreen(activity: MainActivity) {
                         }
                         GlassTextField(baseUrl, {
                             baseUrl = it
-                            hasSavedKey = db.getAiKey(it).isNotBlank()
-                        }, "Base URL")
-                        GlassTextField(textModel, { textModel = it }, "文本模型")
-                        GlassTextField(visionModel, { visionModel = it }, "视觉模型（可留空）")
+                            hasSavedKey = db.getAiKey(activeProfileId, it).isNotBlank()
+                            discoveredModels = emptyList()
+                        }, "Base URL（含 https://、端口和基础路径）")
+                        Text(
+                            "请求体协议：OpenAI Chat Completions。下面的接口路径、鉴权方式和模型均可独立填写。",
+                            fontSize = 10.sp,
+                            color = secondaryText()
+                        )
+                        ModelTextField(
+                            value = textModel,
+                            onValueChange = { textModel = it },
+                            label = "文本模型（可手输任意名称）",
+                            availableCount = discoveredModels.size,
+                            onPick = { modelSearch = ""; modelPickerTarget = "text" }
+                        )
+                        ModelTextField(
+                            value = visionModel,
+                            onValueChange = { visionModel = it },
+                            label = "视觉模型（可留空）",
+                            availableCount = discoveredModels.size,
+                            onPick = { modelSearch = ""; modelPickerTarget = "vision" }
+                        )
+                        GlassTextField(chatPath, { chatPath = it }, "Chat 接口路径或完整 URL")
+                        GlassTextField(modelsPath, { modelsPath = it }, "模型列表路径（留空则不读取）")
+                        Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                            Box(Modifier.weight(1f)) {
+                                GlassTextField(authHeader, { authHeader = it }, "鉴权 Header")
+                            }
+                            Box(Modifier.weight(1f)) {
+                                GlassTextField(authPrefix, { authPrefix = it }, "Key 前缀")
+                            }
+                        }
+                        Text(
+                            "常见鉴权：Authorization + Bearer；Azure 可用 api-key 并把前缀留空；无鉴权服务可不填 Key。",
+                            fontSize = 10.sp,
+                            color = secondaryText()
+                        )
                         OutlinedTextField(
                             value = keyInput,
                             onValueChange = { keyInput = it },
@@ -993,8 +1189,13 @@ private fun SettingsScreen(activity: MainActivity) {
                                         onClick = {
                                             val result = runCatching { db.bindUnboundAiKey(baseUrl) }
                                             if (result.getOrNull() == true) {
+                                                val migratedKey = db.getAiKey(baseUrl)
+                                                if (migratedKey.isNotBlank()) {
+                                                    db.setAiKey(activeProfileId, migratedKey, baseUrl)
+                                                    db.setAiKey("", baseUrl)
+                                                }
                                                 hasUnboundKey = false
-                                                hasSavedKey = db.getAiKey(baseUrl).isNotBlank()
+                                                hasSavedKey = db.getAiKey(activeProfileId, baseUrl).isNotBlank()
                                                 status = "旧 Key 已绑定到当前服务"
                                             } else {
                                                 status = "绑定失败：请先填写有效的服务地址"
@@ -1008,7 +1209,7 @@ private fun SettingsScreen(activity: MainActivity) {
                         Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
                             Column(Modifier.weight(1f)) {
                                 Text("允许局域网 HTTP", fontWeight = FontWeight.Medium)
-                                Text("仅 localhost、模拟器 10.0.2.2 与 .local 主机名；重定向会被拒绝", fontSize = 10.sp, color = secondaryText())
+                                Text("支持回环、10.x、172.16–31.x、192.168.x、链路本地与 .local；拒绝公网 HTTP 和重定向", fontSize = 10.sp, color = secondaryText())
                             }
                             Switch(checked = allowPrivateHttp, onCheckedChange = { enabled ->
                                 if (!enabled) {
@@ -1016,29 +1217,22 @@ private fun SettingsScreen(activity: MainActivity) {
                                 } else {
                                     android.app.AlertDialog.Builder(activity)
                                         .setTitle("允许局域网明文 HTTP？")
-                                        .setMessage("HTTP 流量可能被同一网络中的设备监听。页枢只允许 localhost、模拟器 10.0.2.2 或 .local 主机名，并会拒绝重定向；请仅连接你信任的本地服务。")
+                                        .setMessage("HTTP 流量可能被同一网络中的设备监听。页枢仅允许回环或私有局域网地址，并会拒绝公网 HTTP 与重定向；请只连接你信任的本地服务。")
                                         .setPositiveButton("我了解，启用") { _, _ -> allowPrivateHttp = true }
                                         .setNegativeButton("取消", null)
                                         .show()
                                 }
                             })
                         }
-                        Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+                        Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(10.dp)) {
                             Button(
                                 onClick = {
-                                    db.setSetting("ai_base_url", baseUrl.trim())
-                                    db.setSetting("ai_model", textModel.trim())
-                                    db.setSetting("ai_vision_model", visionModel.trim())
-                                    db.setSetting("ai_allow_private_http", if (allowPrivateHttp) "1" else "0")
-                                    var saveError: String? = null
-                                    if (keyInput.isNotBlank()) {
-                                        val saved = runCatching { db.setAiKey(keyInput, baseUrl) }
-                                        if (saved.isSuccess) keyInput = ""
-                                        else saveError = "保存失败：请先填写有效的服务地址"
-                                    }
-                                    hasSavedKey = db.getAiKey(baseUrl).isNotBlank()
-                                    status = saveError ?: "设置已保存"
+                                    val result = saveDraft()
+                                    hasSavedKey = db.getAiKey(activeProfileId, baseUrl).isNotBlank()
+                                    status = if (result.isSuccess) "“$profileName”已保存并设为当前配置"
+                                    else "保存失败：${AiClient.userFacingError(result.exceptionOrNull()!!)}"
                                 },
+                                modifier = Modifier.weight(1f),
                                 shape = RoundedCornerShape(18.dp),
                                 colors = ButtonDefaults.buttonColors(containerColor = ElectricBlue)
                             ) { Text("保存") }
@@ -1046,34 +1240,72 @@ private fun SettingsScreen(activity: MainActivity) {
                                 enabled = !testing,
                                 onClick = {
                                     testing = true
-                                    status = "正在探测模型…"
+                                    status = "正在读取模型列表…"
                                     scope.launch {
-                                        val key = if (keyInput.isNotBlank()) keyInput else db.getAiKey(baseUrl)
-                                        val result = withContext(Dispatchers.IO) {
-                                            runCatching {
-                                                val cfg = AiClient.Config(baseUrl, key, textModel, visionModel, allowPrivateHttp)
-                                                val models = AiClient.listModels(cfg)
-                                                if (models.isEmpty()) "连接成功，服务未返回模型列表" else "连接成功，可用模型 ${models.size} 个"
-                                            }.getOrElse { "连接失败：${AiClient.userFacingError(it)}" }
+                                        val key = if (keyInput.isNotBlank()) keyInput else db.getAiKey(activeProfileId, baseUrl)
+                                        val fetch = withContext(Dispatchers.IO) {
+                                            runCatching { AiClient.discoverModels(currentAiConfig(
+                                                baseUrl, key, textModel, visionModel, allowPrivateHttp,
+                                                chatPath, modelsPath, authHeader, authPrefix
+                                            )) }
                                         }
                                         testing = false
-                                        status = result
+                                        fetch.onSuccess { models ->
+                                            discoveredModels = models
+                                            status = if (models.isEmpty()) {
+                                                "模型列表接口已关闭，请手动填写模型"
+                                            } else {
+                                                "已读取 ${models.size} 个模型，可点击模型框右侧选择"
+                                            }
+                                        }.onFailure {
+                                            status = "读取失败：${AiClient.userFacingError(it)}；仍可手动填写模型"
+                                        }
                                     }
                                 },
+                                modifier = Modifier.weight(1f),
                                 shape = RoundedCornerShape(18.dp)
-                            ) { Text(if (testing) "测试中" else "测试连接") }
+                            ) { Text(if (testing) "读取中" else "读取模型") }
                         }
+                        OutlinedButton(
+                            enabled = !testing,
+                            onClick = {
+                                testing = true
+                                status = "正在测试当前模型…"
+                                scope.launch {
+                                    val key = if (keyInput.isNotBlank()) keyInput else db.getAiKey(activeProfileId, baseUrl)
+                                    val result = withContext(Dispatchers.IO) {
+                                        runCatching {
+                                            AiClient.chat(
+                                                currentAiConfig(
+                                                    baseUrl, key, textModel, visionModel, allowPrivateHttp,
+                                                    chatPath, modelsPath, authHeader, authPrefix
+                                                ),
+                                                system = null,
+                                                user = "Reply with OK.",
+                                                timeoutMs = 30_000
+                                            )
+                                            "连接成功，当前模型可调用"
+                                        }.getOrElse { "连接失败：${AiClient.userFacingError(it)}" }
+                                    }
+                                    testing = false
+                                    status = result
+                                }
+                            },
+                            modifier = Modifier.fillMaxWidth(),
+                            shape = RoundedCornerShape(18.dp)
+                        ) { Text("测试当前模型") }
                         status?.let {
-                            val failed = it.startsWith("连接失败")
+                            val failed = it.startsWith("连接失败") || it.startsWith("读取失败") ||
+                                it.startsWith("保存失败") || it.startsWith("切换失败")
                             GlassPill(color = if (failed) MaterialTheme.colorScheme.error else LuminousCyan) {
                                 Text(it, fontSize = 11.sp, color = if (failed) MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.onSurface)
                             }
                         }
                         if (hasSavedKey) {
                             TextButton(onClick = {
-                                db.setAiKey("", baseUrl)
+                                db.setAiKey(activeProfileId, "", baseUrl)
                                 hasSavedKey = false
-                                status = "API Key 已移除"
+                                status = "当前配置的 API Key 已移除"
                             }) { Text("移除已保存的 Key") }
                         }
                     }
@@ -1156,6 +1388,52 @@ private fun GlassTextField(value: String, onValueChange: (String) -> Unit, label
         colors = glassTextFieldColors()
     )
 }
+
+@Composable
+private fun ModelTextField(
+    value: String,
+    onValueChange: (String) -> Unit,
+    label: String,
+    availableCount: Int,
+    onPick: () -> Unit
+) {
+    OutlinedTextField(
+        value = value,
+        onValueChange = onValueChange,
+        modifier = Modifier.fillMaxWidth(),
+        label = { Text(label) },
+        singleLine = true,
+        trailingIcon = {
+            TextButton(enabled = availableCount > 0, onClick = onPick) {
+                Text(if (availableCount > 0) "选择" else "手输")
+            }
+        },
+        shape = RoundedCornerShape(18.dp),
+        colors = glassTextFieldColors()
+    )
+}
+
+private fun currentAiConfig(
+    baseUrl: String,
+    key: String,
+    textModel: String,
+    visionModel: String,
+    allowPrivateHttp: Boolean,
+    chatPath: String,
+    modelsPath: String,
+    authHeader: String,
+    authPrefix: String
+) = AiClient.Config(
+    baseUrl = baseUrl,
+    key = key,
+    model = textModel,
+    visionModel = visionModel,
+    allowPrivateHttp = allowPrivateHttp,
+    chatPath = chatPath,
+    modelsPath = modelsPath,
+    authHeader = authHeader,
+    authPrefix = authPrefix
+)
 
 @Composable
 private fun glassTextFieldColors() = OutlinedTextFieldDefaults.colors(

@@ -2,6 +2,7 @@ package app.yeshu.reader
 
 import android.graphics.Bitmap
 import android.util.Base64
+import app.yeshu.reader.ai.AiProfileStore
 import org.json.JSONArray
 import org.json.JSONObject
 import java.io.ByteArrayOutputStream
@@ -12,6 +13,11 @@ import java.util.concurrent.CancellationException
 
 /** OpenAI 兼容 chat/completions 客户端（HttpURLConnection + org.json，零依赖） */
 object AiClient {
+
+    const val DEFAULT_CHAT_PATH = "/chat/completions"
+    const val DEFAULT_MODELS_PATH = "/models"
+    const val DEFAULT_AUTH_HEADER = "Authorization"
+    const val DEFAULT_AUTH_PREFIX = "Bearer"
 
     /** Disconnects the active HttpURLConnection so a user cancellation stops network I/O. */
     class CancelToken {
@@ -58,19 +64,28 @@ object AiClient {
         val key: String,
         val model: String,
         val visionModel: String = "",
-        val allowPrivateHttp: Boolean = false
+        val allowPrivateHttp: Boolean = false,
+        val chatPath: String = DEFAULT_CHAT_PATH,
+        val modelsPath: String = DEFAULT_MODELS_PATH,
+        val authHeader: String = DEFAULT_AUTH_HEADER,
+        val authPrefix: String = DEFAULT_AUTH_PREFIX
     )
 
     fun config(db: Db): Config {
-        val textModel = (db.getSetting("ai_model") ?: "").trim()
-        val configuredVision = (db.getSetting("ai_vision_model") ?: "").trim()
-        val baseUrl = (db.getSetting("ai_base_url") ?: "").trim()
+        val profile = AiProfileStore.active(db)
+        val textModel = profile.textModel.trim()
+        val configuredVision = profile.visionModel.trim()
+        val baseUrl = profile.baseUrl.trim()
         return Config(
             baseUrl = baseUrl,
-            key = db.getAiKey(baseUrl),
+            key = db.getAiKey(profile.id, baseUrl),
             model = textModel,
             visionModel = configuredVision.ifBlank { textModel.takeIf { it.contains("vision", true) || it.contains("vl", true) }.orEmpty() },
-            allowPrivateHttp = db.getSetting("ai_allow_private_http") == "1"
+            allowPrivateHttp = profile.allowPrivateHttp,
+            chatPath = profile.chatPath,
+            modelsPath = profile.modelsPath,
+            authHeader = profile.authHeader,
+            authPrefix = profile.authPrefix
         )
     }
 
@@ -98,18 +113,49 @@ object AiClient {
 
     fun endpointError(c: Config): String? {
         if (c.baseUrl.isBlank()) return "请填写接口地址"
-        val uri = runCatching { URI(normalizeBase(c.baseUrl)) }.getOrNull() ?: return "接口地址格式不正确"
+        if (c.key.isNotBlank() && !isValidHeaderName(c.authHeader)) return "鉴权 Header 名称不正确"
+        if (c.key.isNotBlank() && c.authHeader.lowercase() in FORBIDDEN_AUTH_HEADERS) {
+            return "鉴权 Header 不能使用 HTTP 协议保留字段"
+        }
+        if (c.authPrefix.contains('\r') || c.authPrefix.contains('\n')) return "鉴权前缀不能包含换行"
+        val baseUri = runCatching { URI(normalizeBase(c.baseUrl)) }.getOrNull()
+            ?: return "接口地址格式不正确"
+        val uri = runCatching { URI(chatCompletionsEndpoint(c.baseUrl, c.chatPath)) }.getOrNull()
+            ?: return "Chat 接口地址格式不正确"
         if (uri.host.isNullOrBlank()) return "接口地址格式不正确"
+        if (baseUri.host.isNullOrBlank()) return "接口地址格式不正确"
+        if (!sameOrigin(baseUri, uri)) return "Chat 接口不能切换到其他服务商域名"
         if (uri.scheme.equals("https", true)) return null
         if (!uri.scheme.equals("http", true)) return "只支持 HTTPS，或经确认的局域网 HTTP"
         if (!c.allowPrivateHttp) return "HTTP 仅用于本机/局域网服务，请先开启局域网 HTTP"
         val host = uri.host.orEmpty()
-        if (isAllowedCleartextHost(host)) return null
-        return if (isPrivateNetworkHost(host)) {
-            "局域网 HTTP 请使用 .local 主机名；系统仅放行 localhost、10.0.2.2 与 .local"
-        } else {
-            "公网接口必须使用 HTTPS"
-        }
+        if (isAllowedCleartextHost(host) || isPrivateNetworkHost(host)) return null
+        return "公网接口必须使用 HTTPS"
+    }
+
+    private fun isValidHeaderName(value: String): Boolean =
+        value.isNotBlank() && value.length <= 80 && value.all { it.isLetterOrDigit() || it == '-' }
+
+    private val FORBIDDEN_AUTH_HEADERS = setOf(
+        "host", "content-length", "content-type", "connection", "transfer-encoding",
+        "expect", "upgrade", "proxy-authorization", "proxy-authenticate", "te", "trailer",
+        "via", "forwarded", "x-forwarded-host"
+    )
+
+    private fun sameOrigin(first: URI, second: URI): Boolean {
+        val firstScheme = first.scheme?.lowercase().orEmpty()
+        val secondScheme = second.scheme?.lowercase().orEmpty()
+        val firstPort = effectivePort(first)
+        val secondPort = effectivePort(second)
+        return firstScheme == secondScheme &&
+            first.host.equals(second.host, ignoreCase = true) &&
+            firstPort == secondPort
+    }
+
+    private fun effectivePort(uri: URI): Int = when {
+        uri.port >= 0 -> uri.port
+        uri.scheme.equals("https", true) -> 443
+        else -> 80
     }
 
     private fun isAllowedCleartextHost(host: String): Boolean {
@@ -168,14 +214,39 @@ object AiClient {
         return "$scheme://$authority$path"
     }
 
-    internal fun chatCompletionsEndpoint(raw: String): String =
-        normalizeBase(raw).trimEnd('/') + "/chat/completions"
+    /**
+     * Resolves an endpoint relative to the API Base URL. A leading slash is intentionally treated
+     * as Base-relative rather than origin-relative because compatible providers commonly document
+     * `Base URL = .../v1` and `Chat = /chat/completions` as two separate fields.
+     * A complete HTTP(S) URL is also accepted, but [endpointError] refuses cross-origin key sends.
+     */
+    internal fun resolveEndpoint(rawBase: String, configuredPath: String, defaultPath: String): String {
+        val path = configuredPath.trim().ifBlank { defaultPath }
+        if (path.startsWith("http://", true) || path.startsWith("https://", true)) {
+            return normalizeAbsoluteEndpoint(path)
+        }
+        return normalizeBase(rawBase).trimEnd('/') + "/" + path.trimStart('/')
+    }
 
-    internal fun modelsEndpoint(raw: String): String =
-        normalizeBase(raw).trimEnd('/') + "/models"
+    internal fun chatCompletionsEndpoint(raw: String, path: String = DEFAULT_CHAT_PATH): String =
+        resolveEndpoint(raw, path, DEFAULT_CHAT_PATH)
 
-    internal fun authorizationHeader(key: String): String? =
-        key.takeIf { it.isNotBlank() }?.let { "Bearer $it" }
+    internal fun modelsEndpoint(raw: String, path: String = DEFAULT_MODELS_PATH): String =
+        resolveEndpoint(raw, path, DEFAULT_MODELS_PATH)
+
+    private fun normalizeAbsoluteEndpoint(raw: String): String {
+        val uri = URI(raw.trim())
+        val scheme = uri.scheme?.lowercase().orEmpty()
+        val authority = uri.rawAuthority ?: return raw.trim()
+        val path = uri.rawPath.orEmpty().ifBlank { "/" }.trimEnd('/').ifBlank { "/" }
+        val query = uri.rawQuery?.let { "?$it" }.orEmpty()
+        return "$scheme://$authority$path$query"
+    }
+
+    internal fun authorizationHeader(key: String, prefix: String = DEFAULT_AUTH_PREFIX): String? =
+        key.trim().takeIf { it.isNotBlank() }?.let { secret ->
+            prefix.trim().takeIf { it.isNotBlank() }?.let { "$it $secret" } ?: secret
+        }
 
     /** Stable scheme/host/port identity used to bind an encrypted key to one provider. */
     fun endpointOrigin(raw: String): String {
@@ -193,34 +264,68 @@ object AiClient {
      * using the user-selected model verifies the actual endpoint instead of reporting a false
      * connection failure.
      */
-    fun listModels(cfg: Config, timeoutMs: Int = 20_000): List<String> {
+    fun discoverModels(cfg: Config, timeoutMs: Int = 20_000): List<String> {
         endpointError(cfg)?.let { throw IllegalArgumentException(it) }
-        val discovery = runCatching {
-            val conn = URL(modelsEndpoint(cfg.baseUrl)).openConnection() as HttpURLConnection
-            try {
-                conn.instanceFollowRedirects = false
-                conn.requestMethod = "GET"
-                conn.connectTimeout = 10_000
-                conn.readTimeout = timeoutMs
-                authorizationHeader(cfg.key)?.let { conn.setRequestProperty("Authorization", it) }
-                val code = conn.responseCode
-                if (code !in 200..299) throw RuntimeException("HTTP $code")
-                val response = conn.inputStream.use { it.readBytes().toString(Charsets.UTF_8) }
-                val root = JSONObject(response)
-                val data = root.optJSONArray("data") ?: throw RuntimeException("模型列表格式不兼容")
-                buildList {
-                    for (index in 0 until data.length()) {
-                        data.optJSONObject(index)?.optString("id")?.takeIf { it.isNotBlank() }?.let(::add)
-                    }
-                }.distinct().sorted()
-            } finally {
-                conn.disconnect()
-            }
+        if (cfg.modelsPath.isBlank()) return emptyList()
+        val modelsUrl = modelsEndpoint(cfg.baseUrl, cfg.modelsPath)
+        val baseUri = URI(normalizeBase(cfg.baseUrl))
+        val modelsUri = runCatching { URI(modelsUrl) }.getOrNull()
+            ?: throw IllegalArgumentException("模型列表接口地址格式不正确")
+        if (!sameOrigin(baseUri, modelsUri)) {
+            throw IllegalArgumentException("模型列表接口不能切换到其他服务商域名")
         }
+        val conn = URL(modelsUrl).openConnection() as HttpURLConnection
+        try {
+            conn.instanceFollowRedirects = false
+            conn.requestMethod = "GET"
+            conn.connectTimeout = 10_000
+            conn.readTimeout = timeoutMs
+            authorizationHeader(cfg.key, cfg.authPrefix)?.let {
+                conn.setRequestProperty(cfg.authHeader, it)
+            }
+            val code = conn.responseCode
+            if (code !in 200..299) throw RuntimeException("HTTP $code")
+            val response = conn.inputStream.use { it.readBytes().toString(Charsets.UTF_8) }
+            return extractModelIds(response)
+        } finally {
+            conn.disconnect()
+        }
+    }
+
+    internal fun extractModelIds(response: String): List<String> {
+        val root = JSONObject(response)
+        val candidates = listOfNotNull(
+            root.optJSONArray("data"),
+            root.optJSONArray("models"),
+            root.optJSONObject("data")?.optJSONArray("models")
+        )
+        val models = buildList {
+            candidates.forEach { array ->
+                val sizeBeforeArray = size
+                for (index in 0 until array.length()) {
+                    val value = array.optJSONObject(index)
+                    if (value != null) {
+                        sequenceOf("id", "name", "model")
+                            .map { value.optString(it).takeUnless { text -> text == "null" }.orEmpty() }
+                            .firstOrNull { it.isNotBlank() }
+                            ?.let(::add)
+                    }
+                }
+                if (size == sizeBeforeArray) addAll(jsonStringElements(array))
+            }
+            if (isEmpty()) addAll(extractStringModelArrays(response))
+        }.distinct().sorted()
+        if (models.isEmpty()) throw RuntimeException("模型列表格式不兼容")
+        return models
+    }
+
+    fun listModels(cfg: Config, timeoutMs: Int = 20_000): List<String> {
+        val discovery = runCatching { discoverModels(cfg, timeoutMs) }
         discovery.getOrNull()?.let { return it }
 
         // Discovery is optional in the OpenAI-compatible ecosystem. Verify chat itself before
         // surfacing a failure; the custom model name and arbitrary key value are passed unchanged.
+        if (cfg.model.isBlank()) throw discovery.exceptionOrNull() ?: IllegalArgumentException("请填写模型名称")
         chat(
             cfg = cfg,
             system = null,
@@ -299,17 +404,77 @@ object AiClient {
 
     /** 兼容标准 OpenAI 结构；容错解析 */
     fun extractContent(respJson: String): String? = try {
-        val json = JSONObject(respJson)
-        val choices = json.getJSONArray("choices")
-        if (choices.length() == 0) null
-        else {
-            val first = choices.getJSONObject(0)
-            first.optJSONObject("message")?.optString("content")?.takeIf { it.isNotBlank() }
-                ?: first.optString("text", "").takeIf { it.isNotBlank() }
-        }
-    } catch (e: Exception) {
+        val root = JSONObject(respJson)
+        sequenceOf(root, root.optJSONObject("data"))
+            .filterNotNull()
+            .mapNotNull(::extractCompatibleContent)
+            .firstOrNull()
+    } catch (_: Exception) {
         null
     }
+
+    private fun extractCompatibleContent(json: JSONObject): String? {
+        json.optString("output_text").takeIf { it.isNotBlank() }?.let { return it }
+        json.optString("response").takeIf { it.isNotBlank() }?.let { return it }
+        json.optJSONObject("message")?.let { jsonText(it, "content") }
+            ?.takeIf { it.isNotBlank() }?.let { return it }
+        val choices = json.optJSONArray("choices")
+        if (choices != null && choices.length() > 0) {
+            val first = choices.optJSONObject(0)
+            first?.optJSONObject("message")?.let { jsonText(it, "content") }
+                ?.takeIf { it.isNotBlank() }?.let { return it }
+            first?.let { jsonText(it, "text") }?.takeIf { it.isNotBlank() }?.let { return it }
+        }
+        val output = json.optJSONArray("output") ?: return null
+        return buildList {
+            for (index in 0 until output.length()) {
+                val content = output.optJSONObject(index)?.optJSONArray("content") ?: continue
+                for (partIndex in 0 until content.length()) {
+                    content.optJSONObject(partIndex)?.optString("text")
+                        ?.takeIf { it.isNotBlank() }?.let(::add)
+                }
+            }
+        }.joinToString("").takeIf { it.isNotBlank() }
+    }
+
+    private fun jsonText(source: JSONObject, key: String): String? {
+        source.optJSONArray(key)?.let { array ->
+            return buildList {
+                for (index in 0 until array.length()) {
+                    val part = array.optJSONObject(index)
+                    if (part != null) {
+                        sequenceOf("text", "content")
+                            .map { part.optString(it).takeUnless { text -> text == "null" }.orEmpty() }
+                            .firstOrNull { it.isNotBlank() }
+                            ?.let(::add)
+                    }
+                }
+                if (isEmpty()) addAll(jsonStringElements(array))
+            }.joinToString("").takeIf { it.isNotBlank() }
+        }
+        return source.optString(key).takeIf { it.isNotBlank() && it != "null" }
+    }
+
+    /** JVM tests use a deliberately tiny org.json; this also tolerates string-only model arrays. */
+    private fun jsonStringElements(array: JSONArray): List<String> =
+        Regex("\"(?:\\\\.|[^\"\\\\])*\"").findAll(array.toString()).mapNotNull { match ->
+            decodeJsonString(match.value)
+        }.toList()
+
+    private fun extractStringModelArrays(response: String): List<String> =
+        Regex("\"(?:models|data)\"\\s*:\\s*\\[(.*?)]", RegexOption.DOT_MATCHES_ALL)
+            .findAll(response)
+            .flatMap { match ->
+                val body = match.groupValues[1]
+                if (!body.trimStart().startsWith('"')) emptySequence()
+                else Regex("\"(?:\\\\.|[^\"\\\\])*\"").findAll(body).mapNotNull { decodeJsonString(it.value) }
+            }
+            .toList()
+
+    private fun decodeJsonString(token: String): String? =
+        runCatching { JSONObject("{\"value\":$token}") }
+            .getOrNull()?.optString("value")
+            ?.takeIf { it.isNotBlank() && it != "null" }
 
     /**
      * 视觉多模态请求：文本 + 页面图片（PDF 走此通道）。
@@ -365,7 +530,7 @@ object AiClient {
         val token = cancellation.get()
         token?.ensureActive()
         endpointError(cfg)?.let { throw IllegalArgumentException(it) }
-        val urlStr = chatCompletionsEndpoint(cfg.baseUrl)
+        val urlStr = chatCompletionsEndpoint(cfg.baseUrl, cfg.chatPath)
         val conn = URL(urlStr).openConnection() as HttpURLConnection
         token?.attach(conn)
         try {
@@ -375,7 +540,9 @@ object AiClient {
             conn.readTimeout = timeoutMs
             conn.doOutput = true
             conn.setRequestProperty("Content-Type", "application/json")
-            authorizationHeader(cfg.key)?.let { conn.setRequestProperty("Authorization", it) }
+            authorizationHeader(cfg.key, cfg.authPrefix)?.let {
+                conn.setRequestProperty(cfg.authHeader, it)
+            }
 
             val body = JSONObject()
                 .put("model", cfg.model)
