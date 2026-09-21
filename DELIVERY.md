@@ -92,7 +92,7 @@ YeshuReader/
 - 局域网 / 回环 HTTP 需用户显式二次确认；公网 HTTP 即使勾选也会被拒绝；跨源 URL 与受限 header 同样被拒。
 - 支持流式输出（SSE）与“整段 JSON 回退”，并提供取消、重试、结果缓存；缓存键绑定文档指纹 + 模型 + 提示词版本。
 
-> 安全提示：曾经粘贴到聊天里的 DeepSeek Key（`sk-51cf362be89f4d83b86f58384434f21f`、`sk_tr_hhq9XFAWHHrqLGu7tlZBXpKdkEDWS0Og3kNbwsfrwUE` 等）已经被用于调试，但代码与仓库从未包含明文 Key。请尽快在 DeepSeek 控制台轮换。
+> 安全提示：调试期间使用过的两个 Key（一个 DeepSeek 直连、一个基元律动中转，分别形如 `sk-***`、`sk_tr_***`）曾出现在聊天记录中，应视为已泄露，请尽快在对应控制台轮换。密钥只存在于本机未纳入版本管理的 `local.properties` 与运行时 Android Keystore 中；仓库、APK、日志、备份文件里都没有明文。
 
 ## 七、本地重建
 

@@ -86,6 +86,22 @@ class MainActivity : ComponentActivity() {
 
     private val openBackup = registerForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
         uri ?: return@registerForActivityResult
+        // 恢复是不可逆的批量写入：先读清单让用户看到会导入什么，再执行
+        lifecycleScope.launch {
+            val summary = withContext(Dispatchers.IO) { BackupService.inspect(this@MainActivity, uri) }
+            val message = summary?.describe()
+                ?: "无法读取备份清单（文件可能已损坏）。仍要尝试恢复吗？"
+            android.app.AlertDialog.Builder(this@MainActivity)
+                .setTitle(if (summary == null) "备份清单不可读" else "确认恢复这份备份？")
+                .setMessage(message)
+                .setPositiveButton("开始恢复") { _, _ -> runRestore(uri) }
+                .setNegativeButton("取消", null)
+                .show()
+                .also { Glass.styleDialog(it, resources.displayMetrics.density) }
+        }
+    }
+
+    private fun runRestore(uri: android.net.Uri) {
         lifecycleScope.launch {
             val result = withContext(Dispatchers.IO) { BackupService.restore(this@MainActivity, uri) }
             libraryRevision++

@@ -186,7 +186,7 @@ class NotesView(private val act: Activity, private val bookId: Long) : FrameLayo
                 isFocusable = true
                 elevation = Glass.dp(3, d).toFloat()
                 setPadding(Glass.dp(16, d), Glass.dp(13, d), Glass.dp(12, d), Glass.dp(10, d))
-                setOnClickListener { showFull(raw) }
+                setOnClickListener { showFull(row, raw) }
                 setOnLongClickListener {
                     performHapticFeedback(HapticFeedbackConstants.LONG_PRESS)
                     confirmDelete(row)
@@ -342,32 +342,85 @@ class NotesView(private val act: Activity, private val bookId: Long) : FrameLayo
     }
 
     /**
-     * 全文弹层：引用锚点（[CHAPTER:2] / [PAGE:12] …）渲染成可点链接。
+     * 全文弹层：引用锚点（[CHAPTER:2] / [PAGE:12] …）渲染成可点链接，并可原地编辑。
+     *
      * 有链接时必须用 LinkMovementMethod（与文本选择互斥，两者同时开会让链接点不动），
-     * 没有链接时保持可选中复制。
+     * 没有链接时保持可选中复制。编辑态改用 EditText 承载同样的正文。
      */
-    private fun showFull(content: String) {
+    private fun showFull(row: NoteRow, content: String) {
         val d = density(act)
-        val linked = withCitationLinks(content)
-        val hasLinks = linked is android.text.Spanned &&
-            linked.getSpans(0, linked.length, android.text.style.ClickableSpan::class.java).isNotEmpty()
-        val sc = ScrollView(act)
-        sc.addView(TextView(act).apply {
-            text = linked
+        val body = TextView(act).apply {
+            text = withCitationLinks(content)
             textSize = 14f
             // 对话框底色跟随主题，正文颜色也必须跟着走
             setTextColor(if (pal.dark) pal.textP else Color.parseColor("#222222"))
-            if (hasLinks) {
+            if (withCitationLinks(content) is android.text.Spanned) {
                 movementMethod = android.text.method.LinkMovementMethod.getInstance()
             } else {
                 setTextIsSelectable(true)
             }
             setPadding(Glass.dp(20, d), Glass.dp(14, d), Glass.dp(20, d), Glass.dp(20, d))
+        }
+        val editor = android.widget.EditText(act).apply {
+            setText(content)
+            textSize = 14f
+            setTextColor(if (pal.dark) pal.textP else Color.parseColor("#222222"))
+            setPadding(Glass.dp(20, d), Glass.dp(14, d), Glass.dp(20, d), Glass.dp(20, d))
+            setBackgroundColor(Color.TRANSPARENT)
+            gravity = Gravity.TOP
+            inputType = android.text.InputType.TYPE_CLASS_TEXT or
+                android.text.InputType.TYPE_TEXT_FLAG_MULTI_LINE
+            visibility = View.GONE
+        }
+        val sc = ScrollView(act)
+        sc.addView(LinearLayout(act).apply {
+            orientation = LinearLayout.VERTICAL
+            addView(body, LayoutParams(-1, -2))
+            addView(editor, LayoutParams(-1, -2))
         })
-        AlertDialog.Builder(act)
+
+        var editing = false
+        val dlg = AlertDialog.Builder(act)
             .setView(sc)
+            .setNeutralButton("编辑", null)
             .setPositiveButton("关闭", null)
-            .show().also { Glass.styleDialog(it, density(act)) }
+            .create()
+        dlg.setOnShowListener {
+            // 点「编辑」进入编辑态，按钮变成「保存修改 / 取消」；内容为空直接拒绝
+            dlg.getButton(AlertDialog.BUTTON_NEUTRAL).setOnClickListener {
+                editing = !editing
+                body.visibility = if (editing) View.GONE else View.VISIBLE
+                editor.visibility = if (editing) View.VISIBLE else View.GONE
+                dlg.getButton(AlertDialog.BUTTON_NEUTRAL).text = if (editing) "保存修改" else "编辑"
+                dlg.getButton(AlertDialog.BUTTON_POSITIVE).text = if (editing) "取消" else "关闭"
+                if (editing) {
+                    editor.requestFocus()
+                } else {
+                    val edited = editor.text.toString().trim()
+                    if (edited.isBlank()) {
+                        android.widget.Toast.makeText(act, "内容不能为空", android.widget.Toast.LENGTH_SHORT).show()
+                        return@setOnClickListener
+                    }
+                    if (edited != content) {
+                        saveEditedNote(row, content, edited)
+                    }
+                    dlg.dismiss()
+                }
+            }
+        }
+        dlg.show()
+        Glass.styleDialog(dlg, d)
+    }
+
+    /** 手动编辑落库：笔记正文 + 对应 AI 成果同步，并标记「已手动编辑」。 */
+    private fun saveEditedNote(row: NoteRow, oldContent: String, newContent: String) {
+        Thread {
+            runCatching { db.applyEditedContent(bookId, row.kind, oldContent, newContent) }
+            act.runOnUiThread {
+                android.widget.Toast.makeText(act, "已保存修改", android.widget.Toast.LENGTH_SHORT).show()
+                refresh()
+            }
+        }.apply { isDaemon = true }.start()
     }
 
     /** 把引用锚点包成可点 span；无锚点时原样返回，避免多建一个 Spannable。 */
@@ -381,9 +434,8 @@ class NotesView(private val act: Activity, private val bookId: Long) : FrameLayo
             out.setSpan(
                 object : android.text.style.ClickableSpan() {
                     override fun onClick(widget: View) {
-                        android.widget.Toast.makeText(
-                            act, "引用来源：${anchorLabel(anchor)}", android.widget.Toast.LENGTH_SHORT
-                        ).show()
+                        // 直接跳到原书对应位置，而不是只弹一句「引用来源：第 3 章」
+                        (act as MainActivity).openReader(bookId, anchor)
                     }
 
                     override fun updateDrawState(ds: android.text.TextPaint) {
@@ -481,7 +533,8 @@ class NotesView(private val act: Activity, private val bookId: Long) : FrameLayo
                     else -> {
                         filterKind = "digest"
                         refresh()
-                        showFull(reply)
+                        // 刚写入的精读笔记：取回它的行，才能走同一个可编辑详情面板
+                        db.listNotes(bookId, "digest").firstOrNull()?.let { showFull(it, reply) }
                     }
                 }
             }

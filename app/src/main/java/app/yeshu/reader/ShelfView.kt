@@ -341,21 +341,59 @@ class ShelfView(private val act: Activity) : FrameLayout(act) {
         }
     }
 
-    /** 更多 sheet：AI 推荐 / 阅读统计 / 批量管理 / 更换背景 / 设置 */
+    /**
+     * 更多 sheet：按「书架管理 / AI 与数据 / 外观」分组，每项带一行说明。
+     *
+     * 入口名称与工作台、阅读器里的提示完全一致（都是「AI 设置」），
+     * 用户是照着提示来找入口的，命名不一致会让人以为功能不存在。
+     */
     private fun showMoreSheet() {
+        val cfg = AiClient.config(db)
+        val aiReady = AiClient.isReady(cfg)
+        val trash = db.listDeletedBooks().size
         showSheet("更多") {
-            shelfItem("bulb", "✨ AI 推荐下一本") { aiRecommend() }
-            shelfItem("sort", "阅读统计") { (act as MainActivity).showStats() }
-            shelfItem("check", "批量管理") { toggleMultiMode() }
-            shelfItem("book", "回收站 (${db.listDeletedBooks().size})") { showRecycleBin() }
-            shelfItem("palette", "更换背景") {
+            section("书架管理", "整理、统计与批量操作")
+            item("check", "批量管理", "多选删除、移动分类或加入收藏") {
+                activeSheet = null
+                sheetBackCallback?.isEnabled = false
+                toggleMultiMode()
+            }
+            item("sort", "阅读统计", "总时长、近 7 天与阅读排行") {
+                activeSheet = null
+                sheetBackCallback?.isEnabled = false
+                (act as MainActivity).showStats()
+            }
+            item("book", "回收站（$trash）", if (trash > 0) "有 $trash 项待恢复或彻底删除" else "当前是空的") {
+                activeSheet = null
+                sheetBackCallback?.isEnabled = false
+                showRecycleBin()
+            }
+
+            section("AI 与数据", "由你自己提供接口，费用由服务商收取")
+            item(
+                "sliders",
+                "AI 设置",
+                if (aiReady) "接口与模型已就绪：${cfg.model}" else "填写接口地址、Key 和模型名后即可使用"
+            ) {
+                activeSheet = null
+                sheetBackCallback?.isEnabled = false
+                (act as MainActivity).showSettings()
+            }
+            item("bulb", "AI 推荐下一本", "根据已读内容推荐，会发送阅读记录摘要") {
+                activeSheet = null
+                sheetBackCallback?.isEnabled = false
+                aiRecommend()
+            }
+
+            section("外观")
+            item("palette", "更换背景", "选一张本地图片作为书架背景") {
+                activeSheet = null
+                sheetBackCallback?.isEnabled = false
                 val i = Intent(Intent.ACTION_GET_CONTENT)
                 i.type = "image/*"
                 @Suppress("DEPRECATION")
                 act.startActivityForResult(i, Glass.REQ_BG)
             }
-            // 名称与各处的「AI 设置」提示保持一致：用户是照着提示来找入口的。
-            shelfItem("sliders", "AI 设置") { (act as MainActivity).showSettings() }
         }
     }
 
@@ -496,6 +534,13 @@ class ShelfView(private val act: Activity) : FrameLayout(act) {
         ensureSheetBackCallback().isEnabled = true
         sheet.show()
     }
+
+    /**
+     * R44：阅读器记录的最近位置（「第 3 章 · 第 12 段」/「第 5 / 120 页」）。
+     * 没有记录时返回空串，界面就不显示这一段，避免出现「· 未知」。
+     */
+    private fun rememberedPosition(bookId: Long): String =
+        db.getSetting(ReaderView.positionSettingKey(bookId)).orEmpty().trim()
 
     /** 弹层菜单项：点击后弹层自行关闭，这里同步清理返回键状态。 */
     private fun BottomSheet.shelfItem(icon: String, label: String, onClick: () -> Unit) =
@@ -1160,9 +1205,10 @@ class ShelfView(private val act: Activity) : FrameLayout(act) {
             return
         }
         for ((i, b) in books.withIndex()) {
-            val kb = if (b.sizeBytes < 1024) "${b.sizeBytes} B"
-                     else (b.sizeBytes / 1024).toString() + " KB"
+            val kb = formatBytes(b.sizeBytes)
             val pct = ((b.progress * 100).toInt()).toString() + "%"
+            // R44：百分比之外再给出「读到哪一章 / 第几页」，比 37% 更有信息量
+            val position = rememberedPosition(b.id)
 
             // 左封面：56x84dp，真封面或程序化占位
             val tw = Glass.dp(T.coverWList, d)
@@ -1238,9 +1284,13 @@ class ShelfView(private val act: Activity) : FrameLayout(act) {
                     meta.addView(TextView(context).apply {
                         text = "  " + kb + if (searching) {
                             if (b.folderId == 0L) "" else " · " + (folderNames[b.folderId] ?: "")
-                        } else ""
+                        } else {
+                            if (position.isBlank()) "" else " · " + position
+                        }
                         textSize = 11f
                         setTextColor(pal.textT)
+                        maxLines = 1
+                        ellipsize = android.text.TextUtils.TruncateAt.END
                     })
                     addView(meta, LinearLayout.LayoutParams(-2, -2).also {
                         it.topMargin = Glass.dp(6, d)
@@ -1352,6 +1402,8 @@ class ShelfView(private val act: Activity) : FrameLayout(act) {
         val d = density(act)
         val coverH = cw * 3 / 2   // 接近 2:3 竖版比例
         val pct = ((b.progress * 100).toInt()).toString() + "%"
+        // R44：网格卡片同样给出「读到哪一章 / 第几页」
+        val position = rememberedPosition(b.id)
         val thumb: android.view.View = if (CoverStore.file(act, b.id).exists()) {
             ImageView(act).apply {
                 scaleType = ImageView.ScaleType.CENTER_CROP
@@ -1398,9 +1450,14 @@ class ShelfView(private val act: Activity) : FrameLayout(act) {
                 setLineSpacing(0f, 1.15f)
             }, LinearLayout.LayoutParams(-1, -2).also { it.topMargin = Glass.dp(8, d) })
             addView(TextView(act).apply {
-                text = b.format.uppercase().ifEmpty { "TXT" } + " · " + pct
+                text = buildString {
+                    append(b.format.uppercase().ifEmpty { "TXT" }).append(" · ").append(pct)
+                    if (position.isNotBlank()) append(" · ").append(position)
+                }
                 textSize = 11f
                 setTextColor(pal.textS)
+                maxLines = 1
+                ellipsize = android.text.TextUtils.TruncateAt.END
             }, LinearLayout.LayoutParams(-2, -2).also { it.topMargin = Glass.dp(3, d) })
             // 按压：轻微缩放
             setOnTouchListener { v, ev ->

@@ -28,3 +28,17 @@ internal fun hasExtractableText(fullText: String): Boolean {
     if (text.length <= PLACEHOLDER_MAX_CHARS && IMAGE_ONLY_PREFIXES.any { text.startsWith(it) }) return false
     return true
 }
+
+/**
+ * 文件大小：书架上各处口径必须一致。
+ * 之前有的地方用 KB 整除（<1KB 显示成「0 KB」），有的地方只显示字节数。
+ */
+internal fun formatBytes(bytes: Long): String {
+    val value = bytes.coerceAtLeast(0L)
+    return when {
+        value < 1024 -> "$value B"
+        value < 1024L * 1024 -> "${value / 1024} KB"
+        value < 1024L * 1024 * 1024 -> "%.1f MB".format(value / (1024.0 * 1024.0))
+        else -> "%.1f GB".format(value / (1024.0 * 1024.0 * 1024.0))
+    }
+}

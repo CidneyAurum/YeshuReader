@@ -78,6 +78,7 @@ class StatsView(private val act: Activity) : FrameLayout(act) {
         // ---- 总览卡：总时长 / 坚持天数 / 笔记数 ----
         val totalMs = db.totalAllReadMs()
         val days = db.activeDays()
+        val longest = db.longestDay()
         val notesN = db.noteCount()
         val booksAll = db.listBooks()
         val reading = booksAll.count { it.progress > 0.005f && it.progress < 0.99f }
@@ -94,6 +95,9 @@ class StatsView(private val act: Activity) : FrameLayout(act) {
             val cells = listOf(
                 formatMs(totalMs) to "累计阅读",
                 "$days" to "坚持天数",
+                // R43：read_log 只按天存总量，无法还原时段分布；「最长的一天」是同样有意义
+                // 且不需要改表结构就能算出的指标。
+                (longest?.let { (day, ms) -> "$day\n${ms / 60000} 分钟" } ?: "—") to "最长的一天",
                 "${booksAll.size}" to "藏书",
                 "$reading" to "在读"
             )
@@ -131,7 +135,9 @@ class StatsView(private val act: Activity) : FrameLayout(act) {
             setPadding(Glass.dp(16, d), Glass.dp(16, d), Glass.dp(16, d), Glass.dp(12, d))
         }
         val barRow = LinearLayout(act).apply { orientation = LinearLayout.HORIZONTAL; gravity = Gravity.BOTTOM }
-        daily.forEach { (day, ms) ->
+        // 同月只显示日、跨月带上月份：固定 "MM-dd" 在窄柱上读不清，只显示日又会出现 31→1 的错觉
+        val dayLabels = DayLabels.labels(daily.map { it.first })
+        daily.forEachIndexed { index, (day, ms) ->
             val frac = ms.toFloat() / maxMs
             barRow.addView(LinearLayout(act).apply {
                 orientation = LinearLayout.VERTICAL
@@ -152,7 +158,7 @@ class StatsView(private val act: Activity) : FrameLayout(act) {
                     }
                 })
                 addView(TextView(act).apply {
-                    text = day.substring(5); textSize = 9f; setTextColor(pal.textT)
+                    text = dayLabels[index]; textSize = 9f; setTextColor(pal.textT)
                     setPadding(0, Glass.dp(6, d), 0, 0); gravity = Gravity.CENTER
                     layoutParams = LinearLayout.LayoutParams(-1, -2)
                 })

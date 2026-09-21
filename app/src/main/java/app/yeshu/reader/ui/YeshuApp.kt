@@ -383,6 +383,10 @@ private fun DocumentWorkbenchScreen(
                             DocumentTool("目录", "章节或 PDF 页码", LuminousCyan) { reader?.openTableOfContents() }
                             DocumentTool("AI", "理解包、问答与自测", ActiveViolet) { reader?.openAiWorkbench() }
                             DocumentTool("笔记", "批注与 AI 结果", Color(0xFFFF8A65)) { onNavigate(Destination.BookNotes(bookId)) }
+                            // 宽屏侧栏原先没有聊天入口，聊天只在窄屏可用
+                            DocumentTool("AI 问答", "带着当前章上下文聊天", ElectricBlue) {
+                                onNavigate(Destination.Chat(bookId, ""))
+                            }
                             Spacer(Modifier.weight(1f))
                             Text("AI 只在你主动触发时发送所选范围。", color = secondaryText(), fontSize = 10.sp)
                         }
@@ -935,10 +939,21 @@ private data class ArtifactRow(
     val artifact: AiArtifact,
     val bookTitle: String?,
     val anchors: List<CitationAnchor>,
-    val hasNote: Boolean
+    val hasNote: Boolean,
+    /** 原书已被软删除（在回收站里）。此时既不能跳转，也不该说成「已不在书架」。 */
+    val bookInRecycleBin: Boolean = false
 ) {
-    /** 只有书目仍在书架里时才能跳转过去；bookId = 0 或书目已删除时为 null。 */
+    /** 只有书目仍在书架里时才能跳转过去；bookId = 0、书在回收站或已彻底删除时为 null。 */
     val sourceBookId: Long? get() = artifact.bookId.takeIf { it != 0L && bookTitle != null }
+
+    /** 卡片上的来源说明：区分「在回收站」与「已删除」，前者可以一键恢复。 */
+    val sourceHint: String
+        get() = when {
+            sourceBookId != null -> "已在笔记列表中"
+            bookInRecycleBin -> "原书在回收站，可恢复后跳转"
+            bookTitle == null && artifact.bookId != 0L -> "原书已删除"
+            else -> "已在笔记列表中"
+        }
 }
 
 /** 笔记中枢一次加载的完整数据：笔记（带出处锚点）、书签/重点与全局 AI 成果。 */
@@ -985,6 +1000,8 @@ private fun NotesHubScreen(activity: MainActivity, revision: Int) {
     var reloadTick by remember { mutableStateOf(0) }
     var detail by remember { mutableStateOf<DetailContent?>(null) }
     var pendingDelete by remember { mutableStateOf<Db.NoteDetail?>(null) }
+    // 笔记多起来以后「按时间」很难复习同一本书：提供按书聚合的视图
+    var groupByBook by remember { mutableStateOf(false) }
     val snackbarHostState = remember { SnackbarHostState() }
 
     LaunchedEffect(revision, localRevision, reloadTick) {
@@ -992,6 +1009,8 @@ private fun NotesHubScreen(activity: MainActivity, revision: Int) {
         withContext(Dispatchers.IO) {
             runCatching {
                 val books = db.listBooks().associateBy { it.id }
+                // 回收站里的书：成果卡要据此提示「原书在回收站」并提供恢复
+                val deletedBooks = db.listDeletedBooks().associateBy { it.id }
                 val notes = db.recentNoteDetails(80).mapNotNull { note ->
                     val book = books[note.bookId]
                     // bookId = 0 是全局阅读报告，不属于任何一本书，不能因为查不到书就丢掉。
@@ -1034,6 +1053,7 @@ private fun NotesHubScreen(activity: MainActivity, revision: Int) {
                         ArtifactRow(
                             artifact = artifact,
                             bookTitle = books[artifact.bookId]?.title,
+                            bookInRecycleBin = deletedBooks.containsKey(artifact.bookId),
                             anchors = parseCitations(artifact.citationsJson),
                             hasNote = notes.any { (note, _) ->
                                 note.bookId == artifact.bookId &&
@@ -1131,17 +1151,61 @@ private fun NotesHubScreen(activity: MainActivity, revision: Int) {
                     }
                 }
                 else -> {
-                    items(loaded.notes, key = { "note-${it.first.id}" }) { (note, book) ->
-                        NoteHubCard(
-                            title = book?.title ?: "阅读报告",
-                            kind = noteKindLabel(note.kind, note.content),
-                            content = cleanNoteContent(note.content),
-                            // bookId = 0 的全局阅读报告不属于任何一本书：正文直接铺开，也没有可跳转的来源
-                            expandBody = note.bookId == 0L,
-                            sourceHint = if (note.bookId == 0L) null else "点击查看全文",
-                            onOpen = { openNoteDetail(note, book) },
-                            onDelete = { pendingDelete = note }
-                        )
+                    item {
+                        Row(
+                            Modifier.horizontalScroll(rememberScrollState()),
+                            horizontalArrangement = Arrangement.spacedBy(8.dp)
+                        ) {
+                            FilterChip(
+                                selected = !groupByBook,
+                                onClick = { groupByBook = false },
+                                label = { Text("按时间") },
+                                shape = RoundedCornerShape(16.dp)
+                            )
+                            FilterChip(
+                                selected = groupByBook,
+                                onClick = { groupByBook = true },
+                                label = { Text("按书（${loaded.notes.map { it.first.bookId }.distinct().size}）") },
+                                shape = RoundedCornerShape(16.dp)
+                            )
+                        }
+                    }
+                    if (groupByBook) {
+                        // 按书聚合：每本书一个组头（书名 + 条数），组内仍按时间倒序
+                        val grouped = loaded.notes.groupBy { it.first.bookId }
+                            .toList()
+                            .sortedByDescending { (_, items) -> items.maxOf { it.first.createdAt } }
+                        grouped.forEach { (bookId, items) ->
+                            val bookTitle = items.firstOrNull()?.second?.title
+                                ?: if (bookId == 0L) "阅读报告" else "已删除的书目"
+                            item(key = "group-$bookId") {
+                                SectionHeader(bookTitle, "${items.size} 条 · ${relativeTime(items.first().first.createdAt)}")
+                            }
+                            items(items, key = { "gnote-${it.first.id}" }) { (note, book) ->
+                                NoteHubCard(
+                                    title = bookTitle,
+                                    kind = noteKindLabel(note.kind, note.content),
+                                    content = cleanNoteContent(note.content),
+                                    expandBody = false,
+                                    sourceHint = if (note.bookId == 0L) null else "点击查看全文",
+                                    onOpen = { openNoteDetail(note, book) },
+                                    onDelete = { pendingDelete = note }
+                                )
+                            }
+                        }
+                    } else {
+                        items(loaded.notes, key = { "note-${it.first.id}" }) { (note, book) ->
+                            NoteHubCard(
+                                title = book?.title ?: "阅读报告",
+                                kind = noteKindLabel(note.kind, note.content),
+                                content = cleanNoteContent(note.content),
+                                // bookId = 0 的全局阅读报告不属于任何一本书：正文直接铺开，也没有可跳转的来源
+                                expandBody = note.bookId == 0L,
+                                sourceHint = if (note.bookId == 0L) null else "点击查看全文",
+                                onOpen = { openNoteDetail(note, book) },
+                                onDelete = { pendingDelete = note }
+                            )
+                        }
                     }
                     if (loaded.marks.isNotEmpty()) {
                         item { SectionHeader("标记", "书签与划过的重点，点击回到原文位置") }
@@ -1156,7 +1220,7 @@ private fun NotesHubScreen(activity: MainActivity, revision: Int) {
                                 row = row,
                                 onOpen = {
                                     detail = DetailContent(
-                                        title = row.bookTitle ?: "已不在书架的书目",
+                                        title = row.bookTitle ?: if (row.bookInRecycleBin) "原书在回收站" else "已不在书架的书目",
                                         badge = NoteKindLabels.label(row.artifact.kind),
                                         meta = "模型 ${row.artifact.model.ifBlank { "未知" }}  ·  ${relativeTime(row.artifact.updatedAt)}",
                                         body = row.artifact.content,
@@ -1172,6 +1236,18 @@ private fun NotesHubScreen(activity: MainActivity, revision: Int) {
                                     }
                                 },
                                 onSaveAsNote = { saveArtifactAsNote(row.artifact) },
+                                onRestoreSource = if (row.bookInRecycleBin) {
+                                    {
+                                        scope.launch {
+                                            withContext(Dispatchers.IO) {
+                                                db.restoreDeletedBook(row.artifact.bookId)
+                                            }
+                                            localRevision++
+                                        }
+                                    }
+                                } else {
+                                    null
+                                },
                                 onDelete = {
                                     scope.launch {
                                         withContext(Dispatchers.IO) { db.deleteArtifact(row.artifact.id) }
@@ -1384,6 +1460,7 @@ private fun ArtifactHubCard(
     onOpen: () -> Unit,
     onOpenSource: ((String) -> Unit)?,
     onSaveAsNote: () -> Unit,
+    onRestoreSource: (() -> Unit)?,
     onDelete: () -> Unit
 ) {
     GlassPanel(
@@ -1439,12 +1516,18 @@ private fun ArtifactHubCard(
             Spacer(Modifier.height(8.dp))
             Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
                 Text(
-                    if (row.hasNote) "已在笔记列表中；删除笔记会一并删除成果" else "还没有对应笔记，仅存在于缓存",
+                    if (row.hasNote) "${row.sourceHint}；删除笔记会一并删除成果" else row.sourceHint,
                     modifier = Modifier.weight(1f),
                     fontSize = 11.sp,
                     color = secondaryText(),
                     maxLines = 2
                 )
+                // 原书在回收站时先给「恢复原书」，否则用户只能看着成果点不进去
+                if (onRestoreSource != null) {
+                    TextButton(onClick = onRestoreSource) {
+                        Text("恢复原书", color = ElectricBlue, fontWeight = FontWeight.Bold)
+                    }
+                }
                 if (!row.hasNote) {
                     TextButton(onClick = onSaveAsNote) {
                         Text("保存为笔记", color = ActiveViolet, fontWeight = FontWeight.Bold)

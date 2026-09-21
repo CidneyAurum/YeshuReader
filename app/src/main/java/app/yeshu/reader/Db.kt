@@ -160,6 +160,10 @@ class Db(context: Context) {
 
     fun activeDays(): Int = dao.activeDays()
 
+    /** 阅读时长最长的一天；没有任何记录时返回 null。 */
+    fun longestDay(): Pair<String, Long>? =
+        dao.allReadLogs().filter { it.ms > 0 }.maxByOrNull { it.ms }?.let { it.day to it.ms }
+
     /**
      * 恢复备份后校正日累计。
      *

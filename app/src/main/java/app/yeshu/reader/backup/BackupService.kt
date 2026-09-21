@@ -152,6 +152,76 @@ object BackupService {
         "备份完成：${books.size} 项，API Key 未包含"
     }.getOrElse { "备份失败：${it.message}" }
 
+    /** 恢复前的只读清单：用户在覆盖前应当知道会导入多少内容。 */
+    data class BackupSummary(
+        val version: Int,
+        val exportedAt: Long,
+        val books: Int,
+        val notes: Int,
+        val artifacts: Int,
+        val bookmarks: Int,
+        val includesOriginals: Boolean
+    ) {
+        fun describe(): String = buildString {
+            append("包含 ${books} 本书目、${notes} 条笔记、${artifacts} 份 AI 成果")
+            if (bookmarks > 0) append("、${bookmarks} 个书签")
+            append('。')
+            if (includesOriginals) append("含书籍原文件与封面。")
+            append("同名书籍按内容合并，不会删除本地多余条目；API Key 不会导入。")
+        }
+    }
+
+    /**
+     * 只读取备份清单，不写任何数据。
+     *
+     * 恢复是不可逆的批量写入，先让用户看到「会导入什么」再确认；
+     * 解析失败时返回 null，调用方回退到「直接恢复」并照常报错。
+     */
+    fun inspect(context: Context, uri: Uri): BackupSummary? = runCatching {
+        val input = context.contentResolver.openInputStream(uri) ?: return null
+        BufferedInputStream(input).use { buffered ->
+            buffered.mark(MAX_DETECTION_BYTES)
+            val first = firstNonWhitespace(buffered)
+            buffered.reset()
+            if (first == '{'.code) {
+                // 旧版 JSON 备份：没有条目清单，仍按元数据里的数组长度给出数量
+                val legacy = JSONObject(readLimited(buffered, MAX_LIBRARY_JSON_BYTES).toString(Charsets.UTF_8))
+                return BackupSummary(
+                    version = 0,
+                    exportedAt = legacy.optLong("exportedAt", 0L),
+                    books = legacy.optJSONArray("books")?.length() ?: 0,
+                    notes = legacy.optJSONArray("notes")?.length() ?: 0,
+                    artifacts = 0,
+                    bookmarks = 0,
+                    includesOriginals = false
+                )
+            }
+            val archive = File(context.cacheDir, "inspect_${System.nanoTime()}.zip")
+            try {
+                archive.outputStream().use { copyLimited(buffered, it, MAX_ARCHIVE_BYTES) }
+                ZipFile(archive).use { zip ->
+                    val entry = zip.entries().asSequence()
+                        .firstOrNull { safeEntryName(it.name) == LIBRARY_JSON } ?: return null
+                    val meta = zip.getInputStream(entry).use {
+                        JSONObject(readLimited(it, MAX_LIBRARY_JSON_BYTES).toString(Charsets.UTF_8))
+                    }
+                    require(meta.optString("app") in setOf("yeshu", "shuge")) { "不是页枢备份文件" }
+                    BackupSummary(
+                        version = meta.optInt("version", 0),
+                        exportedAt = meta.optLong("exportedAt", 0L),
+                        books = meta.optJSONArray("books")?.length() ?: 0,
+                        notes = meta.optJSONArray("notes")?.length() ?: 0,
+                        artifacts = meta.optJSONArray("artifacts")?.length() ?: 0,
+                        bookmarks = meta.optJSONArray("bookmarks")?.length() ?: 0,
+                        includesOriginals = meta.optBoolean("includesOriginalFiles", false)
+                    )
+                }
+            } finally {
+                archive.delete()
+            }
+        }
+    }.getOrNull()
+
     fun restore(context: Context, uri: Uri): String = runCatching {
         val input = context.contentResolver.openInputStream(uri) ?: error("无法读取备份")
         BufferedInputStream(input).use { buffered ->
