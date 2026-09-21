@@ -5,6 +5,7 @@ import android.net.Uri
 import app.yeshu.reader.CoverStore
 import app.yeshu.reader.Db
 import app.yeshu.reader.data.AiArtifactEntity
+import app.yeshu.reader.data.BookmarkEntity
 import app.yeshu.reader.data.NoteEntity
 import app.yeshu.reader.data.ReadLogEntity
 import app.yeshu.reader.data.SettingEntity
@@ -66,7 +67,7 @@ object BackupService {
         val appearance = runBlocking { UserPreferences(context).snapshot() }
         val root = JSONObject()
             .put("app", "yeshu")
-            .put("version", 3)
+            .put("version", 4)
             .put("exportedAt", System.currentTimeMillis())
             .put("includesOriginalFiles", true)
             .put("includesSecrets", false)
@@ -98,8 +99,19 @@ object BackupService {
         root.put("notes", JSONArray().apply {
             val bookIds = books.mapTo(hashSetOf()) { it.id }
             room.dao().allNotes().filter { it.bookId in bookIds }.forEach { note ->
+                // anchor/status 必须一起导出：缺了它们，恢复后「金句」找不到出处、
+                // 「校验未通过但已保留」的结果会被当成校验通过。
                 put(JSONObject().put("id", note.id).put("bookId", note.bookId).put("kind", note.kind)
-                    .put("content", note.content).put("createdAt", note.createdAt))
+                    .put("content", note.content).put("createdAt", note.createdAt)
+                    .put("anchor", note.anchor).put("status", note.status))
+            }
+        })
+        root.put("bookmarks", JSONArray().apply {
+            val bookIds = books.mapTo(hashSetOf()) { it.id }
+            db.recentBookmarks().filter { it.bookId in bookIds }.forEach { mark ->
+                put(JSONObject().put("bookId", mark.bookId).put("anchor", mark.anchor)
+                    .put("label", mark.label).put("excerpt", mark.excerpt)
+                    .put("createdAt", mark.createdAt))
             }
         })
         root.put("artifacts", JSONArray().apply {
@@ -385,8 +397,31 @@ object BackupService {
                     val content = note.optString("content")
                     val createdAt = note.optLong("createdAt", 0L)
                     if (dao.findNote(newBook, kind, content, createdAt) == null) {
-                        dao.addNote(NoteEntity(bookId = newBook, kind = kind, content = content, createdAt = createdAt))
+                        dao.addNote(NoteEntity(
+                            bookId = newBook,
+                            kind = kind,
+                            content = content,
+                            createdAt = createdAt,
+                            anchor = note.optString("anchor", ""),
+                            status = note.optString("status", "")
+                        ))
                     }
+                }
+                // 书签按 (bookId, anchor) 去重，重复恢复同一份备份不会堆出一串相同位置
+                val bookmarks = root.optJSONArray("bookmarks") ?: JSONArray()
+                for (index in 0 until bookmarks.length()) {
+                    val mark = bookmarks.getJSONObject(index)
+                    val newBook = bookMap[mark.optLong("bookId")] ?: continue
+                    val anchor = mark.optString("anchor").trim()
+                    if (anchor.isBlank()) continue
+                    if (dao.listBookmarks(newBook).any { it.anchor == anchor }) continue
+                    dao.addBookmark(BookmarkEntity(
+                        bookId = newBook,
+                        anchor = anchor,
+                        label = mark.optString("label"),
+                        excerpt = mark.optString("excerpt"),
+                        createdAt = mark.optLong("createdAt", System.currentTimeMillis())
+                    ))
                 }
                 val artifacts = root.optJSONArray("artifacts") ?: JSONArray()
                 for (index in 0 until artifacts.length()) {
@@ -438,6 +473,8 @@ object BackupService {
                 }
                 counts
             }
+            // 日累计与总量是两套合并策略，恢复后必须校正一次，否则统计页会出现日合计大于总量
+            runCatching { Db(context).reconcileReadTotals() }
             "恢复完成：${restoreSummary(restored)}，API Key 未导入"
         } catch (error: Throwable) {
             createdFiles.asReversed().forEach { it.delete() }

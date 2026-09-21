@@ -15,7 +15,8 @@ object T {
     val textP = Color.parseColor("#F5F5F7")         // 主文字
     val textS = Color.argb(158, 245, 245, 247)      // 次文字 62%
     val textT = Color.argb(107, 245, 245, 247)      // 弱文字 42%
-    val accent = Color.parseColor("#0A84FF")        // 系统蓝强调色
+    /** 强调色统一取自 [Accent]，不再单独维护一套系统蓝。 */
+    val accent = Accent.primary
     val hairline = Color.argb(20, 255, 255, 255)    // 发丝分隔线
     val scrim = Color.argb(140, 0, 0, 0)            // 弹层蒙层
 

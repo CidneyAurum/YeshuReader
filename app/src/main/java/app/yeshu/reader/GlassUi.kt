@@ -112,7 +112,9 @@ object Glass {
                 v.setTextColor(palette.textP)
                 v.setHintTextColor(palette.textT)
             }
-            is android.widget.Button -> v.setTextColor(Color.parseColor("#8FB6FF"))
+            // 按钮统一用单一强调色；取消键用次要文字色，避免「确定/取消」同色
+            is android.widget.Button ->
+                v.setTextColor(if (v.id == android.R.id.button2) palette.textS else Accent.primarySoft)
             is android.widget.TextView -> v.setTextColor(palette.textP)
         }
         if (v is android.view.ViewGroup) {
@@ -161,17 +163,22 @@ object Glass {
         return box
     }
 
-    /** 细圆角阅读进度条：background.level 0..10000 控制填充比例 */
+    /**
+     * 细圆角阅读进度条：background.level 0..10000 控制填充比例。
+     *
+     * 填充色用统一强调色：原先固定白色，在浅色/纸张主题下画在米色背景上几乎看不见。
+     * 进度信息由顶栏百分比承载，这里对 TalkBack 隐藏，避免读出一个无标签视图。
+     */
     fun progressTrack(activity: Activity): View {
         val dd = activity.resources.displayMetrics.density
         val r = dp(2, dd).toFloat()
         val track = GradientDrawable().apply {
             cornerRadius = r
-            setColor(Color.argb(45, 255, 255, 255))
+            setColor(Color.argb(38, 128, 128, 128))
         }
         val fill = GradientDrawable().apply {
             cornerRadius = r
-            setColor(Color.argb(235, 255, 255, 255))
+            setColor(Accent.primary)
         }
         val clip = android.graphics.drawable.ClipDrawable(
             fill, Gravity.LEFT, android.graphics.drawable.ClipDrawable.HORIZONTAL
@@ -179,6 +186,7 @@ object Glass {
         return View(activity).apply {
             background = android.graphics.drawable.LayerDrawable(arrayOf(track, clip))
             background!!.level = 0
+            importantForAccessibility = View.IMPORTANT_FOR_ACCESSIBILITY_NO
         }
     }
 
@@ -244,6 +252,8 @@ object NoteKindLabels {
         "quiz" to "自测",
         "chat" to "聊天",
         "quote" to "金句",
+        // 划重点与书签位置都以笔记形式落库（颜色/锚点分别存在 status/anchor 列）
+        "highlight" to "重点",
         "digest" to "精读",
         "report" to "报告",
         "intro" to "书籍简介",

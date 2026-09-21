@@ -17,24 +17,55 @@ class SecureKeyStore(context: Context) {
 
     fun readApiKey(expectedOrigin: String): String {
         if (expectedOrigin.isBlank()) return ""
-        val storedOrigin = prefs.getString(KEY_ORIGIN, "").orEmpty()
-        // An origin-less payload may have come from an older build. Never silently send it to
-        // whichever provider the user happens to configure first; the UI must explicitly bind it.
-        if (storedOrigin.isBlank() || storedOrigin != expectedOrigin) return ""
-        return decryptPayload(KEY_PAYLOAD)
+        return if (apiKeyState(expectedOrigin) == KeyState.OK) decryptPayload(KEY_PAYLOAD) else ""
     }
+
+    /** 全局槽位的真实状态；origin 不匹配或无法解密时都如实返回，不再静默为空串。 */
+    fun apiKeyState(expectedOrigin: String): KeyState = KeyPayloadState.classify(
+        storedOrigin = prefs.getString(KEY_ORIGIN, "").orEmpty(),
+        expectedOrigin = expectedOrigin,
+        payloadPresent = prefs.getString(KEY_PAYLOAD, null).orEmpty().isNotBlank(),
+        decryptSucceeded = decryptOrNull(KEY_PAYLOAD) != null
+    )
 
     /** Reads one profile's independently encrypted key and verifies its provider origin. */
     fun readProfileApiKey(profileId: String, expectedOrigin: String): String {
-        if (profileId.isBlank() || expectedOrigin.isBlank()) return ""
-        val slot = profileSlot(profileId)
-        val storedOrigin = prefs.getString("${slot}_origin", "").orEmpty()
-        if (storedOrigin != expectedOrigin) return ""
-        return decryptPayload("${slot}_payload")
+        if (profileId.isBlank()) return ""
+        return if (profileKeyState(profileId, expectedOrigin) == KeyState.OK) {
+            decryptPayload("${profileSlot(profileId)}_payload")
+        } else {
+            ""
+        }
     }
 
-    fun hasProfileApiKey(profileId: String): Boolean =
-        prefs.getString("${profileSlot(profileId)}_payload", null).orEmpty().isNotBlank()
+    /**
+     * 一个配置的 Key 状态。origin 匹配、但当前 Keystore 密钥解不开时返回
+     * [KeyState.UNDECRYPTABLE]，界面据此提示「需要重新填写 Key」而不是假报保存成功。
+     */
+    fun profileKeyState(profileId: String, expectedOrigin: String): KeyState {
+        if (profileId.isBlank()) return KeyState.NONE
+        val slot = profileSlot(profileId)
+        val payloadKey = "${slot}_payload"
+        return KeyPayloadState.classify(
+            storedOrigin = prefs.getString("${slot}_origin", "").orEmpty(),
+            expectedOrigin = expectedOrigin,
+            payloadPresent = prefs.getString(payloadKey, null).orEmpty().isNotBlank(),
+            decryptSucceeded = decryptOrNull(payloadKey) != null
+        )
+    }
+
+    /**
+     * 旧签名：只回答「这条密文在本机能否解开」，不校验来源。
+     * 调用方若能拿到服务地址，应改用 [hasProfileApiKey] 的带 origin 重载。
+     */
+    fun hasProfileApiKey(profileId: String): Boolean {
+        if (profileId.isBlank()) return false
+        return decryptPayload("${profileSlot(profileId)}_payload").isNotBlank()
+    }
+
+    /** 校验密文可解密且属于 [expectedOrigin]。 */
+    fun hasProfileApiKey(profileId: String, expectedOrigin: String): Boolean =
+        profileKeyState(profileId, expectedOrigin) == KeyState.OK
 
     fun hasUnboundApiKey(): Boolean =
         prefs.getString(KEY_PAYLOAD, null).orEmpty().isNotBlank() &&
@@ -99,10 +130,13 @@ class SecureKeyStore(context: Context) {
         prefs.edit().putString(payloadKey, payload).putString(originKey, origin).apply()
     }
 
-    private fun decryptPayload(payloadKey: String): String = runCatching {
-        val payload = prefs.getString(payloadKey, null) ?: return ""
+    private fun decryptPayload(payloadKey: String): String = decryptOrNull(payloadKey).orEmpty()
+
+    /** 解密失败与「没有密文」都返回 null；成功时一定返回非空明文（空白值不会被写入）。 */
+    private fun decryptOrNull(payloadKey: String): String? = runCatching {
+        val payload = prefs.getString(payloadKey, null) ?: return null
         val parts = payload.split(':', limit = 2)
-        require(parts.size == 2)
+        if (parts.size != 2) return null
         val cipher = Cipher.getInstance(TRANSFORMATION)
         cipher.init(
             Cipher.DECRYPT_MODE,
@@ -110,7 +144,7 @@ class SecureKeyStore(context: Context) {
             GCMParameterSpec(128, Base64.decode(parts[0], Base64.NO_WRAP))
         )
         cipher.doFinal(Base64.decode(parts[1], Base64.NO_WRAP)).toString(Charsets.UTF_8)
-    }.getOrElse { "" }
+    }.getOrNull()?.takeIf { it.isNotBlank() }
 
     private fun profileSlot(profileId: String): String {
         val digest = MessageDigest.getInstance("SHA-256")

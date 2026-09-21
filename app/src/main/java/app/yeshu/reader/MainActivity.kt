@@ -38,7 +38,8 @@ sealed interface Destination {
     data object Notes : Destination
     data object Settings : Destination
     data object Stats : Destination
-    data class Reader(val bookId: Long) : Destination
+    /** [anchor] 非空时进入阅读器后按该锚点定位一次（来自笔记/成果里的引用 chip）。 */
+    data class Reader(val bookId: Long, val anchor: String = "") : Destination
     data class BookNotes(val bookId: Long) : Destination
     data class Chat(val bookId: Long, val chapterContext: String) : Destination
 }
@@ -148,10 +149,10 @@ class MainActivity : ComponentActivity() {
 
     fun showShelf() = navigate(Destination.Shelf)
 
-    fun openReader(id: Long) {
+    fun openReader(id: Long, anchor: String = "") {
         Db(this).markOpened(id)
         libraryRevision++
-        navigate(Destination.Reader(id))
+        navigate(Destination.Reader(id, anchor))
     }
 
     fun showSettings() = navigate(Destination.Settings)

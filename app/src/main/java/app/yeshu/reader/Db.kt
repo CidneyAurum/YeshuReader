@@ -2,6 +2,7 @@ package app.yeshu.reader
 
 import android.content.Context
 import app.yeshu.reader.data.AiArtifactEntity
+import app.yeshu.reader.data.BookmarkEntity
 import app.yeshu.reader.data.FolderEntity
 import app.yeshu.reader.data.LibraryItemEntity
 import app.yeshu.reader.data.NoteEntity
@@ -158,6 +159,24 @@ class Db(context: Context) {
     }
 
     fun activeDays(): Int = dao.activeDays()
+
+    /**
+     * 恢复备份后校正日累计。
+     *
+     * `mergeReadLog` 与 `mergeTotalReadMs` 各自只取较大值，两条独立策略叠加后
+     * 会出现「近 7 天合计 > 全部阅读时长」这种自相矛盾的统计。
+     * 这里把超出的部分按天等比回缩到总量以内，保证 `sum(read_log) <= total`。
+     */
+    fun reconcileReadTotals() {
+        room.runInTransaction {
+            val total = dao.totalAllReadMs()
+            val logs = dao.allReadLogs()
+            val sum = logs.sumOf { it.ms }
+            if (sum <= 0 || sum <= total) return@runInTransaction
+            val scale = total.toDouble() / sum.toDouble()
+            logs.forEach { row -> dao.setReadLog(row.day, (row.ms * scale).toLong()) }
+        }
+    }
     data class TopBook(val title: String, val ms: Long)
     fun topBooks(n: Int): List<TopBook> = dao.topBooks(n).map { TopBook(it.title, it.totalReadMs) }
     fun noteCount(): Int = dao.noteCount()
@@ -185,9 +204,94 @@ class Db(context: Context) {
         room.runInTransaction {
             dao.deleteNotesForBook(id)
             dao.deleteArtifactsForBook(id)
+            dao.deleteBookmarksForBook(id)
             dao.purgeBook(id)
         }
     }
+
+    // ---------- 书签 ----------
+
+    data class Bookmark(
+        val id: Long,
+        val bookId: Long,
+        val anchor: String,
+        val label: String,
+        val excerpt: String,
+        val createdAt: Long
+    )
+
+    private fun BookmarkEntity.toModel() = Bookmark(id, bookId, anchor, label, excerpt, createdAt)
+
+    /**
+     * 新建书签。同一位置重复添加会先删旧条目，避免用户连点后列表里出现一串相同位置。
+     * 返回是否真的写入了新书签。
+     */
+    fun addBookmark(bookId: Long, anchor: String, label: String, excerpt: String = ""): Boolean {
+        if (bookId <= 0 || anchor.isBlank()) return false
+        dao.listBookmarks(bookId).firstOrNull { it.anchor == anchor }?.let { dao.deleteBookmark(it.id) }
+        return dao.addBookmark(
+            BookmarkEntity(
+                bookId = bookId,
+                anchor = anchor,
+                label = label.trim(),
+                excerpt = excerpt.trim().take(80),
+                createdAt = System.currentTimeMillis()
+            )
+        ) > 0
+    }
+
+    fun listBookmarks(bookId: Long): List<Bookmark> = dao.listBookmarks(bookId).map { it.toModel() }
+
+    fun recentBookmarks(limit: Int = 200): List<Bookmark> = dao.recentBookmarks(limit).map { it.toModel() }
+
+    fun deleteBookmark(id: Long) = dao.deleteBookmark(id)
+
+    /** 当前位置是否已有书签，供阅读器切换「加书签 / 取消书签」。 */
+    fun hasBookmark(bookId: Long, anchor: String): Boolean =
+        anchor.isNotBlank() && dao.listBookmarks(bookId).any { it.anchor == anchor }
+
+    // ---------- 笔记内容编辑 ----------
+
+    /** 修改一条笔记的正文（编辑 AI 结果或手改错别字），不动 kind/anchor/createdAt。 */
+    fun updateNoteContent(id: Long, content: String) {
+        if (id <= 0) return
+        dao.updateNoteContent(id, content)
+    }
+
+    /** 同步更新 ai_artifacts 的正文，保证「笔记」与「AI 成果」两处一致。 */
+    fun updateArtifactContent(bookId: Long, kind: String, oldContent: String, newContent: String) {
+        dao.listArtifacts(bookId).firstOrNull { it.kind == kind && it.content == oldContent }?.let { artifact ->
+            dao.updateArtifactContent(artifact.id, newContent, System.currentTimeMillis())
+        }
+    }
+
+    /**
+     * 用户手动编辑 AI 结果后落库。
+     *
+     * 结果可能已经自动落成笔记（kind 非空），也可能只存在于缓存（命中缓存时不落笔记）。
+     * 因此：能按旧正文匹配到笔记就改它并标 edited；匹配不到就补一条，避免用户改完却看不到。
+     * ai_artifacts 同步改，否则「笔记」与「AI 成果」会显示两份不同的内容。
+     */
+    fun applyEditedContent(bookId: Long, kind: String, oldContent: String, newContent: String) {
+        if (newContent.isBlank()) return
+        room.runInTransaction {
+            val matched = dao.listNotes(bookId, kind).filter { it.content == oldContent }
+            if (matched.isEmpty()) {
+                dao.addNote(
+                    NoteEntity(bookId = bookId, kind = kind, content = newContent, createdAt = System.currentTimeMillis())
+                )
+            } else {
+                matched.forEach { note ->
+                    dao.updateNoteContent(note.id, newContent)
+                    dao.updateNoteStatus(note.id, NOTE_STATUS_EDITED)
+                }
+            }
+            updateArtifactContent(bookId, kind, oldContent, newContent)
+        }
+    }
+
+    /** 手动编辑过的笔记会带上这个状态，界面据此显示「已手动编辑」，避免被当成模型原文。 */
+    fun editedStatus(): String = NOTE_STATUS_EDITED
 
     fun addFolder(name: String, parentId: Long): Long = dao.insertFolder(FolderEntity(name = name.trim(), parentId = parentId))
     fun renameFolder(id: Long, name: String) = dao.renameFolder(id, name.trim())
@@ -286,6 +390,15 @@ class Db(context: Context) {
 
     fun hasAiKey(profileId: String): Boolean = SecureKeyStore(appContext).hasProfileApiKey(profileId)
 
+    /**
+     * 一个配置的 Key 真实状态（未保存/可用/来源不符/解不开）。
+     * 界面必须用它而不是「密文是否存在」，否则 Keystore 失效后会假报「已安全保存」。
+     */
+    fun aiKeyState(profileId: String, baseUrl: String): app.yeshu.reader.security.KeyState {
+        val origin = runCatching { AiClient.endpointOrigin(baseUrl) }.getOrDefault("")
+        return SecureKeyStore(appContext).profileKeyState(profileId, origin)
+    }
+
     fun setAiKey(profileId: String, value: String, baseUrl: String) {
         val origin = runCatching { AiClient.endpointOrigin(baseUrl) }.getOrDefault("")
         SecureKeyStore(appContext).writeProfileApiKey(profileId, value.trim(), origin)
@@ -330,6 +443,10 @@ class Db(context: Context) {
 
     fun listNotes(bookId: Long, kind: String? = null): List<NoteRow> =
         (if (kind == null) dao.listNotes(bookId) else dao.listNotes(bookId, kind)).map { it.toModel() }
+
+    /** 按 kind 取笔记详情（带 anchor/status）：重点的颜色与位置都存在这两列里。 */
+    fun listNoteDetails(bookId: Long, kind: String): List<NoteDetail> =
+        dao.listNotes(bookId, kind).map { it.toDetail() }
 
     /** 笔记中枢列表：带出处锚点，便于卡片上直接显示来源位置。 */
     fun recentNoteDetails(limit: Int = 80): List<NoteDetail> = dao.recentNotes(limit).map { it.toDetail() }
@@ -417,6 +534,9 @@ class Db(context: Context) {
     }
 
     companion object {
+        /** 用户手动编辑过内容的状态标记。 */
+        const val NOTE_STATUS_EDITED = "edited"
+
         private fun statusFor(progress: Float): String = when {
             progress >= 0.99f -> "done"
             progress > 0.005f -> "reading"

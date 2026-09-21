@@ -8,6 +8,7 @@ import android.view.Gravity
 import android.view.View
 import android.widget.FrameLayout
 import android.widget.LinearLayout
+import android.widget.ScrollView
 import android.widget.TextView
 import androidx.core.view.ViewCompat
 import androidx.core.view.WindowInsetsCompat
@@ -16,7 +17,10 @@ import android.animation.ObjectAnimator
 import android.view.animation.DecelerateInterpolator
 
 /**
- * 通用底部弹层：圆角面板 + 拖拽指示条 + 可选标题 + 图标菜单项。
+ * 通用底部弹层：圆角面板 + 拖拽指示条 + 可选标题 + 图标菜单项 + 分组标题。
+ *
+ * 分组（[section]）与副标题（`description`）是给 AI 动作列表用的：
+ * 用户必须能一眼看出哪些动作本地完成、哪些会把内容发到哪个服务商。
  * 蒙层点击关闭；进入/退出 220ms 平台缓动。用完即销毁，不驻留。
  */
 class BottomSheet(private val act: Activity, private val title: String? = null) {
@@ -26,10 +30,27 @@ class BottomSheet(private val act: Activity, private val title: String? = null) 
     private val pal by lazy { LegacyPalette.of(act) }
     private lateinit var overlay: FrameLayout
     private lateinit var panel: LinearLayout
-    private val items = mutableListOf<Triple<String, String, () -> Unit>>()  // icon, label, onClick
+    private var panelHost: ScrollView? = null
 
-    fun item(icon: String, label: String, onClick: () -> Unit): BottomSheet {
-        items.add(Triple(icon, label, onClick))
+    private sealed interface Entry {
+        data class Section(val title: String, val subtitle: String?) : Entry
+        data class Row(
+            val icon: String,
+            val label: String,
+            val description: String?,
+            val onClick: () -> Unit
+        ) : Entry
+    }
+
+    private val entries = mutableListOf<Entry>()
+
+    fun section(title: String, subtitle: String? = null): BottomSheet {
+        entries.add(Entry.Section(title, subtitle))
+        return this
+    }
+
+    fun item(icon: String, label: String, description: String? = null, onClick: () -> Unit): BottomSheet {
+        entries.add(Entry.Row(icon, label, description, onClick))
         return this
     }
 
@@ -70,45 +91,26 @@ class BottomSheet(private val act: Activity, private val title: String? = null) 
                 setTextColor(pal.textT)
                 setTypeface(null, Typeface.BOLD)
                 letterSpacing = 0.08f
-                setPadding(Glass.dp(14, d), Glass.dp(6, d), Glass.dp(14, d), Glass.dp(10, d))
+                setPadding(Glass.dp(14, d), Glass.dp(6, d), Glass.dp(14, d), Glass.dp(6, d))
             })
         }
 
-        // 菜单项：56dp 高、图标+标签，按压反馈
-        for ((icon, label, onClick) in items) {
-            val row = LinearLayout(act).apply {
-                orientation = LinearLayout.HORIZONTAL
-                gravity = Gravity.CENTER_VERTICAL
-                foreground = Glass.pressFx()
-                setPadding(Glass.dp(12, d), 0, Glass.dp(12, d), 0)
-                // 自绘图标无自身语义，标签放在整行容器上，TalkBack 只播报一次
-                contentDescription = label
-                setOnClickListener {
-                    dismiss()
-                    onClick()
-                }
+        for (entry in entries) {
+            when (entry) {
+                is Entry.Section -> panel.addView(sectionView(entry))
+                is Entry.Row -> panel.addView(rowView(entry))
             }
-            row.addView(FrameLayout(act).apply {
-                background = GradientDrawable().apply {
-                    shape = GradientDrawable.OVAL
-                    setColor(if (pal.dark) Color.argb(28, 255, 255, 255) else Color.argb(20, 23, 26, 43))
-                }
-                addView(IconView(act, icon, 19, pal.icon).apply {
-                    importantForAccessibility = View.IMPORTANT_FOR_ACCESSIBILITY_NO
-                })
-            }, LinearLayout.LayoutParams(Glass.dp(38, d), Glass.dp(38, d)))
-            row.addView(TextView(act).apply {
-                text = label
-                textSize = 15f
-                setTextColor(pal.textP)
-                val lp = LinearLayout.LayoutParams(0, -2, 1f)
-                lp.marginStart = Glass.dp(14, d)
-                layoutParams = lp
-            }, LinearLayout.LayoutParams(0, -2, 1f))
-            panel.addView(row, LinearLayout.LayoutParams(-1, Glass.dp(54, d)))
         }
 
-        overlay.addView(panel, FrameLayout.LayoutParams(-1, -2, Gravity.BOTTOM))
+        // 项目较多（如 AI 动作分组）时内容可能超过一屏：放进可滚动容器，
+        // 否则底部条目会被导航栏裁掉且无法访问。
+        val maxPanelHeight = (act.resources.displayMetrics.heightPixels * 0.82f).toInt()
+        val host = ScrollView(act).apply {
+            isFillViewport = false
+            addView(panel, FrameLayout.LayoutParams(-1, -2))
+        }
+        panelHost = host
+        overlay.addView(host, FrameLayout.LayoutParams(-1, -2, Gravity.BOTTOM))
         // 底部安全区：navigation bar inset 转为面板 padding
         ViewCompat.setOnApplyWindowInsetsListener(overlay) { v, insets ->
             val bars = insets.getInsets(
@@ -120,6 +122,9 @@ class BottomSheet(private val act: Activity, private val title: String? = null) 
                 Glass.dp(8, d), Glass.dp(10, d), Glass.dp(8, d),
                 Glass.dp(18, d) + bars.bottom
             )
+            host.layoutParams = (host.layoutParams as FrameLayout.LayoutParams).apply {
+                height = maxPanelHeight
+            }
             insets
         }
         ViewCompat.requestApplyInsets(overlay)
@@ -127,12 +132,12 @@ class BottomSheet(private val act: Activity, private val title: String? = null) 
         root.addView(overlay, FrameLayout.LayoutParams(-1, -1))
 
         // 进入动画：蒙层淡入 + 面板上滑
-        panel.post {
-            panel.translationY = panel.height.toFloat()
+        host.post {
+            host.translationY = host.height.toFloat()
             overlay.alpha = 0f
             AnimatorSet().apply {
                 playTogether(
-                    ObjectAnimator.ofFloat(panel, "translationY", panel.height.toFloat(), 0f),
+                    ObjectAnimator.ofFloat(host, "translationY", host.height.toFloat(), 0f),
                     ObjectAnimator.ofFloat(overlay, "alpha", 0f, 1f)
                 )
                 duration = T.durNorm.toLong()
@@ -142,14 +147,82 @@ class BottomSheet(private val act: Activity, private val title: String? = null) 
         }
     }
 
+    /** 分组标题：小字 + 一行解释，用于区分「本地」与「会联网」的动作。 */
+    private fun sectionView(section: Entry.Section): View = LinearLayout(act).apply {
+        orientation = LinearLayout.VERTICAL
+        setPadding(Glass.dp(14, d), Glass.dp(12, d), Glass.dp(14, d), Glass.dp(4, d))
+        addView(TextView(act).apply {
+            text = section.title
+            textSize = 11.5f
+            setTextColor(pal.textT)
+            setTypeface(null, Typeface.BOLD)
+            letterSpacing = 0.06f
+        })
+        section.subtitle?.let { sub ->
+            addView(TextView(act).apply {
+                text = sub
+                textSize = 10.5f
+                setTextColor(pal.textT)
+                setPadding(0, Glass.dp(2, d), 0, 0)
+            })
+        }
+    }
+
+    /** 菜单项：图标 + 标签（+ 可选一行说明），按压反馈。 */
+    private fun rowView(row: Entry.Row): View {
+        val hasDescription = !row.description.isNullOrBlank()
+        val container = LinearLayout(act).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            foreground = Glass.pressFx()
+            setPadding(Glass.dp(12, d), 0, Glass.dp(12, d), 0)
+            // 自绘图标无自身语义，标签放在整行容器上，TalkBack 只播报一次
+            contentDescription = if (hasDescription) "${row.label}，${row.description}" else row.label
+            setOnClickListener {
+                dismiss()
+                row.onClick()
+            }
+        }
+        container.addView(FrameLayout(act).apply {
+            background = GradientDrawable().apply {
+                shape = GradientDrawable.OVAL
+                setColor(if (pal.dark) Color.argb(28, 255, 255, 255) else Color.argb(20, 23, 26, 43))
+            }
+            addView(IconView(act, row.icon, 19, pal.icon).apply {
+                importantForAccessibility = View.IMPORTANT_FOR_ACCESSIBILITY_NO
+            })
+        }, LinearLayout.LayoutParams(Glass.dp(38, d), Glass.dp(38, d)))
+        container.addView(LinearLayout(act).apply {
+            orientation = LinearLayout.VERTICAL
+            addView(TextView(act).apply {
+                text = row.label
+                textSize = 15f
+                setTextColor(pal.textP)
+            })
+            if (hasDescription) {
+                addView(TextView(act).apply {
+                    text = row.description
+                    textSize = 10.5f
+                    setTextColor(pal.textT)
+                    setPadding(0, Glass.dp(2, d), 0, 0)
+                })
+            }
+        }, LinearLayout.LayoutParams(0, -2, 1f).also { it.marginStart = Glass.dp(14, d) })
+        return container
+    }
+
     fun dismiss() {
         if (!this::overlay.isInitialized) return
-        val p = panel
+        val host = panelHost
         AnimatorSet().apply {
-            playTogether(
-                ObjectAnimator.ofFloat(p, "translationY", 0f, p.height.toFloat()),
-                ObjectAnimator.ofFloat(overlay, "alpha", 1f, 0f)
-            )
+            if (host != null) {
+                playTogether(
+                    ObjectAnimator.ofFloat(host, "translationY", 0f, host.height.toFloat()),
+                    ObjectAnimator.ofFloat(overlay, "alpha", 1f, 0f)
+                )
+            } else {
+                playTogether(ObjectAnimator.ofFloat(overlay, "alpha", 1f, 0f))
+            }
             duration = T.durFast.toLong()
             interpolator = DecelerateInterpolator(2f)
             start()

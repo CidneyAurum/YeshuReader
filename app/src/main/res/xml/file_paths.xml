@@ -1,0 +1,5 @@
+<?xml version="1.0" encoding="utf-8"?>
+<paths>
+    <!-- 仅暴露 cache/share 目录：段落分享生成的临时图片，不涉及书籍原文件 -->
+    <cache-path name="share" path="share/" />
+</paths>

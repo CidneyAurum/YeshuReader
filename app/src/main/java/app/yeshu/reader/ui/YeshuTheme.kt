@@ -7,9 +7,10 @@ import androidx.compose.material3.lightColorScheme
 import androidx.compose.runtime.Composable
 import androidx.compose.ui.graphics.Color
 
-val ElectricBlue = Color(0xFF5B5FF5)
-val LuminousCyan = Color(0xFF22D3EE)
-val ActiveViolet = Color(0xFFA855F7)
+// 单一强调色系统：与 legacy 视图共用同一组色值（Accent.kt）
+val ElectricBlue = Color(app.yeshu.reader.Accent.primary)
+val LuminousCyan = Color(app.yeshu.reader.Accent.cyan)
+val ActiveViolet = Color(app.yeshu.reader.Accent.violet)
 val InkNavy = Color(0xFF0B1020)
 
 private val LightColors = lightColorScheme(

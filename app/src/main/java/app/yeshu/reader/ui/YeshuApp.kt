@@ -107,6 +107,7 @@ import app.yeshu.reader.StatsView
 import app.yeshu.reader.ai.AiProfileStore
 import app.yeshu.reader.ai.AiProviders
 import app.yeshu.reader.ai.SavedAiProfile
+import app.yeshu.reader.security.KeyState
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
@@ -149,6 +150,7 @@ private data class SettingsBootstrap(
     val profiles: List<SavedAiProfile>,
     val profile: SavedAiProfile,
     val hasSavedKey: Boolean,
+    val keyState: KeyState,
     val hasUnboundKey: Boolean,
     val volumeKeyFlip: Boolean
 )
@@ -317,7 +319,7 @@ private fun DestinationContent(
         Destination.Notes -> NotesHubScreen(activity, revision)
         Destination.Settings -> SettingsScreen(activity)
         Destination.Stats -> LegacyHost(activity) { StatsView(activity) }
-        is Destination.Reader -> DocumentWorkbenchScreen(activity, destination.bookId, onNavigate)
+        is Destination.Reader -> DocumentWorkbenchScreen(activity, destination.bookId, destination.anchor, onNavigate)
         is Destination.BookNotes -> LegacyHost(activity) { NotesView(activity, destination.bookId) }
         is Destination.Chat -> LegacyHost(
             activity,
@@ -330,6 +332,7 @@ private fun DestinationContent(
 private fun DocumentWorkbenchScreen(
     activity: MainActivity,
     bookId: Long,
+    anchor: String = "",
     onNavigate: (Destination) -> Unit
 ) {
     BoxWithConstraints(Modifier.fillMaxSize().background(Color(0xFF090D1A))) {
@@ -350,6 +353,11 @@ private fun DocumentWorkbenchScreen(
             }
             reader = loaded.first
             book = loaded.second
+            // 引用锚点只消费一次：挂载后按锚点定位，而不是把用户丢在文首
+            if (anchor.isNotBlank()) {
+                loaded.first.setPendingAnchor(anchor)
+                loaded.first.post { loaded.first.jumpToPendingAnchor() }
+            }
         }
         if (wide) {
             Row(Modifier.fillMaxSize()) {
@@ -933,10 +941,23 @@ private data class ArtifactRow(
     val sourceBookId: Long? get() = artifact.bookId.takeIf { it != 0L && bookTitle != null }
 }
 
-/** 笔记中枢一次加载的完整数据：笔记（带出处锚点）与全局 AI 成果。 */
+/** 笔记中枢一次加载的完整数据：笔记（带出处锚点）、书签/重点与全局 AI 成果。 */
 private data class NotesHubData(
     val notes: List<Pair<Db.NoteDetail, Book?>>,
-    val artifacts: List<ArtifactRow>
+    val artifacts: List<ArtifactRow>,
+    /** 书签与划过的重点。没有这一区，用户在阅读器里做的标记就再也找不回来。 */
+    val marks: List<MarkRow>
+)
+
+/** 笔记中枢「标记」区的一行：书签或高亮，点击回到原文位置。 */
+private data class MarkRow(
+    val key: String,
+    val title: String,
+    val badge: String,
+    val body: String,
+    val accent: Color,
+    val bookId: Long,
+    val anchor: String
 )
 
 /** 详情面板要展示的一条内容，笔记与 AI 成果共用。 */
@@ -976,6 +997,36 @@ private fun NotesHubScreen(activity: MainActivity, revision: Int) {
                     // bookId = 0 是全局阅读报告，不属于任何一本书，不能因为查不到书就丢掉。
                     if (book == null && note.bookId != 0L) null else note to book
                 }
+                val marks = buildList {
+                    db.recentBookmarks(120).forEach { mark ->
+                        val book = books[mark.bookId] ?: return@forEach
+                        add(
+                            MarkRow(
+                                key = "bm-${mark.id}",
+                                title = book.title,
+                                badge = "书签",
+                                body = mark.excerpt.ifBlank { mark.label },
+                                accent = ElectricBlue,
+                                bookId = mark.bookId,
+                                anchor = mark.anchor
+                            )
+                        )
+                    }
+                    notes.filter { (note, _) -> note.kind == "highlight" }.forEach { (note, book) ->
+                        if (book == null) return@forEach
+                        add(
+                            MarkRow(
+                                key = "hl-${note.id}",
+                                title = book.title,
+                                badge = "重点",
+                                body = cleanNoteContent(note.content),
+                                accent = ActiveViolet,
+                                bookId = note.bookId,
+                                anchor = note.anchor
+                            )
+                        )
+                    }
+                }
                 NotesHubData(
                     notes = notes,
                     // ai_artifacts 以前只有 AI 内部缓存会读：对话框一关，成果就再也没有入口
@@ -990,7 +1041,8 @@ private fun NotesHubScreen(activity: MainActivity, revision: Int) {
                                     note.content == artifact.content
                             }
                         )
-                    }
+                    },
+                    marks = marks
                 )
             }
         }
@@ -1060,7 +1112,7 @@ private fun NotesHubScreen(activity: MainActivity, revision: Int) {
             when {
                 failure != null -> item { WorkbenchErrorCard(failure, "无法读取本地笔记") { reloadTick++ } }
                 loaded == null -> item { NotesHubLoadingCard() }
-                loaded.notes.isEmpty() && loaded.artifacts.isEmpty() -> item {
+                loaded.notes.isEmpty() && loaded.artifacts.isEmpty() && loaded.marks.isEmpty() -> item {
                     GlassPanel(
                         modifier = Modifier.fillMaxWidth(),
                         shape = RoundedCornerShape(28.dp),
@@ -1091,6 +1143,12 @@ private fun NotesHubScreen(activity: MainActivity, revision: Int) {
                             onDelete = { pendingDelete = note }
                         )
                     }
+                    if (loaded.marks.isNotEmpty()) {
+                        item { SectionHeader("标记", "书签与划过的重点，点击回到原文位置") }
+                        items(loaded.marks, key = { it.key }) { mark ->
+                            MarkHubCard(mark) { activity.openReader(mark.bookId, mark.anchor) }
+                        }
+                    }
                     if (loaded.artifacts.isNotEmpty()) {
                         item { SectionHeader("AI 成果", "生成过的理解包，关闭对话框后仍可回看") }
                         items(loaded.artifacts, key = { "artifact-${it.artifact.id}" }) { row ->
@@ -1108,9 +1166,9 @@ private fun NotesHubScreen(activity: MainActivity, revision: Int) {
                                     )
                                 },
                                 onOpenSource = row.sourceBookId?.let { id ->
-                                    {
+                                    { anchorToken: String ->
                                         detail = null
-                                        activity.openReader(id)
+                                        activity.openReader(id, anchorToken)
                                     }
                                 },
                                 onSaveAsNote = { saveArtifactAsNote(row.artifact) },
@@ -1133,10 +1191,10 @@ private fun NotesHubScreen(activity: MainActivity, revision: Int) {
         detail?.let { request ->
             DetailSheet(
                 request = request,
-                onOpenSource = {
+                onOpenSource = { anchorToken: String ->
                     request.bookId?.let { id ->
                         detail = null
-                        activity.openReader(id)
+                        activity.openReader(id, anchorToken)
                     }
                 },
                 onSaveAsNote = request.saveAsNoteArtifact?.let { artifact -> { saveArtifactAsNote(artifact) } },
@@ -1171,7 +1229,11 @@ private fun detailContentOf(
 ): DetailContent = DetailContent(
     title = book?.title ?: "阅读报告",
     badge = noteKindLabel(note.kind, note.content),
-    meta = relativeTime(note.createdAt) + if (note.status == "unvalidated") "  ·  校验未通过，已保留" else "",
+    meta = relativeTime(note.createdAt) + when (note.status) {
+        "unvalidated" -> "  ·  校验未通过，已保留"
+        "edited" -> "  ·  已手动编辑"
+        else -> ""
+    },
     body = cleanNoteContent(note.content),
     anchors = (noteAnchors(note.anchor) + extraAnchors).distinct(),
     bookId = book?.id
@@ -1274,12 +1336,53 @@ private fun NoteHubCard(
     }
 }
 
+/** 标记卡片：书签/重点共用，点按跳回原文的精确位置。 */
+@Composable
+private fun MarkHubCard(mark: MarkRow, onOpen: () -> Unit) {
+    GlassPanel(
+        modifier = Modifier.fillMaxWidth(),
+        shape = RoundedCornerShape(22.dp),
+        contentPadding = PaddingValues(15.dp),
+        elevation = 6.dp,
+        onClick = onOpen
+    ) {
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            Box(Modifier.size(10.dp).clip(CircleShape).background(mark.accent))
+            Spacer(Modifier.width(9.dp))
+            Column(Modifier.weight(1f)) {
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Text(
+                        mark.title,
+                        modifier = Modifier.weight(1f),
+                        fontWeight = FontWeight.Bold,
+                        color = mark.accent,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis
+                    )
+                    GlassPill(color = mark.accent) {
+                        Text(mark.badge, fontSize = 10.sp, color = mark.accent, fontWeight = FontWeight.Bold)
+                    }
+                }
+                Spacer(Modifier.height(5.dp))
+                Text(
+                    mark.body,
+                    maxLines = 2,
+                    overflow = TextOverflow.Ellipsis,
+                    color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.84f)
+                )
+            }
+            Spacer(Modifier.width(8.dp))
+            Text("→", color = mark.accent, fontWeight = FontWeight.Bold)
+        }
+    }
+}
+
 /** AI 成果卡片：kind、模型、时间与引用锚点都直接可见，不必再打开对话框找。 */
 @Composable
 private fun ArtifactHubCard(
     row: ArtifactRow,
     onOpen: () -> Unit,
-    onOpenSource: (() -> Unit)?,
+    onOpenSource: ((String) -> Unit)?,
     onSaveAsNote: () -> Unit,
     onDelete: () -> Unit
 ) {
@@ -1355,12 +1458,12 @@ private fun ArtifactHubCard(
     }
 }
 
-/** 引用锚点：有原书时点击跳转到那本书（页枢暂不支持按锚点精确定位）。 */
+/** 引用锚点：有原书时点击跳转到那本书的对应位置（anchor 交给 ReaderView 定位）。 */
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
-private fun AnchorChip(anchor: CitationAnchor, onClick: (() -> Unit)?) {
+private fun AnchorChip(anchor: CitationAnchor, onClick: ((String) -> Unit)?) {
     AssistChip(
-        onClick = { onClick?.invoke() },
+        onClick = { onClick?.invoke(anchor.token) },
         enabled = onClick != null,
         label = { Text(anchor.label, fontSize = 11.sp, maxLines = 1) },
         shape = RoundedCornerShape(14.dp)
@@ -1371,7 +1474,7 @@ private fun AnchorChip(anchor: CitationAnchor, onClick: (() -> Unit)?) {
 @Composable
 private fun DetailSheet(
     request: DetailContent,
-    onOpenSource: () -> Unit,
+    onOpenSource: (String) -> Unit,
     onSaveAsNote: (() -> Unit)?,
     onDismiss: () -> Unit
 ) {
@@ -1433,7 +1536,8 @@ private fun DetailSheet(
                 Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                     if (request.bookId != null) {
                         OutlinedButton(
-                            onClick = onOpenSource,
+                            // 没有具体锚点时只打开原书；有则跳到第一个引用位置
+                            onClick = { onOpenSource(request.anchors.firstOrNull()?.token.orEmpty()) },
                             modifier = Modifier.weight(1f),
                             shape = RoundedCornerShape(16.dp)
                         ) { Text("打开原书位置") }
@@ -1479,10 +1583,12 @@ private fun SettingsScreen(activity: MainActivity) {
         bootstrap = withContext(Dispatchers.IO) {
             val profiles = AiProfileStore.list(db)
             val profile = AiProfileStore.active(db)
+            val keyState = db.aiKeyState(profile.id, profile.baseUrl)
             SettingsBootstrap(
                 profiles = profiles,
                 profile = profile,
-                hasSavedKey = db.getAiKey(profile.id, profile.baseUrl).isNotBlank(),
+                hasSavedKey = keyState == KeyState.OK,
+                keyState = keyState,
                 hasUnboundKey = db.hasUnboundAiKey(),
                 // ReaderView 以 "0" 表示关闭音量键翻页，其余（含未写入）视为开启
                 volumeKeyFlip = db.getSetting("reader_volume_flip") != "0"
@@ -1507,6 +1613,7 @@ private fun SettingsScreen(activity: MainActivity) {
     var authPrefix by remember { mutableStateOf(boot.profile.authPrefix) }
     var keyInput by remember { mutableStateOf("") }
     var hasSavedKey by remember { mutableStateOf(boot.hasSavedKey) }
+    var keyState by remember { mutableStateOf(boot.keyState) }
     var keyLoading by remember { mutableStateOf(false) }
     var hasUnboundKey by remember { mutableStateOf(boot.hasUnboundKey) }
     var volumeKeyFlip by remember { mutableStateOf(boot.volumeKeyFlip) }
@@ -1532,10 +1639,14 @@ private fun SettingsScreen(activity: MainActivity) {
         keyLoading = true
         keyLoadToken[0] += 1
         val token = keyLoadToken[0]
+        val profileId = activeProfileId
         scope.launch {
-            val saved = withContext(Dispatchers.IO) { db.getAiKey(activeProfileId, url).isNotBlank() }
+            // 状态而不是「密文是否存在」：解不开的旧 Key 必须让用户看到「需要重新填写」，
+            // 否则界面会一直显示「已安全保存」，直到请求被 401 拒绝才暴露。
+            val state = withContext(Dispatchers.IO) { db.aiKeyState(profileId, url) }
             if (token == keyLoadToken[0]) {
-                hasSavedKey = saved
+                keyState = state
+                hasSavedKey = state == KeyState.OK
                 keyLoading = false
             }
         }
@@ -2091,6 +2202,10 @@ private fun SettingsScreen(activity: MainActivity) {
                                     when {
                                         keyLoading -> "API Key（正在读取…）"
                                         hasSavedKey -> "API Key（已安全保存，留空不修改）"
+                                        keyState == KeyState.UNDECRYPTABLE ->
+                                            "API Key（需要重新填写）"
+                                        keyState == KeyState.ORIGIN_MISMATCH ->
+                                            "API Key（已保存的 Key 属于其他服务地址）"
                                         else -> "API Key"
                                     }
                                 )
@@ -2101,6 +2216,16 @@ private fun SettingsScreen(activity: MainActivity) {
                             visualTransformation = PasswordVisualTransformation(),
                             colors = glassTextFieldColors()
                         )
+                        // 状态提示必须说清「为什么」和「怎么办」，否则用户只知道请求失败
+                        keyState.hint?.let { hint ->
+                            GlassPill(color = MaterialTheme.colorScheme.error) {
+                                Text(
+                                    "$hint。请重新输入一次即可覆盖保存。",
+                                    fontSize = 10.sp,
+                                    color = MaterialTheme.colorScheme.error
+                                )
+                            }
+                        }
                         if (hasUnboundKey) {
                             GlassPanel(
                                 modifier = Modifier.fillMaxWidth(),
@@ -2135,9 +2260,11 @@ private fun SettingsScreen(activity: MainActivity) {
                                                 }
                                                 if (bound) {
                                                     hasUnboundKey = false
-                                                    hasSavedKey = withContext(Dispatchers.IO) {
-                                                        db.getAiKey(activeProfileId, baseUrl).isNotBlank()
+                                                    val boundState = withContext(Dispatchers.IO) {
+                                                        db.aiKeyState(activeProfileId, baseUrl)
                                                     }
+                                                    keyState = boundState
+                                                    hasSavedKey = boundState == KeyState.OK
                                                     status = "旧 Key 已绑定到当前服务"
                                                 } else {
                                                     status = "绑定失败：请先填写有效的服务地址"
@@ -2260,15 +2387,18 @@ private fun SettingsScreen(activity: MainActivity) {
                                 Text(it, fontSize = 11.sp, color = if (failed) MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.onSurface)
                             }
                         }
-                        if (hasSavedKey) {
+                        if (hasSavedKey || keyState != KeyState.NONE) {
                             TextButton(onClick = {
                                 scope.launch {
                                     withContext(Dispatchers.IO) { db.setAiKey(activeProfileId, "", baseUrl) }
                                     hasSavedKey = false
+                                    keyState = KeyState.NONE
                                     keyLoading = false
                                     status = "当前配置的 API Key 已移除"
                                 }
-                            }) { Text("移除已保存的 Key") }
+                            }) {
+                                Text(if (hasSavedKey) "移除已保存的 Key" else "清除失效的 Key 记录")
+                            }
                         }
                     }
                 }

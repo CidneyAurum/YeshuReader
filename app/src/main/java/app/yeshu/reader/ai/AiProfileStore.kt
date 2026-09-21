@@ -2,6 +2,7 @@ package app.yeshu.reader.ai
 
 import app.yeshu.reader.AiClient
 import app.yeshu.reader.Db
+import app.yeshu.reader.security.KeyState
 import org.json.JSONArray
 import org.json.JSONObject
 import java.util.UUID
@@ -317,7 +318,10 @@ object AiProfileStore {
         profiles.asSequence().filter { it.baseUrl.isNotBlank() }.forEach { profile ->
             val oldKey = db.getAiKey(profile.baseUrl)
             if (oldKey.isBlank()) return@forEach
-            if (!db.hasAiKey(profile.id)) {
+            // 「密文存在」不等于「本机能解开」：换机/恢复备份后 Keystore 密钥失效时，
+            // 旧密文仍在但永远解不开。此时必须允许用旧绑定 Key 覆盖，否则用户的 Key 被永久卡住。
+            val state = db.aiKeyState(profile.id, profile.baseUrl)
+            if (state != KeyState.OK) {
                 runCatching {
                     db.setAiKey(profile.id, oldKey, profile.baseUrl)
                 }

@@ -34,7 +34,8 @@ class AiLiveSmokeTest {
             .firstOrNull { it.isFile }
             ?.inputStream()?.use { props.load(it) }
         baseUrl = props.getProperty("yeshu.ai.baseUrl", "https://tokenrhythm.studio/v1")
-        model = props.getProperty("yeshu.ai.model", "deepseek-v4-flash")
+        // 用稳定别名而不是带版本/日期的具体 id：服务商轮换版本时别名不会失效
+        model = props.getProperty("yeshu.ai.model", "deepseek-flash")
         apiKey = System.getenv("YESHU_AI_KEY")?.takeIf { it.isNotBlank() }
             ?: props.getProperty("yeshu.ai.key", "")
         assumeTrue("未提供 AI 密钥，跳过实况测试", apiKey.isNotBlank())

@@ -63,7 +63,14 @@ class ReaderView(
         /** PDF/图片图像发送确认：用户确认过一次后不再重复询问 */
         private const val SETTING_VISION_SEND_CONFIRMED = "ai_vision_send_confirmed"
         /** AI 结果里的 Markdown 标题强调色（与引用链接同色系） */
-        private val AI_HEAD_ACCENT = Color.parseColor("#5B5FF5")
+        private val AI_HEAD_ACCENT = Accent.primary
+
+        /** 重点（高亮）用的笔记 kind；颜色 id 存在 notes.status 列里。 */
+        private const val HIGHLIGHT_KIND = "highlight"
+        private const val HIGHLIGHT_AMBER = "amber"
+        private const val HIGHLIGHT_GREEN = "green"
+        private const val HIGHLIGHT_BLUE = "blue"
+        private const val HIGHLIGHT_ROSE = "rose"
         private val BOLD_RE = Regex("\\*\\*(.+?)\\*\\*")
         /** pptx 幻灯片标题形如「第 3 张幻灯片」「— 第 3 页 —」，与 DocumentAiService 的识别规则一致 */
         private val PPT_SLIDE_RE = Regex("^—?\\s*第\\s*(\\d+)\\s*页\\s*—?$")
@@ -84,10 +91,21 @@ class ReaderView(
     }
 
     private enum class ReaderTheme(val key: String, val title: String, val subtitle: String) {
+        SYSTEM("system", "跟随系统", "随系统外观自动切换"),
         LIGHT("light", "浅色", "清爽白底，适合明亮环境"),
         PAPER("paper", "纸张", "暖米色，适合长时间阅读"),
         DARK("dark", "深色", "低眩光，适合夜间阅读")
     }
+
+    /** 「跟随系统」必须解析成具体主题后才能取色；其余主题原样返回。 */
+    private fun resolveTheme(theme: ReaderTheme = readerTheme): ReaderTheme =
+        if (theme == ReaderTheme.SYSTEM) {
+            val night = (act.resources.configuration.uiMode and android.content.res.Configuration.UI_MODE_NIGHT_MASK) ==
+                android.content.res.Configuration.UI_MODE_NIGHT_YES
+            if (night) ReaderTheme.DARK else ReaderTheme.LIGHT
+        } else {
+            theme
+        }
 
     private val db = Db(act)
     private var sc: ScrollView? = null
@@ -131,7 +149,42 @@ class ReaderView(
     private var bottomBar: android.view.View? = null
     private var progBar: android.view.View? = null
     private var themeCell: FrameLayout? = null
+    private var bookmarkCell: FrameLayout? = null
     private var barsHidden = false
+
+    /** 已划重点的块下标 → 颜色 id。只存 id，色值按当前阅读主题解析（见 highlightColorOf）。 */
+    private val highlightColors = mutableMapOf<Int, String>()
+
+    /** 已存在的书签锚点。滚动事件是高频路径，不能每帧去查一次 Room。 */
+    private val bookmarkAnchors = mutableSetOf<String>()
+    private var lastBookmarkAnchor = ""
+
+    /** 排版参数：从 settings 读入，改动后立即重排并还原阅读位置。 */
+    private var lineSpacingFactor = 1.38f
+    private var marginDp = 20
+
+    /** 由宿主传入的一次性跳转目标（笔记/成果里的引用锚点）；消费一次即清空。 */
+    var pendingAnchor: String = ""
+        private set
+
+    /**
+     * 进入阅读器后按锚点定位一次（来自笔记中枢的引用 chip）。
+     * 锚点可能带方括号或空格（笔记列表里统一展示成 `[CHAPTER:3]`），这里统一解析。
+     */
+    fun jumpToPendingAnchor() {
+        val raw = pendingAnchor
+        pendingAnchor = ""
+        if (raw.isBlank()) return
+        val match = Regex("([A-Za-z]+)\\s*:\\s*(\\d+)").find(raw) ?: return
+        val type = match.groupValues[1].uppercase()
+        val index = match.groupValues[2].toIntOrNull() ?: return
+        jumpToCitation(type, index)
+    }
+
+    /** 设置一次待跳转锚点；宿主在视图挂载后调用 [jumpToPendingAnchor]。 */
+    fun setPendingAnchor(anchor: String) {
+        pendingAnchor = anchor
+    }
 
     /** 点正文呼出/隐藏工具栏（iBooks 式沉浸阅读） */
     private fun toggleBars() {
@@ -325,27 +378,27 @@ class ReaderView(
         }
     }
 
-    private fun themeBackground(theme: ReaderTheme = readerTheme): Int = when (theme) {
-        ReaderTheme.LIGHT -> LIGHT_BG
+    private fun themeBackground(theme: ReaderTheme = readerTheme): Int = when (resolveTheme(theme)) {
+        ReaderTheme.LIGHT, ReaderTheme.SYSTEM -> LIGHT_BG
         ReaderTheme.PAPER -> PAPER_BG
         ReaderTheme.DARK -> NIGHT_BG
     }
 
-    private fun themeText(theme: ReaderTheme = readerTheme): Int = when (theme) {
-        ReaderTheme.LIGHT -> LIGHT_TEXT
+    private fun themeText(theme: ReaderTheme = readerTheme): Int = when (resolveTheme(theme)) {
+        ReaderTheme.LIGHT, ReaderTheme.SYSTEM -> LIGHT_TEXT
         ReaderTheme.PAPER -> PAPER_TEXT
         ReaderTheme.DARK -> NIGHT_TEXT
     }
 
-    private fun themeHeading(theme: ReaderTheme = readerTheme): Int = when (theme) {
-        ReaderTheme.LIGHT -> LIGHT_HEAD
+    private fun themeHeading(theme: ReaderTheme = readerTheme): Int = when (resolveTheme(theme)) {
+        ReaderTheme.LIGHT, ReaderTheme.SYSTEM -> LIGHT_HEAD
         ReaderTheme.PAPER -> PAPER_HEAD
         ReaderTheme.DARK -> NIGHT_HEAD
     }
 
     /** PDF 与图片本身不改色，只让画布边缘跟随阅读主题。 */
-    private fun themeStage(theme: ReaderTheme = readerTheme): Int = when (theme) {
-        ReaderTheme.LIGHT -> Color.parseColor("#DDE1E8")
+    private fun themeStage(theme: ReaderTheme = readerTheme): Int = when (resolveTheme(theme)) {
+        ReaderTheme.LIGHT, ReaderTheme.SYSTEM -> Color.parseColor("#DDE1E8")
         ReaderTheme.PAPER -> Color.parseColor("#C9BEAA")
         ReaderTheme.DARK -> Color.parseColor("#24272E")
     }
@@ -384,6 +437,7 @@ class ReaderView(
     }
 
     private fun themeIcon(theme: ReaderTheme = readerTheme): String = when (theme) {
+        ReaderTheme.SYSTEM -> "sliders"
         ReaderTheme.LIGHT -> "sun"
         ReaderTheme.PAPER -> "book"
         ReaderTheme.DARK -> "moon"
@@ -398,7 +452,7 @@ class ReaderView(
     ) {
         val d = density(act)
         container.removeAllViews()
-        val primary = if (accent) Color.parseColor("#B7C0FF") else Color.parseColor("#F4F5FA")
+        val primary = if (accent) Accent.chromeAccentText else Accent.chromeTextMuted
         val inner = LinearLayout(act).apply {
             orientation = LinearLayout.VERTICAL
             gravity = Gravity.CENTER
@@ -422,7 +476,7 @@ class ReaderView(
             text = label
             textSize = 9.5f
             gravity = Gravity.CENTER
-            setTextColor(if (accent) Color.parseColor("#AAB5FF") else Color.parseColor("#AEB4C2"))
+            setTextColor(if (accent) Accent.chromeAccentTextSoft else Accent.chromeTextSecondary)
             setTypeface(null, if (accent) Typeface.BOLD else Typeface.NORMAL)
         }, LinearLayout.LayoutParams(-2, Glass.dp(17, d)))
         container.addView(inner, FrameLayout.LayoutParams(-1, -1, Gravity.CENTER))
@@ -515,7 +569,7 @@ class ReaderView(
         val titleTv = TextView(act).apply {
             text = book.title
             textSize = 16f
-            setTextColor(Color.parseColor("#F7F8FC"))
+            setTextColor(Accent.chromeTextPrimary)
             setTypeface(null, Typeface.BOLD)
             maxLines = 1
             ellipsize = android.text.TextUtils.TruncateAt.END
@@ -524,7 +578,7 @@ class ReaderView(
         val curHeadTv = TextView(act).apply {
             text = book.author.ifBlank { "继续阅读" }
             textSize = 10f
-            setTextColor(Color.parseColor("#AEB4C2"))
+            setTextColor(Accent.chromeTextSecondary)
             maxLines = 1
             ellipsize = android.text.TextUtils.TruncateAt.END
             gravity = Gravity.CENTER
@@ -541,40 +595,10 @@ class ReaderView(
             lp.setMargins(Glass.dp(10, d), Glass.dp(6, d), Glass.dp(10, d), Glass.dp(5, d))
         })
 
-        // 文档二层工作台：普通书籍可停留在阅读，资料可进入目录、AI 与笔记。
-        val documentTabs = LinearLayout(act).apply {
-            orientation = LinearLayout.HORIZONTAL
-            gravity = Gravity.CENTER_VERTICAL
-            background = chromeSurface(radiusDp = 18, alpha = 210)
-            elevation = Glass.dp(5, d).toFloat()
-            setPadding(Glass.dp(5, d), Glass.dp(4, d), Glass.dp(5, d), Glass.dp(4, d))
-        }
-        fun documentTab(label: String, selected: Boolean = false, onClick: () -> Unit) =
-            TextView(act).apply {
-                text = label
-                textSize = 12f
-                gravity = Gravity.CENTER
-                setTextColor(if (selected) Color.WHITE else Color.parseColor("#B8BECC"))
-                setTypeface(null, if (selected) Typeface.BOLD else Typeface.NORMAL)
-                background = chromeChip(selected)
-                foreground = Glass.pressFx()
-                contentDescription = label
-                layoutParams = LinearLayout.LayoutParams(0, Glass.dp(38, d), 1f).also {
-                    it.marginStart = Glass.dp(2, d)
-                    it.marginEnd = Glass.dp(2, d)
-                }
-                setOnClickListener { onClick() }
-            }
-        if (showDocumentTabs) {
-            documentTabs.addView(documentTab("阅读", selected = true) { })
-            documentTabs.addView(documentTab("目录") { listToc() })
-            documentTabs.addView(documentTab("AI") { showAiMenu() })
-            documentTabs.addView(documentTab("笔记") { (act as MainActivity).showNotes(bookId) })
-            col.addView(documentTabs, LayoutParams(-1, -2).also { lp ->
-                lp.setMargins(Glass.dp(10, d), 0, Glass.dp(10, d), Glass.dp(6, d))
-            })
-            documentBar = documentTabs
-        }
+        // 文档二层工作台原先是一条与底部工具坞并列的横栏（阅读/目录/AI/笔记），
+        // 两条栏权重相同且「目录」重复出现，用户不知道该点哪条。
+        // 现在统一收进下方唯一的工具坞，这里只保留进度条位置。
+        documentBar = null
 
         val sv = ScrollView(act).apply {
             isFillViewport = true
@@ -603,14 +627,13 @@ class ReaderView(
         // 阅读进度细条（底部工具坞上方）
         val prog = Glass.progressTrack(act)
         progBar = prog
-        col.addView(prog, LayoutParams(-1, Glass.dp(2, d)).also { lp ->
+        // 3dp：2dp 在低密度屏上低于可感知阈值
+        col.addView(prog, LayoutParams(-1, Glass.dp(3, d)).also { lp ->
             lp.setMargins(Glass.dp(22, d), Glass.dp(5, d), Glass.dp(22, d), Glass.dp(3, d))
         })
         fun updProg() {
-            val child = sv.getChildAt(0) ?: return
-            val range = child.height - sv.height
-            val frac = if (range > 0) (sv.scrollY.toFloat() / range).coerceIn(0f, 1f) else 0f
-            prog.background?.level = (frac * 10000).toInt()
+            // 与落库、顶栏共用同一进度口径：三者不一致时用户会以为进度条在骗人
+            prog.background?.level = (currentProgress() * 10000).toInt()
         }
         sv.post { updProg() }
 
@@ -618,34 +641,26 @@ class ReaderView(
             renderPdfWindow()
             maybeAppend()
             updProg()
+            syncBookmarkCell()
+            hasInteracted = true
             // 顶栏当前章名联动（微信读书式方位感）+ 实时百分比
-            if (pdfRenderer == null && tocHeads.isNotEmpty()) {
-                val bx = sv.getChildAt(0) as? LinearLayout
-                val range = (bx?.height ?: 0) - sv.height
-                if (bx != null && range > 0) {
-                    val frac = (sv.scrollY.toFloat() / range).coerceIn(0f, 1f)
-                    // 块高差异大，章名必须按真实可见块判断，不能用滚动比例反推索引
-                    val curIdx = currentBlockIndex()
-                    var name: String? = null
-                    if (curIdx >= 0) {
-                        for (h in tocHeads) { if (h.first <= curIdx) name = h.second else break }
-                    }
-                    val show = name?.let { it.take(20) + " · " + (frac * 100).toInt() + "%" }
-                    if (show != null && curHeadTv.text != show) {
-                        curHeadTv.visibility = View.VISIBLE
-                        curHeadTv.text = show
-                    }
-                }
-            } else if (pdfRenderer != null) {
-                val bx = sv.getChildAt(0) as? LinearLayout
-                val range = (bx?.height ?: 0) - sv.height
-                if (range > 0) {
-                    val show = "PDF · " + ((sv.scrollY.toFloat() / range).coerceIn(0f, 1f) * 100).toInt() + "%"
-                    if (curHeadTv.text != show) {
-                        curHeadTv.visibility = View.VISIBLE
-                        curHeadTv.text = show
-                    }
-                }
+            // 顶栏副标题：始终显示「真实位置 · 统一百分比」。
+            // 没有章节结构的 TXT / PDF / 图片集以前会长期停在一句无意义的格式串。
+            val percent = (currentProgress() * 100).toInt()
+            val (posIndex, posTotal) = progressPosition()
+            val show = if (pdfRenderer != null || bookFormat == "pdf") {
+                "PDF · 第 ${posIndex + 1}${if (posTotal > 0) " / $posTotal" else ""} 页 · $percent%"
+            } else if (posIndex >= 0) {
+                var name: String? = null
+                for (h in tocHeads) { if (h.first <= posIndex) name = h.second else break }
+                if (name.isNullOrBlank()) "第 ${posIndex + 1} / $posTotal 段 · $percent%"
+                else "${name.take(20)} · $percent%"
+            } else {
+                null
+            }
+            if (show != null && curHeadTv.text != show) {
+                curHeadTv.visibility = View.VISIBLE
+                curHeadTv.text = show
             }
             val now = System.currentTimeMillis()
             if (now - lastSavedAt > 1500) {
@@ -683,19 +698,27 @@ class ReaderView(
             renderToolCell(cell, icon = icon, glyph = glyph, label = label)
             return cell
         }
+        // 唯一的一条底部工具坞：本地动作（搜索/目录/书签/主题设置）与联网动作（AI/笔记）分区排布。
+        // 先加第一格：搜索。
         bottom.addView(toolCell(icon = "search", label = "搜索", description = "书内搜索") { searchInBook() })
-        bottom.addView(toolCell(icon = "list", label = "目录", description = "文档目录") { listToc() })
-        val tc = toolCell(icon = themeIcon(), label = readerTheme.title, description = "选择阅读主题") {
-            showThemePicker()
+        // 书签：点击在当前位置添加/取消，长按打开书签列表。这是本地动作，不联网。
+        bookmarkCell = toolCell(icon = "book", label = "书签", description = "在当前位置添加或取消书签；长按查看全部书签") { toggleBookmark() }
+        bookmarkCell?.setOnLongClickListener { showBookmarkList(); true }
+        bottom.addView(bookmarkCell)
+        if (showDocumentTabs) {
+            // 宽屏下目录/AI/笔记已在侧栏常驻，这里不再重复；窄屏必须有入口。
+            bottom.addView(toolCell(icon = "list", label = "目录", description = "文档目录") { listToc() })
+            bottom.addView(toolCell(icon = "note", label = "AI", description = "AI 助手：理解包、问答与自测") { showAiMenu() })
+            bottom.addView(toolCell(icon = "folder", label = "笔记", description = "本书笔记") { (act as MainActivity).showNotes(bookId) })
+        }
+        val tc = toolCell(icon = themeIcon(), label = readerTheme.title, description = "阅读设置：主题 / 亮度 / 行距 / 字号") {
+            showReaderSettings()
         }
         themeCell = tc
         refreshThemeCell()
         bottom.addView(tc)
-        bottom.addView(toolCell(icon = "bulb", label = "亮度", description = "阅读亮度") { brightnessDialog() })
-        val dec = toolCell(glyph = "A−", label = "缩小", description = "减小字号") { applyFontSp(styleSp - 1f) }
-        setupRepeatable(dec) { applyFontSp(styleSp - 1f) }
-        bottom.addView(dec)
-        val inc = toolCell(glyph = "A+", label = "放大", description = "增大字号") { applyFontSp(styleSp + 1f) }
+        // 字号独立成格保留连发手感，同时把行距/边距收进「阅读设置」面板。
+        val inc = toolCell(glyph = "A+", label = "字号", description = "增大字号") { applyFontSp(styleSp + 1f) }
         setupRepeatable(inc) { applyFontSp(styleSp + 1f) }
         bottom.addView(inc)
         col.addView(bottom, LayoutParams(-1, -2).also { lp ->
@@ -753,7 +776,12 @@ class ReaderView(
         tocHeads = doc.blocks.mapIndexedNotNull { i, b ->
             if (b.type == Block.HEADING) i to b.text else null
         }
+        loadBookmarks()
         docFullText = doc.fullText
+        // 排版参数与已划重点必须在渲染块之前就位，否则首屏块会用默认行距/无色渲染
+        lineSpacingFactor = db.getSetting("reader_line_spacing")?.toFloatOrNull()?.coerceIn(1.0f, 2.0f) ?: 1.38f
+        marginDp = db.getSetting("reader_margin_dp")?.toIntOrNull()?.coerceIn(8, 40) ?: 20
+        loadHighlights()
         val box = LinearLayout(act).apply {
             orientation = LinearLayout.VERTICAL
             setBackgroundColor(themeBackground())
@@ -773,21 +801,19 @@ class ReaderView(
         val total = doc.blocks.size
         val p = db.getBook(bookId)?.progress ?: 0f
         val restoring = p > 0.001f && p < 0.999f
+        // 恢复用 ProgressModel 的逆映射，与 saveProgress 严格互逆，往返不再漂移
+        val restoreIndex = ProgressModel.indexForProgress(p, total)
         if (restoring && total > 0) {
-            ensureRenderedUpTo(((p * (total - 1)).toInt()).coerceIn(0, total - 1), PRELOAD_MAX_CHUNKS)
+            ensureRenderedUpTo(restoreIndex, PRELOAD_MAX_CHUNKS)
         }
 
         sv.post {
             if (!restoring) return@post
             val applyRestore = Runnable {
                 try {
-                    val range = (box.height - sv.height).coerceAtLeast(0)
-                    // 前缀未加载完时按已渲染占比换算，把比例限制在真实渲染出的高度内
-                    val loaded = if (total > 0) {
-                        (renderedUpTo.toFloat() / total.toFloat()).coerceIn(0.0001f, 1f)
-                    } else 1f
-                    val fixed = if (loaded >= 0.999f) p else (p / loaded).coerceIn(0f, 1f)
-                    sv.scrollTo(0, (range * fixed).toInt())
+                    // 直接按目标块的真实 top 定位，不再把比例套到截断高度上
+                    val target = box.getChildAt(restoreIndex)
+                    if (target != null) sv.scrollTo(0, target.top.coerceAtLeast(0))
                 } catch (e: Exception) {}
             }
             if (box.height > 0) {
@@ -877,12 +903,12 @@ class ReaderView(
             // 标题同样参与沉浸切换
             tv.setOnClickListener { toggleBars() }
         } else {
-            tv.text = b.text
+            tv.text = applyHighlightSpan(b.text, index)
             tv.textSize = styleSp
             tv.setTextColor(themeText())
             // 成熟阅读器共识：1.38 倍行距最舒适
-            tv.setLineSpacing(0f, 1.38f)
-            tv.setPadding(Glass.dp(20, d), Glass.dp(6, d), Glass.dp(20, d), Glass.dp(6, d))
+            tv.setLineSpacing(0f, lineSpacingFactor)
+            tv.setPadding(Glass.dp(marginDp, d), Glass.dp(6, d), Glass.dp(marginDp, d), Glass.dp(6, d))
             if (b.text.length > 4) {
                 // 长按菜单要写回块锚点，必须把块下标一并带进去（收藏金句需要可定位的来源）
                 tv.setOnLongClickListener { explainBlock(b.text, index); true }
@@ -893,23 +919,81 @@ class ReaderView(
         return tv
     }
 
+    /**
+     * 给已划重点的块加背景色。
+     *
+     * 颜色只存 id（amber/green/blue/rose），实际色值按当前阅读主题解析：
+     * 同一个 id 在浅色底和深色底上必须都保持正文可读，不能直接存死色值。
+     */
+    private fun applyHighlightSpan(text: String, index: Int): CharSequence {
+        val colorId = highlightColors[index] ?: return text
+        val color = highlightColorOf(colorId) ?: return text
+        return android.text.SpannableString(text).apply {
+            setSpan(
+                android.text.style.BackgroundColorSpan(color),
+                0, length,
+                android.text.Spanned.SPAN_EXCLUSIVE_EXCLUSIVE
+            )
+        }
+    }
+
+    /** 高亮底色的解析：深色主题用低透明高饱和，浅色主题用低饱和浅底。 */
+    private fun highlightColorOf(colorId: String): Int? {
+        val dark = resolveTheme() == ReaderTheme.DARK
+        return when (colorId) {
+            HIGHLIGHT_AMBER -> if (dark) Color.argb(90, 255, 196, 84) else Color.parseColor("#FBEFC9")
+            HIGHLIGHT_GREEN -> if (dark) Color.argb(90, 126, 224, 168) else Color.parseColor("#D8F1DE")
+            HIGHLIGHT_BLUE -> if (dark) Color.argb(90, 140, 178, 255) else Color.parseColor("#DBE6FF")
+            HIGHLIGHT_ROSE -> if (dark) Color.argb(90, 255, 154, 180) else Color.parseColor("#FBDDE6")
+            else -> null
+        }
+    }
+
+    /** 重新给所有已渲染的块上色（划线/取消后即时生效，不重建界面）。 */
+    private fun refreshHighlights() {
+        val box = boxRef ?: return
+        val blocks = docBlocks ?: return
+        for (i in 0 until min(renderedUpTo, box.childCount)) {
+            val view = box.getChildAt(i) as? TextView ?: continue
+            if (view.tag == "head") continue
+            val block = blocks.getOrNull(i) ?: continue
+            view.text = applyHighlightSpan(block.text, i)
+        }
+    }
+
     /** 就地调整字号：不重建界面、不丢滚动位置 */
     private fun applyFontSp(newSp: Float) {
-        if (bookFormat == "pdf" || pdfRenderer != null) return
         val clamped = newSp.coerceIn(12f, 26f)
         if (clamped == styleSp) return
+        styleSp = clamped
+        db.setSetting("reader_font_sp", styleSp.toString())
+        applyTypography()
+    }
+
+    /**
+     * 就地应用排版参数（字号/行距/页边距），不重建界面、不丢滚动位置。
+     *
+     * 三者会同时改变块高，所以必须共用同一套「记住可见块 + 像素偏移」的还原逻辑，
+     * 否则改行距时用字号那套锚点会甩走几百行。
+     */
+    private fun applyTypography() {
+        if (bookFormat == "pdf" || pdfRenderer != null) return
         val box = boxRef ?: return
-        // 记住当前可见块及其在视口内的像素偏移：字号变化会重排，不重新锚定就会甩走几百行
+        val d = density(act)
         val anchorIdx = visibleBlockIndex()
         val anchorOffset = if (anchorIdx >= 0) {
             (box.getChildAt(anchorIdx)?.top ?: 0) - (sc?.scrollY ?: 0)
         } else 0
-        styleSp = clamped
-        db.setSetting("reader_font_sp", styleSp.toString())
         for (i in 0 until box.childCount) {
-            val v = box.getChildAt(i)
-            if (v is TextView && v.tag != "head") v.textSize = styleSp
-            if (v is TextView && v.tag == "head") v.textSize = styleSp + 4f
+            val v = box.getChildAt(i) as? TextView ?: continue
+            if (v.tag == "head") {
+                v.textSize = styleSp + 4f
+                v.setPadding(Glass.dp(marginDp, d), Glass.dp(26, d), Glass.dp(marginDp, d), Glass.dp(10, d))
+            } else {
+                v.textSize = styleSp
+                v.setLineSpacing(0f, lineSpacingFactor)
+                v.setPadding(Glass.dp(marginDp, d), Glass.dp(6, d), Glass.dp(marginDp, d), Glass.dp(6, d))
+            }
         }
         if (anchorIdx >= 0) {
             // 重排是一次 requestLayout，必须等布局完成后再按锚点还原滚动位置
@@ -952,8 +1036,13 @@ class ReaderView(
         }
     }
 
-    /** 阅读器专用主题面板，避免系统浅色对话框破坏夜间阅读。 */
-    private fun showThemePicker() {
+    /**
+     * 阅读设置面板：主题（含跟随系统）、行距、页边距、字号、亮度。
+     *
+     * 全部即时生效并写 settings 表。之前只有「主题」一个面板，行距写死 1.38、
+     * 边距写死 20dp、亮度独占一格——长时间阅读最常调的几项反而无处可调。
+     */
+    private fun showReaderSettings() {
         val d = density(act)
         val dialog = android.app.Dialog(act)
         val panel = LinearLayout(act).apply {
@@ -961,76 +1050,149 @@ class ReaderView(
             background = chromeSurface(radiusDp = 24, alpha = 246)
             setPadding(Glass.dp(18, d), Glass.dp(18, d), Glass.dp(18, d), Glass.dp(12, d))
         }
-        panel.addView(TextView(act).apply {
-            text = "阅读主题"
-            textSize = 19f
-            setTextColor(Color.parseColor("#F7F8FC"))
-            setTypeface(null, Typeface.BOLD)
-        }, LinearLayout.LayoutParams(-1, -2))
-        panel.addView(TextView(act).apply {
-            text = "背景与文字会一起切换"
-            textSize = 12f
-            setTextColor(Color.parseColor("#AEB4C2"))
-            setPadding(0, Glass.dp(3, d), 0, Glass.dp(12, d))
-        }, LinearLayout.LayoutParams(-1, -2))
-
-        ReaderTheme.entries.forEach { option ->
-            val selected = option == readerTheme
+        fun label(text: String, top: Int = 14) {
+            panel.addView(TextView(act).apply {
+                this.text = text
+                textSize = 12f
+                setTextColor(Color.parseColor("#AEB4C2"))
+                setPadding(0, Glass.dp(top, d), 0, Glass.dp(6, d))
+            }, LinearLayout.LayoutParams(-1, -2))
+        }
+        /** 一行可选项：标题 + 副标题 + 选中勾。 */
+        fun optionRow(title: String, subtitle: String, selected: Boolean, onClick: () -> Unit) {
             val row = LinearLayout(act).apply {
                 orientation = LinearLayout.HORIZONTAL
                 gravity = Gravity.CENTER_VERTICAL
                 background = chromeChip(selected)
                 foreground = Glass.pressFx()
-                contentDescription = "${option.title}主题：${option.subtitle}"
+                contentDescription = "$title：$subtitle"
                 setPadding(Glass.dp(12, d), Glass.dp(8, d), Glass.dp(12, d), Glass.dp(8, d))
-                setOnClickListener {
-                    applyReaderTheme(option)
-                    dialog.dismiss()
-                }
+                setOnClickListener { onClick() }
             }
-            row.addView(View(act).apply {
-                background = android.graphics.drawable.GradientDrawable().apply {
-                    shape = android.graphics.drawable.GradientDrawable.OVAL
-                    setColor(themeBackground(option))
-                    setStroke(Glass.dp(1, d), Color.argb(100, 255, 255, 255))
-                }
-            }, LinearLayout.LayoutParams(Glass.dp(30, d), Glass.dp(30, d)).also {
-                it.marginEnd = Glass.dp(12, d)
-            })
-            val copy = LinearLayout(act).apply {
+            row.addView(LinearLayout(act).apply {
                 orientation = LinearLayout.VERTICAL
                 addView(TextView(act).apply {
-                    text = option.title
+                    text = title
                     textSize = 14f
                     setTextColor(Color.parseColor("#F7F8FC"))
                     setTypeface(null, if (selected) Typeface.BOLD else Typeface.NORMAL)
                 })
                 addView(TextView(act).apply {
-                    text = option.subtitle
+                    text = subtitle
                     textSize = 10.5f
                     setTextColor(Color.parseColor("#AEB4C2"))
                 })
-            }
-            row.addView(copy, LinearLayout.LayoutParams(0, -2, 1f))
+            }, LinearLayout.LayoutParams(0, -2, 1f))
             row.addView(TextView(act).apply {
                 text = if (selected) "✓" else ""
                 textSize = 18f
                 gravity = Gravity.CENTER
-                setTextColor(Color.parseColor("#B7C0FF"))
+                setTextColor(Accent.chromeAccentText)
             }, LinearLayout.LayoutParams(Glass.dp(30, d), Glass.dp(30, d)))
-            panel.addView(row, LinearLayout.LayoutParams(-1, Glass.dp(58, d)).also {
-                it.bottomMargin = Glass.dp(7, d)
+            panel.addView(row, LinearLayout.LayoutParams(-1, Glass.dp(56, d)).also {
+                it.bottomMargin = Glass.dp(6, d)
             })
         }
+
         panel.addView(TextView(act).apply {
-            text = "取消"
+            text = "阅读设置"
+            textSize = 19f
+            setTextColor(Color.parseColor("#F7F8FC"))
+            setTypeface(null, Typeface.BOLD)
+        }, LinearLayout.LayoutParams(-1, -2))
+        panel.addView(TextView(act).apply {
+            text = "改动立即生效，重开这本书仍会保持"
+            textSize = 12f
+            setTextColor(Color.parseColor("#AEB4C2"))
+            setPadding(0, Glass.dp(3, d), 0, Glass.dp(4, d))
+        }, LinearLayout.LayoutParams(-1, -2))
+
+        label("主题", top = 10)
+        ReaderTheme.entries.forEach { option ->
+            optionRow(option.title, option.subtitle, option == readerTheme) {
+                applyReaderTheme(option)
+                dialog.dismiss()
+            }
+        }
+
+        label("行距")
+        val spacingOptions = listOf(1.2f to "紧凑", 1.38f to "舒适", 1.6f to "宽松")
+        optionRow("行距", spacingOptions.joinToString(" / ") { it.second } + "（当前 ${"%.2f".format(lineSpacingFactor)}）", false) {
+            val next = spacingOptions[(spacingOptions.indexOfFirst { it.first == lineSpacingFactor }.let { if (it < 0) 1 else it } + 1) % spacingOptions.size]
+            lineSpacingFactor = next.first
+            db.setSetting("reader_line_spacing", lineSpacingFactor.toString())
+            applyTypography()
+            dialog.dismiss()
+            toast("行距：${next.second}")
+        }
+
+        label("页边距")
+        val marginOptions = listOf(12 to "窄", 20 to "中", 28 to "宽")
+        optionRow("页边距", marginOptions.joinToString(" / ") { it.second } + "（当前 ${marginDp}dp）", false) {
+            val current = marginOptions.indexOfFirst { it.first == marginDp }.let { if (it < 0) 1 else it }
+            val next = marginOptions[(current + 1) % marginOptions.size]
+            marginDp = next.first
+            db.setSetting("reader_margin_dp", marginDp.toString())
+            applyTypography()
+            dialog.dismiss()
+            toast("页边距：${next.second}")
+        }
+
+        label("字号")
+        val fontRow = LinearLayout(act).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+        }
+        fun fontButton(text: String, onClick: () -> Unit): TextView = TextView(act).apply {
+            this.text = text
+            textSize = 15f
+            gravity = Gravity.CENTER
+            setTextColor(Color.parseColor("#F7F8FC"))
+            background = chromeChip(false)
+            foreground = Glass.pressFx()
+            contentDescription = text
+            layoutParams = LinearLayout.LayoutParams(0, Glass.dp(46, d), 1f).also {
+                it.marginStart = Glass.dp(3, d)
+                it.marginEnd = Glass.dp(3, d)
+            }
+            setOnClickListener {
+                onClick()
+                this@apply.text = text
+            }
+        }
+        val minus = fontButton("A−") { applyFontSp(styleSp - 1f) }
+        val current = TextView(act).apply {
+            text = "字号 ${styleSp.toInt()}"
             textSize = 13f
             gravity = Gravity.CENTER
-            setTextColor(Color.parseColor("#B8BECC"))
+            setTextColor(Color.parseColor("#F7F8FC"))
+        }
+        val plus = fontButton("A+") {
+            applyFontSp(styleSp + 1f)
+            current.text = "字号 ${styleSp.toInt()}"
+        }
+        fontRow.addView(minus)
+        fontRow.addView(current, LinearLayout.LayoutParams(0, -2, 1.4f))
+        fontRow.addView(plus)
+        panel.addView(fontRow, LinearLayout.LayoutParams(-1, -2))
+
+        label("亮度")
+        optionRow("阅读亮度", "单独调节阅读器亮度，不改系统亮度", false) {
+            dialog.dismiss()
+            brightnessDialog()
+        }
+
+        panel.addView(TextView(act).apply {
+            text = "关闭"
+            textSize = 13f
+            gravity = Gravity.CENTER
+            setTextColor(Accent.chromeTextTertiary)
             background = chromeChip(selected = false)
             foreground = Glass.pressFx()
             setOnClickListener { dialog.dismiss() }
-        }, LinearLayout.LayoutParams(-1, Glass.dp(42, d)))
+        }, LinearLayout.LayoutParams(-1, Glass.dp(42, d)).also {
+            it.topMargin = Glass.dp(12, d)
+        })
 
         dialog.setContentView(panel)
         dialog.setCanceledOnTouchOutside(true)
@@ -1482,26 +1644,318 @@ class ReaderView(
         session?.close()
     }
 
+    // ---------- 书签与重点（本地，不联网） ----------
+
+    /**
+     * 当前位置的锚点。
+     * PDF 用页号（PAGE:n，1 基），其余（含图片集）用精确块下标（BLOCK:n，0 基）——
+     * 图片集的每个块都是标题，走「非标题块计数」的 PARAGRAPH 锚点会永远算不出编号。
+     */
+    private fun currentAnchor(): String {
+        if (bookFormat == "pdf" || pdfRenderer != null) return "PAGE:${currentPdfPageIndex() + 1}"
+        val index = currentBlockIndex()
+        if (index < 0) return ""
+        return "BLOCK:$index"
+    }
+
+    /** 人类可读的位置标签，用于书签列表。 */
+    private fun currentPositionLabel(): String {
+        if (bookFormat == "pdf" || pdfRenderer != null) {
+            val total = pdfRenderer?.pageCount ?: 0
+            return "第 ${currentPdfPageIndex() + 1}${if (total > 0) " / $total" else ""} 页"
+        }
+        val index = currentBlockIndex().coerceAtLeast(0)
+        val total = docBlocks?.size ?: 0
+        val chapter = tocHeads.lastOrNull { it.first <= index }?.second
+        val where = if (chapter.isNullOrBlank()) "第 ${index + 1} 段" else "$chapter · 第 ${index + 1} 段"
+        return if (total > 0) "$where（共 $total 段）" else where
+    }
+
+    /** 该位置的首行摘录，便于在列表里确认是不是想找的那一处。 */
+    private fun currentExcerpt(): String {
+        val blocks = docBlocks ?: return ""
+        val index = currentBlockIndex()
+        return blocks.getOrNull(index)?.text?.trim()?.take(60).orEmpty()
+    }
+
+    private fun refreshBookmarkCell() {
+        val cell = bookmarkCell ?: return
+        val anchor = currentAnchor()
+        lastBookmarkAnchor = anchor
+        val marked = anchor.isNotBlank() && anchor in bookmarkAnchors
+        cell.contentDescription = if (marked) "取消当前位置的书签；长按查看全部书签" else "在当前位置添加书签；长按查看全部书签"
+        renderToolCell(cell, icon = "book", label = if (marked) "已加签" else "书签", accent = marked)
+    }
+
+    /** 只在锚点真的变了才重绘书签格，避免滚动时反复重建子视图。 */
+    private fun syncBookmarkCell() {
+        if (currentAnchor() != lastBookmarkAnchor) refreshBookmarkCell()
+    }
+
+    /** 启动时把已有书签读进内存（渲染/滚动期间不再访问数据库）。 */
+    private fun loadBookmarks() {
+        bookmarkAnchors.clear()
+        runCatching { db.listBookmarks(bookId).forEach { bookmarkAnchors += it.anchor } }
+    }
+
+    /** 点击：在当前位置添加书签；已有则取消。 */
+    private fun toggleBookmark() {
+        val anchor = currentAnchor()
+        if (anchor.isBlank()) {
+            toast("当前位置暂时无法记录，请先滚动一下")
+            return
+        }
+        val existing = db.listBookmarks(bookId).firstOrNull { it.anchor == anchor }
+        if (existing != null) {
+            db.deleteBookmark(existing.id)
+            bookmarkAnchors -= anchor
+            toast("已取消书签")
+        } else {
+            val ok = db.addBookmark(bookId, anchor, currentPositionLabel(), currentExcerpt())
+            if (ok) bookmarkAnchors += anchor
+            toast(if (ok) "已添加书签 · ${currentPositionLabel()}" else "添加书签失败")
+        }
+        refreshBookmarkCell()
+    }
+
+    /** 长按：书签列表，支持跳转与删除。 */
+    private fun showBookmarkList() {
+        val d = density(act)
+        val marks = db.listBookmarks(bookId)
+        if (marks.isEmpty()) {
+            showResult("书签", "这本书还没有书签。\n点底部「书签」即可把当前位置记下来，长按这里可以回看全部书签。")
+            return
+        }
+        val column = LinearLayout(act).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(Glass.dp(6, d), Glass.dp(4, d), Glass.dp(6, d), Glass.dp(6, d))
+        }
+        val dialog = android.app.AlertDialog.Builder(act)
+            .setTitle("书签（${marks.size}）")
+            .setView(ScrollView(act).apply { addView(column, LayoutParams(-1, -2)) })
+            .setNegativeButton("关闭", null)
+            .create()
+        fun rebuild() {
+            column.removeAllViews()
+            db.listBookmarks(bookId).forEach { mark ->
+                val row = LinearLayout(act).apply {
+                    orientation = LinearLayout.HORIZONTAL
+                    gravity = Gravity.CENTER_VERTICAL
+                    foreground = Glass.pressFx()
+                    contentDescription = "跳到 ${mark.label}"
+                    setPadding(Glass.dp(12, d), Glass.dp(10, d), Glass.dp(6, d), Glass.dp(10, d))
+                    setOnClickListener {
+                        dialog.dismiss()
+                        jumpToCitation(mark.anchor.substringBefore(':').uppercase(), mark.anchor.substringAfter(':').toIntOrNull() ?: 0)
+                    }
+                }
+                row.addView(LinearLayout(act).apply {
+                    orientation = LinearLayout.VERTICAL
+                    addView(TextView(act).apply {
+                        text = mark.label.ifBlank { mark.anchor }
+                        textSize = 14f
+                        setTextColor(pal.textP)
+                        maxLines = 1
+                        ellipsize = android.text.TextUtils.TruncateAt.END
+                    })
+                    if (mark.excerpt.isNotBlank()) {
+                        addView(TextView(act).apply {
+                            text = mark.excerpt
+                            textSize = 11f
+                            setTextColor(pal.textT)
+                            maxLines = 1
+                            ellipsize = android.text.TextUtils.TruncateAt.END
+                        })
+                    }
+                }, LinearLayout.LayoutParams(0, -2, 1f))
+                row.addView(TextView(act).apply {
+                    text = "删除"
+                    textSize = 13f
+                    setTextColor(Accent.dangerText)
+                    setPadding(Glass.dp(10, d), Glass.dp(6, d), Glass.dp(10, d), Glass.dp(6, d))
+                    setOnClickListener {
+                        db.deleteBookmark(mark.id)
+                        bookmarkAnchors -= mark.anchor
+                        refreshBookmarkCell()
+                        rebuild()
+                    }
+                })
+                column.addView(row, LinearLayout.LayoutParams(-1, -2))
+            }
+        }
+        rebuild()
+        dialog.show()
+        Glass.styleDialog(dialog, d)
+    }
+
+    /** 给某一块划重点（颜色 id 存进笔记的 status 列，位置存 anchor 列）。 */
+    private fun addHighlight(blockIndex: Int, blockText: String, colorId: String) {
+        val anchor = "BLOCK:$blockIndex"
+        // 同一段只保留一种颜色：先删掉旧的重点记录，避免叠加出脏色
+        Thread {
+            db.listNoteDetails(bookId, HIGHLIGHT_KIND)
+                .filter { it.anchor == anchor }
+                .forEach { db.deleteNote(it.id) }
+            db.addNote(bookId, HIGHLIGHT_KIND, blockText.trim().take(2000), anchor = anchor, status = colorId)
+            act.runOnUiThread {
+                highlightColors[blockIndex] = colorId
+                refreshHighlights()
+                toast("已划重点")
+            }
+        }.apply { isDaemon = true }.start()
+    }
+
+    /** 取消某一段的重点。 */
+    private fun removeHighlight(blockIndex: Int) {
+        val anchor = "BLOCK:$blockIndex"
+        Thread {
+            db.listNoteDetails(bookId, HIGHLIGHT_KIND)
+                .filter { it.anchor == anchor }
+                .forEach { db.deleteNote(it.id) }
+            act.runOnUiThread {
+                highlightColors.remove(blockIndex)
+                refreshHighlights()
+                toast("已清除本段重点")
+            }
+        }.apply { isDaemon = true }.start()
+    }
+
+    /** 启动时把已保存的重点读进内存，渲染块时直接用。 */
+    private fun loadHighlights() {
+        highlightColors.clear()
+        runCatching {
+            db.listNoteDetails(bookId, HIGHLIGHT_KIND).forEach { note ->
+                val index = note.anchor.removePrefix("BLOCK:").toIntOrNull() ?: return@forEach
+                val color = note.status.ifBlank { HIGHLIGHT_AMBER }
+                highlightColors[index] = color
+            }
+        }
+    }
+
+    /** 颜色选择：4 色 + 清除。 */
+    private fun showHighlightPicker(blockIndex: Int, blockText: String) {
+        val d = density(act)
+        val labels = listOf(
+            HIGHLIGHT_AMBER to "琥珀（重点）",
+            HIGHLIGHT_GREEN to "绿色（概念）",
+            HIGHLIGHT_BLUE to "蓝色（疑问）",
+            HIGHLIGHT_ROSE to "玫红（待办）"
+        )
+        val options = labels.map { it.second }.toTypedArray()
+        android.app.AlertDialog.Builder(act)
+            .setTitle("划重点")
+            .setItems(options) { _, which -> addHighlight(blockIndex, blockText, labels[which].first) }
+            .setNeutralButton(if (highlightColors.containsKey(blockIndex)) "清除本段重点" else "取消") { _, _ ->
+                if (highlightColors.containsKey(blockIndex)) removeHighlight(blockIndex)
+            }
+            .show().also { Glass.styleDialog(it, d) }
+    }
+
+    /** 「我划的重点」列表：跳转与删除。 */
+    private fun showHighlightList() {
+        val d = density(act)
+        val notes = db.listNoteDetails(bookId, HIGHLIGHT_KIND)
+        if (notes.isEmpty()) {
+            showResult("我划的重点", "还没有划重点。\n长按正文段落 → 「划重点」，选一个颜色即可。")
+            return
+        }
+        val column = LinearLayout(act).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(Glass.dp(6, d), Glass.dp(4, d), Glass.dp(6, d), Glass.dp(6, d))
+        }
+        val dialog = android.app.AlertDialog.Builder(act)
+            .setTitle("我划的重点（${notes.size}）")
+            .setView(ScrollView(act).apply { addView(column, LayoutParams(-1, -2)) })
+            .setNegativeButton("关闭", null)
+            .create()
+        fun rebuild() {
+            column.removeAllViews()
+            db.listNoteDetails(bookId, HIGHLIGHT_KIND).forEach { note ->
+                val index = note.anchor.removePrefix("BLOCK:").toIntOrNull()
+                val row = LinearLayout(act).apply {
+                    orientation = LinearLayout.HORIZONTAL
+                    gravity = Gravity.CENTER_VERTICAL
+                    foreground = Glass.pressFx()
+                    setPadding(Glass.dp(12, d), Glass.dp(10, d), Glass.dp(6, d), Glass.dp(10, d))
+                    setOnClickListener {
+                        if (index == null) return@setOnClickListener
+                        dialog.dismiss()
+                        jumpToCitation("BLOCK", index)
+                    }
+                }
+                row.addView(View(act).apply {
+                    background = android.graphics.drawable.GradientDrawable().apply {
+                        shape = android.graphics.drawable.GradientDrawable.OVAL
+                        setColor(highlightColorOf(note.status.ifBlank { HIGHLIGHT_AMBER }) ?: Color.GRAY)
+                    }
+                }, LinearLayout.LayoutParams(Glass.dp(12, d), Glass.dp(12, d)).also {
+                    it.marginEnd = Glass.dp(10, d)
+                })
+                row.addView(TextView(act).apply {
+                    text = note.content
+                    textSize = 13f
+                    setTextColor(pal.textP)
+                    maxLines = 2
+                    ellipsize = android.text.TextUtils.TruncateAt.END
+                }, LinearLayout.LayoutParams(0, -2, 1f))
+                row.addView(TextView(act).apply {
+                    text = "删除"
+                    textSize = 13f
+                    setTextColor(Accent.dangerText)
+                    setPadding(Glass.dp(10, d), Glass.dp(6, d), Glass.dp(10, d), Glass.dp(6, d))
+                    setOnClickListener {
+                        db.deleteNote(note.id)
+                        if (index != null) highlightColors.remove(index)
+                        refreshHighlights()
+                        rebuild()
+                    }
+                })
+                column.addView(row, LinearLayout.LayoutParams(-1, -2))
+            }
+        }
+        rebuild()
+        dialog.show()
+        Glass.styleDialog(dialog, d)
+    }
+
     // ---------- AI 功能 ----------
 
+    /**
+     * AI 助手入口：分组 + 图标 + 一行说明的底部弹层。
+     *
+     * 原先是一屏 7 行纯文字（💬 和书聊聊 / ✨ 生成理解包 / 前段摘要 / 节选问答 /
+     * 出题自测 / 前情提要 / 人物速查），既看不出哪些会联网、哪些要花钱，也看不出
+     * 「前段摘要」和「节选问答」的区别。现在按「本地 / 理解与梳理 / 互动」分组，
+     * 每个联网动作都标明会发往哪个服务商。
+     * 「人物速查」已合并进「前情提要」的提示词（非虚构文档改列核心概念），不再单独占一行。
+     */
     private fun showAiMenu() {
-        // 标签必须说实话：这两个功能只读前若干页/前 24k 字符，不能叫「全文」
-        val options = arrayOf("💬 和书聊聊", "✨ 生成理解包", "前段摘要", "节选问答", "出题自测", "前情提要", "人物速查")
-        android.app.AlertDialog.Builder(act)
-            .setTitle("AI 助手")
-            .setItems(options) { _, which ->
-                when (which) {
-                    0 -> openChat()
-                    1 -> studyPackAction()
-                    2 -> aiSummary()
-                    3 -> askAction()
-                    4 -> quizAction()
-                    5 -> recapAction()
-                    6 -> castAction()
-                }
-            }
-            .setNegativeButton("取消", null)
-            .show().also { Glass.styleDialog(it, density(act)) }
+        val host = providerHost()
+        val sheet = BottomSheet(act, "AI 助手")
+        sheet.section("本地 · 不联网", "这些动作只在本机完成，不发送任何内容")
+        sheet.item("search", "书内搜索", "在当前文档里查找词句") { searchInBook() }
+        if (docBlocks?.isNotEmpty() == true) {
+            sheet.item("list", "目录", "跳到章节或页码") { listToc() }
+        }
+        val marked = currentAnchor().let { it.isNotBlank() && db.hasBookmark(bookId, it) }
+        sheet.item(
+            "book",
+            if (marked) "取消当前位置书签" else "收藏当前位置",
+            if (marked) "移除这一处的书签" else "把当前位置记进书签，长按底栏书签可回看"
+        ) { toggleBookmark() }
+        sheet.item("note", "我划的重点", "回看并跳转到划过的段落") { showHighlightList() }
+        sheet.item("sliders", "阅读设置", "主题 / 行距 / 页边距 / 字号 / 亮度") { showReaderSettings() }
+
+        sheet.section("理解与梳理", "会把所选范围发往 $host，费用由服务商收取")
+        sheet.item("book", "生成理解包", "摘要 + 大纲 + 概念 + 卡片 + 自测，最全面") { studyPackAction() }
+        sheet.item("note", "快速摘要", "只读开头部分，比理解包快且省；不含大纲与自测") { aiSummary() }
+        sheet.item("chevron", "前情提要", "把当前章之前的内容浓缩成一段回顾，含人物与概念") { recapAction() }
+
+        sheet.section("互动", "会把所选范围发往 $host，费用由服务商收取")
+        sheet.item("search", "和书聊聊", "带着当前章上下文自由提问") { openChat() }
+        sheet.item("search", "节选问答", "就一个具体问题在选定范围内找答案") { askAction() }
+        sheet.item("check", "出题自测", "生成 5 道题，作答后由 AI 批改评分") { quizAction() }
+        sheet.show()
     }
 
     fun openTableOfContents() = listToc()
@@ -1546,11 +2000,12 @@ class ReaderView(
                     .show().also { Glass.styleDialog(it, density(act)) }
             }
             else -> {
+                if (!requireExtractableText("生成理解包")) return
                 android.app.AlertDialog.Builder(act)
                     .setTitle("生成理解包")
                     .setMessage(
                         "目标服务：$provider\n范围：全文结构化抽样，最多 ${DocumentAiService.MAX_CONTEXT_CHARS / 1000}k 字符" +
-                            "（本文 ${docFullText.length / 1000}k 字符）。文档原文件不会上传。"
+                            "（本文 ${formatChars(docFullText.length)} 字符）。文档原文件不会上传。"
                     )
                     .setPositiveButton("继续") { _, _ -> generateTextStudyPack(item, file, cfg) }
                     .setNegativeButton("取消", null)
@@ -1566,7 +2021,7 @@ class ReaderView(
         // 命中缓存时不重复落笔记：只有真正生成过才在 onDone 里写
         var generated = false
         val scope = "范围：全文结构化抽样，最多 ${DocumentAiService.MAX_CONTEXT_CHARS / 1000}k 字符" +
-            if (docFullText.isNotBlank()) "（本文 ${docFullText.length / 1000}k 字符）" else ""
+            if (docFullText.isNotBlank()) "（本文 ${formatChars(docFullText.length)} 字符）" else ""
         runAiStream(
             kind = null,
             title = "文档理解包",
@@ -1721,6 +2176,7 @@ class ReaderView(
     /** 前情提要：当前章之前的内容浓缩，追长篇防忘剧情 */
     private fun recapAction(cfgOverride: AiClient.Config? = null) {
         val cfg = cfgOverride ?: (aiReady() ?: return)
+        if (!requireExtractableText("前情提要")) return
         val blocks = docBlocks
         if (blocks == null || tocHeads.isEmpty()) {
             showResult("提示", "本书没有章节结构，无法定位「当前章之前」的内容。\n可以改用「节选问答」。")
@@ -1745,9 +2201,9 @@ class ReaderView(
         }.getOrNull()
         val material = context?.text?.takeIf { it.isNotBlank() } ?: fallbackRecapExcerpt(blocks, start)
         val scope = if (context != null) {
-            "范围：前文节选（已发送 ${context.includedSegments}/${context.totalSegments} 段，约 ${material.length / 1000}k 字符）"
+            "范围：前文节选（已发送 ${context.includedSegments}/${context.totalSegments} 段，约 ${formatChars(material.length)} 字符）"
         } else {
-            "范围：前文节选（章节标题 + 各章末段，约 ${material.length / 1000}k 字符）"
+            "范围：前文节选（章节标题 + 各章末段，约 ${formatChars(material.length)} 字符）"
         }
         runAiStream(
             kind = "recap",
@@ -1758,7 +2214,8 @@ class ReaderView(
         ) { onDelta, onReason, onRestart ->
             AiClient.chat(cfg, SYS_PROMPT,
                 "读者正在读长篇/资料，下面是当前章节之前的带锚点节选（[CHAPTER:n] 是章节，[PARAGRAPH:n] 是段落）。" +
-                    "请用约 250 字梳理「到目前为止发生了什么」：关键事件、出场人物及其动机、留下的悬念。只输出提要正文。" +
+                    "请用约 250 字梳理「到目前为止发生了什么」：关键事件、出场人物及其动机、留下的悬念；" +
+                    "若为非虚构文档，则改为列出已出现的关键概念/术语及其含义。只输出提要正文。" +
                     "\n\n【前文开始】\n$material\n【前文结束】",
                 onDelta, onReason = onReason, onRestart = onRestart)
         }
@@ -1788,6 +2245,7 @@ class ReaderView(
     /** 人物速查：从当前章提取出场人物与身份 */
     private fun castAction(cfgOverride: AiClient.Config? = null) {
         val cfg = cfgOverride ?: (aiReady() ?: return)
+        if (!requireExtractableText("人物速查")) return
         val chapter = currentChapterText()
         if (chapter.isBlank()) { showResult("提示", "当前章节没有可分析文本"); return }
         val sent = chapter.take(12000)
@@ -1795,7 +2253,7 @@ class ReaderView(
             kind = "cast",
             title = "人物速查",
             cfg = cfg,
-            scopeLine = "范围：当前章节前 ${sent.length / 1000}k 字符（共 ${chapter.length / 1000}k）",
+            scopeLine = "范围：当前章节前 ${formatChars(sent.length)} 字符（共 ${formatChars(chapter.length)}）",
             onRetry = { alt -> castAction(alt) }
         ) { onDelta, onReason, onRestart ->
             AiClient.chat(cfg, SYS_PROMPT,
@@ -1922,15 +2380,31 @@ class ReaderView(
         }
         val sectionRow = horizontalChipRow().apply { visibility = View.GONE }
         val actionRow = horizontalChipRow()
+        // 次要动作单独一行：原先 6 个 chip 挤一行，窄屏上「停止」被挤出屏幕
+        val actionRow2 = horizontalChipRow().apply { visibility = View.GONE }
         val footerTv = TextView(act).apply {
             textSize = 11f
             setTextColor(pal.textT)
             setPadding(Glass.dp(22, d), 0, Glass.dp(22, d), Glass.dp(8, d))
         }
+        // 编辑态：结果以前只能看/复制，想删掉一段废话只能整段重生成
+        val editor = EditText(act).apply {
+            textSize = 15f
+            setTextColor(Color.parseColor("#222222"))
+            setLineSpacing(Glass.dp(4, d).toFloat(), 1f)
+            setPadding(Glass.dp(22, d), Glass.dp(12, d), Glass.dp(22, d), Glass.dp(20, d))
+            setBackgroundColor(Color.TRANSPARENT)
+            gravity = Gravity.TOP
+            inputType = android.text.InputType.TYPE_CLASS_TEXT or
+                android.text.InputType.TYPE_TEXT_FLAG_MULTI_LINE
+            hint = "直接修改这段结果，保存后会同步更新笔记与 AI 成果"
+            visibility = View.GONE
+        }
         val box = LinearLayout(act).apply {
             orientation = LinearLayout.VERTICAL
             addView(thinkTv)
             addView(tv)
+            addView(editor)
         }
         val scroll = ScrollView(act)
         scroll.addView(box)
@@ -1941,6 +2415,7 @@ class ReaderView(
             addView(sectionRow)
             addView(scroll, LinearLayout.LayoutParams(-1, Glass.dp(320, d)))
             addView(actionRow)
+            addView(actionRow2)
             addView(footerTv)
         }
         val dlgBuilder = android.app.AlertDialog.Builder(act)
@@ -1962,14 +2437,64 @@ class ReaderView(
         val lastUi = longArrayOf(0L)
         val replyRef = arrayOf("")
         val sectionsRef = arrayOf<List<Pair<String, Int>>>(emptyList())
+        val editingRef = booleanArrayOf(false)
+        // Kotlin 局部函数必须先声明后使用：编辑动作在 showActions 之前定义，用这个槽位回调
+        val showActionsSlot = arrayOfNulls<(Boolean, Boolean) -> Unit>(1)
 
         fun renderBody(text: String) {
+            // 编辑中不要被迟到的流式回调覆盖，否则用户改到一半的文字会被冲掉
+            if (editingRef[0]) return
             val md = renderAiMarkdown(text)
             applyCitationSpans(md.text)
             sectionsRef[0] = md.sections
             tv.text = md.text
             tv.movementMethod = LinkMovementMethod.getInstance()
             tv.highlightColor = Color.TRANSPARENT
+        }
+
+        fun saveEdit() {
+            val edited = editor.text.toString().trim()
+            if (edited.isBlank()) {
+                toast("内容不能为空")
+                return
+            }
+            val original = replyRef[0]
+            val noteKind = kind ?: if (onKeep != null) DocumentAiService.KIND_STUDY_PACK else "note"
+            replyRef[0] = edited
+            editingRef[0] = false
+            renderBody(edited)
+            editor.visibility = View.GONE
+            tv.visibility = View.VISIBLE
+            // 写库放到后台线程：主线程 Room 写会卡住同一帧
+            Thread {
+                runCatching { db.applyEditedContent(bookId, noteKind, original, edited) }
+                act.runOnUiThread {
+                    toast("已保存修改")
+                    showActionsSlot[0]?.invoke(false, false)
+                    footerTv.text = "模型：${modelName.ifBlank { "未配置" }} · 已手动编辑"
+                }
+            }.apply { isDaemon = true }.start()
+        }
+
+        /** 进入编辑态：正文换成可编辑框，动作行换成保存/取消。 */
+        fun startEditing() {
+            editingRef[0] = true
+            editor.setText(replyRef[0])
+            editor.visibility = View.VISIBLE
+            tv.visibility = View.GONE
+            sectionRow.visibility = View.GONE
+            footerTv.text = "手动编辑中 · 保存后会标记为「已手动编辑」"
+            actionRow2.visibility = View.GONE
+            fillChipRow(actionRow, listOf(
+                aiChip("保存修改") { saveEdit() },
+                aiChip("取消编辑") {
+                    editingRef[0] = false
+                    editor.visibility = View.GONE
+                    tv.visibility = View.VISIBLE
+                    showActionsSlot[0]?.invoke(false, false)
+                    footerTv.text = "模型：${modelName.ifBlank { "未配置" }} · 完成"
+                }
+            ))
         }
 
         fun refreshSectionChips() {
@@ -2012,25 +2537,38 @@ class ReaderView(
                 .show().also { Glass.styleDialog(it, density(act)) }
         }
 
+        /**
+         * 动作分两行：第一行是「改变本次生成」的主操作（停止/重新生成/重试），
+         * 第二行是对已有正文的处理（复制/分享/编辑/存为笔记/仍要保存/关闭）。
+         * 以前 6 个 chip 挤在一行，窄屏上「停止」会被挤出屏幕且无法察觉。
+         */
         fun showActions(streaming: Boolean, keepable: Boolean) {
-            val chips = mutableListOf<TextView>()
+            val primary = mutableListOf<TextView>()
+            val secondary = mutableListOf<TextView>()
             if (streaming) {
-                chips += aiChip("停止") {
+                primary += aiChip("停止") {
                     task.cancelled.set(true)
                     task.token.cancel()
                 }
             } else {
-                chips += aiChip("复制") { copyAiText(title, replyRef[0]) }
-                chips += aiChip("分享") { shareAiText(title, replyRef[0]) }
+                if (keepable) {
+                    primary += aiChip("重试") { retry(null) }
+                } else {
+                    primary += aiChip("重新生成") { retry(null) }
+                }
+                if (onRetry != null && cfg != null) primary += aiChip("换模型重试") { pickProfileForRetry() }
+
+                if (replyRef[0].isNotBlank()) secondary += aiChip("复制") { copyAiText(title, replyRef[0]) }
+                if (replyRef[0].isNotBlank()) secondary += aiChip("分享") { shareAiText(title, replyRef[0]) }
+                if (replyRef[0].isNotBlank()) secondary += aiChip("编辑") { startEditing() }
                 if (kind == null && replyRef[0].isNotBlank()) {
-                    chips += aiChip("存为笔记") {
+                    secondary += aiChip("存为笔记") {
                         saveAiNote("note", replyRef[0], anchor, "")
                         toast("已存为笔记")
                     }
                 }
                 if (keepable) {
-                    chips += aiChip("重试") { retry(null) }
-                    chips += aiChip("仍要保存") {
+                    secondary += aiChip("仍要保存") {
                         val content = replyRef[0]
                         // onKeep 存在时由调用方决定 kind（理解包要写 study_pack），避免同一内容落两条笔记
                         if (onKeep != null) {
@@ -2041,15 +2579,15 @@ class ReaderView(
                         toast("已按「未校验」保存")
                         dlg.dismiss()
                     }
-                } else {
-                    chips += aiChip("重新生成") { retry(null) }
                 }
-                if (onRetry != null && cfg != null) chips += aiChip("换模型重试") { pickProfileForRetry() }
-                chips += aiChip("关闭") { dlg.dismiss() }
+                secondary += aiChip("关闭") { dlg.dismiss() }
             }
-            fillChipRow(actionRow, chips)
+            fillChipRow(actionRow, primary)
+            actionRow2.visibility = if (secondary.isEmpty()) View.GONE else View.VISIBLE
+            if (secondary.isNotEmpty()) fillChipRow(actionRow2, secondary)
         }
 
+        showActionsSlot[0] = ::showActions
         showActions(streaming = true, keepable = false)
         footerTv.text = "模型：${modelName.ifBlank { "未配置" }} · 生成中"
 
@@ -2196,6 +2734,8 @@ class ReaderView(
                 if (block != null) jumpToBlock(block, flash = true)
                 else showResult("无法定位", "当前结果引用的${anchorTypeLabel(type)}超出文档范围，文档可能已更新。")
             }
+            // 书签/重点用的是精确块下标（0 基），不受标题计数影响，图片集也能定位
+            "BLOCK" -> jumpToBlock(oneBasedIndex, flash = true)
             else -> showResult("无法定位", "无法识别引用类型「$type」，请手动定位。")
         }
     }
@@ -2276,6 +2816,7 @@ class ReaderView(
         "SLIDE" -> "幻灯片"
         "PARAGRAPH" -> "段落"
         "PAGE" -> "页面"
+        "BLOCK" -> "段落"
         else -> "位置"
     }
 
@@ -2484,8 +3025,33 @@ class ReaderView(
         return "将发送第 ${indices.first() + 1}–${indices.last() + 1} 页图像（共 $pdfPageCount 页）"
     }
 
+    /**
+     * 范围提示。小文档用精确字数：整除到 k 会把几百字显示成「0k」，
+     * 读起来像「什么都没发出去」，比不显示更糟。
+     */
     private fun textScope(sentChars: Int): String =
-        "范围：全文抽样，已发送 ${sentChars / 1000}k/${docFullText.length / 1000}k 字符"
+        "范围：全文抽样，已发送 ${formatChars(sentChars)}/${formatChars(docFullText.length)} 字符"
+
+    /**
+     * 文本 AI 入口的统一前置检查。图片集/固定版式的 docFullText 只是一行占位摘要，
+     * 把它发给模型等于「渲染正常但 AI 什么都没发」，必须先拦住并引导到视觉通道。
+     */
+    private fun requireExtractableText(action: String): Boolean {
+        if (hasExtractableText(docFullText) && docBlocks?.isEmpty() != true) return true
+        val visionAvailable = isImageFormat(bookFormat) || isImageArchive(bookFormat) ||
+            bookFormat == "pdf" || pdfRenderer != null
+        showResult(
+            "这份文档没有可提取的文字",
+            "它按页（图片）渲染，阅读正常，但文本通道没有内容可发送。\n" +
+                if (visionAvailable) {
+                    "请改用「理解包 / 前段摘要」的图片通道：会把你选择的页面图像发给视觉模型。" +
+                        "（当前动作：$action）"
+                } else {
+                    "需要先在设置里配置支持图片输入的视觉模型，才能分析这类文档。（当前动作：$action）"
+                }
+        )
+        return false
+    }
 
     /** 用另一个 profile 构造一次性 Config（只在本次重试生效，不改变当前激活配置） */
     private fun configForProfile(profile: SavedAiProfile): AiClient.Config {
@@ -2573,6 +3139,7 @@ class ReaderView(
                 }
             }
         } else {
+            if (!requireExtractableText("前段摘要")) return
             val text = docFullText
             if (text.isBlank()) { showResult("提示", "本文档没有可提取文本"); return }
             val sent = text.take(24000)
@@ -2634,6 +3201,7 @@ class ReaderView(
                         }
                     }
                 } else {
+                    if (!requireExtractableText("节选问答")) return@setPositiveButton
                     val text = docFullText
                     if (text.isBlank()) {
                         showResult("提示", "本文档没有可提取文本")
@@ -2659,6 +3227,7 @@ class ReaderView(
 
     private fun quizAction(cfgOverride: AiClient.Config? = null) {
         val cfg = cfgOverride ?: (aiReady() ?: return)
+        if (bookFormat != "pdf" && !requireExtractableText("出题自测")) return
         val pdfIndices = if (bookFormat == "pdf") (0 until min(8, pdfRenderer?.pageCount ?: 0)).toList() else emptyList()
         val scope = if (bookFormat == "pdf") pdfScope(pdfIndices) else textScope(min(20000, docFullText.length))
         val build = { onDelta: (String) -> Unit, onReason: (String) -> Unit, onRestart: () -> Unit ->
@@ -2753,59 +3322,117 @@ class ReaderView(
     }
 
     /**
-     * 段落选择菜单：本地动作（收藏）与付费 AI 动作分成两组，
-     * 「收藏金句」不再埋在一堆 AI 调用里，也顺手带上了块锚点。
+     * 段落菜单：本地动作与付费 AI 动作分成两组。
+     *
+     * 两点关键行为：
+     * 1) [cfg] 未配置 AI 时**仍然要显示**本地分组——收藏/复制/划重点完全不联网，
+     *    以前第一行就 `aiReady() ?: return`，未配置 Key 时连收藏都点不出来。
+     * 2) 本地分组补上「划重点」「复制」「分享」，不再只有一条「收藏金句」。
      */
     private fun explainBlock(blockText: String, blockIndex: Int = -1, cfgOverride: AiClient.Config? = null) {
-        val cfg = cfgOverride ?: (aiReady() ?: return)
-        val d = density(act)
         val anchor = if (blockIndex >= 0) anchorForBlockIndex(blockIndex) else ""
-        val column = LinearLayout(act).apply {
-            orientation = LinearLayout.VERTICAL
-            setPadding(Glass.dp(6, d), Glass.dp(4, d), Glass.dp(6, d), Glass.dp(6, d))
+        val preview = blockText.trim().take(40) + if (blockText.trim().length > 40) "…" else ""
+        val sheet = BottomSheet(act, preview)
+        sheet.section("本地 · 不联网")
+        val quoteLabel = if (anchor.isNotBlank()) "收藏金句（$anchor）" else "收藏金句"
+        sheet.item("book", quoteLabel, "存进笔记，列表里能跳回这一段") { saveQuote(blockText, anchor) }
+        if (blockIndex >= 0) {
+            val marked = highlightColors.containsKey(blockIndex)
+            sheet.item("note", if (marked) "改颜色 / 清除重点" else "划重点", "选一个颜色标记这一段") {
+                showHighlightPicker(blockIndex, blockText)
+            }
         }
-        fun addTitle(text: String) {
-            column.addView(TextView(act).apply {
-                this.text = text
-                textSize = 11.5f
-                setTextColor(pal.textT)
-                setPadding(Glass.dp(14, d), Glass.dp(10, d), Glass.dp(14, d), Glass.dp(2, d))
-            }, LinearLayout.LayoutParams(-1, -2))
-        }
-        fun addRow(label: String, onClick: () -> Unit) {
-            column.addView(TextView(act).apply {
-                this.text = label
-                textSize = 15f
-                setTextColor(pal.textP)
-                setPadding(Glass.dp(14, d), Glass.dp(12, d), Glass.dp(14, d), Glass.dp(12, d))
-                isClickable = true
-                setOnClickListener { onClick() }
-            }, LinearLayout.LayoutParams(-1, -2))
-        }
-        addTitle("本地")
-        val quoteLabel = if (anchor.isNotBlank()) "⭐ 收藏这段（$anchor）" else "⭐ 收藏这段"
-        addRow(quoteLabel) { saveQuote(blockText, anchor) }
-        addTitle("AI 操作（会发送到 ${providerHost()}）")
-        addRow("💡 解释含义") {
+        sheet.item("note", "复制这段", "只写进剪贴板，不联网") { copyBlockText(blockText) }
+        sheet.item("search", "搜索这段", "用开头几个字在当前文档里找相关内容") { searchForBlockText(blockText) }
+        sheet.item("share", "分享这段", "生成本段图片分享出去") { shareBlockAsImage(blockText, anchor) }
+
+        sheet.section("AI 操作", "会把这一段发往 ${providerHost()}，费用由服务商收取")
+        sheet.item("bulb", "解释含义", "这段话是什么意思、为什么重要") {
+            val cfg = cfgOverride ?: (aiReady() ?: return@item)
             runBlockAi("explain", "段落解释", blockText, cfg,
                 "请解释下面这段话的含义（是什么意思、为什么重要），简洁作答：", anchor)
         }
-        addRow("🌍 翻译") { translateBlock(blockText, anchor, cfg) }
-        addRow("🗣 大白话讲解") {
+        sheet.item("search", "翻译", "翻译成中文 / English / 日本語") {
+            val cfg = cfgOverride ?: (aiReady() ?: return@item)
+            translateBlock(blockText, anchor, cfg)
+        }
+        sheet.item("bulb", "大白话讲解", "用中学生能懂的话讲一遍") {
+            val cfg = cfgOverride ?: (aiReady() ?: return@item)
             runBlockAi("explain", "大白话讲解", blockText, cfg,
                 "用大白话给中学生讲解下面这段话，可以打比方，通俗但不失准确：", anchor)
         }
-        addRow("✍️ 续写一段") {
+        sheet.item("chevron", "续写一段", "顺着文风自然续写 150–250 字") {
+            val cfg = cfgOverride ?: (aiReady() ?: return@item)
             runBlockAi("continue", "续写", blockText, cfg,
                 "顺着下面的文字风格与情节，自然续写一段（150-250字）：", anchor)
         }
-        val dlg = android.app.AlertDialog.Builder(act)
-            .setTitle("这段话…")
-            .setView(column)
-            .setNegativeButton("取消", null)
-            .create()
-        dlg.show()
-        Glass.styleDialog(dlg, d)
+        sheet.show()
+    }
+
+    /** 复制段落：纯本地动作，长按菜单里最常用的一条。 */
+    private fun copyBlockText(blockText: String) {
+        val text = blockText.trim()
+        if (text.isEmpty()) return
+        val clipboard = act.getSystemService(Context.CLIPBOARD_SERVICE) as android.content.ClipboardManager
+        clipboard.setPrimaryClip(android.content.ClipData.newPlainText("段落", text))
+        toast("已复制这一段")
+    }
+
+    /** 用段落开头作为搜索词，直接出命中计数。 */
+    private fun searchForBlockText(blockText: String) {
+        val query = blockText.trim().replace(Regex("\\s+"), " ").take(16)
+        if (query.isBlank()) return
+        searchInBook(query)
+    }
+
+    /** 把段落渲染成一张浅底图片分享：正文分享不该只依赖截图。 */
+    private fun shareBlockAsImage(blockText: String, anchor: String) {
+        val d = density(act)
+        val title = db.getBook(bookId)?.title.orEmpty()
+        val where = if (anchor.isNotBlank()) anchorTypeLabel(anchor.substringBefore(':')) + anchor.substringAfter(':') else ""
+        val card = LinearLayout(act).apply {
+            orientation = LinearLayout.VERTICAL
+            setBackgroundColor(Color.WHITE)
+            setPadding(Glass.dp(22, d), Glass.dp(20, d), Glass.dp(22, d), Glass.dp(20, d))
+        }
+        card.addView(TextView(act).apply {
+            text = blockText.trim().take(1200)
+            textSize = 16f
+            setTextColor(Color.parseColor("#20232A"))
+            setLineSpacing(0f, 1.35f)
+        }, LinearLayout.LayoutParams(Glass.dp(320, d), -2))
+        card.addView(TextView(act).apply {
+            text = "—— $title $where · 来自页枢".trim()
+            textSize = 11f
+            setTextColor(Color.parseColor("#8A8F9C"))
+            setPadding(0, Glass.dp(14, d), 0, 0)
+        })
+        card.measure(
+            android.view.View.MeasureSpec.makeMeasureSpec(Glass.dp(364, d), android.view.View.MeasureSpec.EXACTLY),
+            android.view.View.MeasureSpec.makeMeasureSpec(0, android.view.View.MeasureSpec.UNSPECIFIED)
+        )
+        card.layout(0, 0, card.measuredWidth, card.measuredHeight)
+        val bitmap = android.graphics.Bitmap.createBitmap(
+            card.measuredWidth.coerceAtLeast(1),
+            card.measuredHeight.coerceAtLeast(1),
+            android.graphics.Bitmap.Config.ARGB_8888
+        )
+        android.graphics.Canvas(bitmap).let { canvas ->
+            canvas.drawColor(Color.WHITE)
+            card.draw(canvas)
+        }
+        val dir = File(act.cacheDir, "share").apply { mkdirs() }
+        val file = File(dir, "quote_${System.currentTimeMillis()}.png")
+        runCatching {
+            file.outputStream().use { bitmap.compress(android.graphics.Bitmap.CompressFormat.PNG, 100, it) }
+            val uri = androidx.core.content.FileProvider.getUriForFile(act, "${act.packageName}.files", file)
+            val intent = android.content.Intent(android.content.Intent.ACTION_SEND).apply {
+                type = "image/png"
+                putExtra(android.content.Intent.EXTRA_STREAM, uri)
+                addFlags(android.content.Intent.FLAG_GRANT_READ_URI_PERMISSION)
+            }
+            act.startActivity(android.content.Intent.createChooser(intent, "分享这段"))
+        }.onFailure { showResult("无法分享", "生成分享图片失败：${it.message ?: it.javaClass.simpleName}") }
     }
 
     /** 段落级 AI 动作：统一带 kind（结果必须能落笔记）、范围说明与重试入口 */
@@ -2910,6 +3537,16 @@ class ReaderView(
         }
         dlg.show()
         Glass.styleDialog(dlg, density(act))
+    }
+
+    /** 用给定关键词直接搜索（段落菜单的「搜索这段」），省去再手打一遍。 */
+    private fun searchInBook(query: String) {
+        if (bookFormat == "pdf") {
+            showResult("提示", "PDF 为整页图片渲染，暂不支持文字搜索\n可改用 AI 问答定位内容")
+            return
+        }
+        val q = query.trim()
+        if (q.isNotEmpty()) doSearch(q)
     }
 
     private fun doSearch(q: String) {
@@ -3133,28 +3770,50 @@ class ReaderView(
         sv.scrollTo(0, (range * progress.coerceIn(0f, 1f)).toInt())
     }
 
+    /**
+     * 进度：统一走 [ProgressModel]，与进度条、顶栏百分比共用同一口径。
+     * 位置取「真实可见块/页的下标」，而不是已渲染前缀的滚动比例——
+     * 前缀比例在分块加载时会把「刚滚到已加载末尾」算成 100%。
+     */
     private fun saveProgress() {
         val sv = sc ?: return
         val child = sv.getChildAt(0) ?: return
-        val extent = sv.height
-        if (extent <= 0) return
-        val range = child.height
-        val offset = sv.scrollY
-        // 分块渲染的文档：child.height 只是「已渲染前缀」的高度。
-        // 直接按它算比例，会把「刚滚到已加载的末尾」当成 100%（>=0.99 即 done），
-        // 于是长书被标记读完、重开时既不预载也不恢复位置。
-        val total = docBlocks?.size ?: 0
+        if (sv.height <= 0) return
+        val (index, total) = progressPosition()
+        if (index < 0) return
         val fullyLoaded = pdfRenderer != null || total <= 0 || renderedUpTo >= total
-        val pr = if (range > extent) {
-            val raw = (offset.toFloat() / (range - extent).toFloat()).coerceIn(0f, 1f)
-            if (fullyLoaded) raw
-            // 未加载完时上限压到 0.98，保证 statusFor 不会把没读完的书判成 done
-            else (raw * (renderedUpTo.toFloat() / total.toFloat())).coerceIn(0f, 0.98f)
-        } else {
-            // 内容不足一屏：滚动不到底，只要整篇已渲染就按读完计，否则保留 0
-            if (fullyLoaded) 1f else 0f
-        }
+        val pr = ProgressModel.progressOf(
+            positionIndex = index,
+            totalCount = total,
+            fullyLoaded = fullyLoaded,
+            fitsOnScreen = child.height <= sv.height,
+            interacted = hasInteracted
+        )
         db.updateProgress(bookId, pr)
+    }
+
+    /** 当前位置下标与总下标数；PDF 用页，其余用块。返回 (-1, 0) 表示暂不可用。 */
+    private fun progressPosition(): Pair<Int, Int> {
+        if (pdfRenderer != null || bookFormat == "pdf") {
+            val total = pdfRenderer?.pageCount ?: pdfPageCount
+            if (total <= 0) return -1 to 0
+            return currentPdfPageIndex().coerceIn(0, total - 1) to total
+        }
+        val total = docBlocks?.size ?: 0
+        if (total <= 0) return -1 to 0
+        val index = currentBlockIndex()
+        if (index < 0) return -1 to 0
+        return index.coerceIn(0, total - 1) to total
+    }
+
+    /** 当前进度（0..1），进度条与顶栏百分比都用它。 */
+    private fun currentProgress(): Float {
+        val (index, total) = progressPosition()
+        if (index < 0) return 0f
+        val sv = sc
+        val fullyLoaded = pdfRenderer != null || total <= 0 || renderedUpTo >= total
+        val fits = sv != null && (sv.getChildAt(0)?.height ?: 0) <= sv.height
+        return ProgressModel.progressOf(index, total, fullyLoaded, fits, hasInteracted)
     }
 
     /** 音量键翻页：单手阅读（设置 reader_volume_flip=0 可关）；由 MainActivity 的按键分发调用 */
@@ -3187,6 +3846,9 @@ class ReaderView(
         volumeFlipCached = enabled
         return enabled
     }
+
+    /** 用户是否真的滚动过。短文不足一屏时用它避免「一打开就 100%」。 */
+    private var hasInteracted = false
 
     private var readSessionStart = 0L
 

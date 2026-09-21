@@ -49,6 +49,24 @@ data class NoteEntity(
     @ColumnInfo(defaultValue = "''") val status: String = ""
 )
 
+/**
+ * 书签：只记录「位置」，与笔记/摘录分开。
+ *
+ * anchor 复用笔记的锚点语法（CHAPTER:3 / PAGE:12 / PARAGRAPH:40 / IMAGE:5），
+ * 因此跳转可以完全复用 ReaderView 已有的锚点定位逻辑，不必再写一套映射。
+ */
+@Entity(tableName = "bookmarks")
+data class BookmarkEntity(
+    @PrimaryKey(autoGenerate = true) val id: Long = 0,
+    @ColumnInfo(name = "book_id") val bookId: Long,
+    val anchor: String,
+    /** 人类可读的位置标签，如「第 3 章 · 第 12 段」。 */
+    val label: String,
+    /** 该位置首行摘录，便于在列表里确认是不是想找的那一处。 */
+    val excerpt: String = "",
+    @ColumnInfo(name = "created_at") val createdAt: Long
+)
+
 @Entity(tableName = "folders")
 data class FolderEntity(
     @PrimaryKey(autoGenerate = true) val id: Long = 0,
@@ -134,6 +152,21 @@ interface YeshuDao {
     @Query("DELETE FROM notes WHERE book_id=:bookId")
     fun deleteNotesForBook(bookId: Long)
 
+    @Insert
+    fun addBookmark(bookmark: BookmarkEntity): Long
+
+    @Query("SELECT * FROM bookmarks WHERE book_id=:bookId ORDER BY created_at DESC")
+    fun listBookmarks(bookId: Long): List<BookmarkEntity>
+
+    @Query("SELECT * FROM bookmarks ORDER BY created_at DESC LIMIT :limit")
+    fun recentBookmarks(limit: Int): List<BookmarkEntity>
+
+    @Query("DELETE FROM bookmarks WHERE id=:id")
+    fun deleteBookmark(id: Long)
+
+    @Query("DELETE FROM bookmarks WHERE book_id=:bookId")
+    fun deleteBookmarksForBook(bookId: Long)
+
     @Query("DELETE FROM ai_artifacts WHERE book_id=:bookId")
     fun deleteArtifactsForBook(bookId: Long)
 
@@ -166,6 +199,9 @@ interface YeshuDao {
 
     @Query("UPDATE read_log SET ms=CASE WHEN ms<:ms THEN :ms ELSE ms END WHERE day=:day")
     fun mergeReadLog(day: String, ms: Long)
+
+    @Query("UPDATE read_log SET ms=:ms WHERE day=:day")
+    fun setReadLog(day: String, ms: Long)
 
     @Query("SELECT COUNT(*) FROM read_log WHERE ms>0")
     fun activeDays(): Int
@@ -230,6 +266,15 @@ interface YeshuDao {
     @Query("DELETE FROM notes WHERE id=:id")
     fun deleteNote(id: Long)
 
+    @Query("UPDATE notes SET content=:content WHERE id=:id")
+    fun updateNoteContent(id: Long, content: String)
+
+    @Query("UPDATE notes SET status=:status WHERE id=:id")
+    fun updateNoteStatus(id: Long, status: String)
+
+    @Query("UPDATE ai_artifacts SET content=:content, updated_at=:updatedAt WHERE id=:id")
+    fun updateArtifactContent(id: Long, content: String, updatedAt: Long)
+
     @Query("SELECT id FROM notes WHERE book_id=:bookId AND kind=:kind AND content=:content AND created_at=:createdAt LIMIT 1")
     fun findNote(bookId: Long, kind: String, content: String, createdAt: Long): Long?
 
@@ -261,9 +306,10 @@ data class TopBookRow(
         FolderEntity::class,
         SettingEntity::class,
         ReadLogEntity::class,
-        AiArtifactEntity::class
+        AiArtifactEntity::class,
+        BookmarkEntity::class
     ],
-    version = 8,
+    version = 9,
     exportSchema = true
 )
 abstract class YeshuDatabase : RoomDatabase() {
@@ -285,7 +331,8 @@ abstract class YeshuDatabase : RoomDatabase() {
                     MIGRATION_4_7,
                     MIGRATION_5_7,
                     MIGRATION_6_7,
-                    MIGRATION_7_8
+                    MIGRATION_7_8,
+                    MIGRATION_8_9
                 )
                 .allowMainThreadQueries()
                 .build()
@@ -312,6 +359,24 @@ abstract class YeshuDatabase : RoomDatabase() {
             override fun migrate(db: SupportSQLiteDatabase) {
                 db.execSQL("ALTER TABLE `notes` ADD COLUMN `anchor` TEXT NOT NULL DEFAULT ''")
                 db.execSQL("ALTER TABLE `notes` ADD COLUMN `status` TEXT NOT NULL DEFAULT ''")
+            }
+        }
+
+        /**
+         * v9：新增书签表。纯新增表，不触碰任何既有列，老库升级不会丢数据。
+         * anchor 复用笔记的锚点语法，跳转直接走 ReaderView 已有的锚点定位。
+         */
+        val MIGRATION_8_9 = object : Migration(8, 9) {
+            override fun migrate(db: SupportSQLiteDatabase) {
+                db.execSQL(
+                    """CREATE TABLE IF NOT EXISTS `bookmarks`(
+                        `id` INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL,
+                        `book_id` INTEGER NOT NULL,
+                        `anchor` TEXT NOT NULL,
+                        `label` TEXT NOT NULL,
+                        `excerpt` TEXT NOT NULL,
+                        `created_at` INTEGER NOT NULL)"""
+                )
             }
         }
 

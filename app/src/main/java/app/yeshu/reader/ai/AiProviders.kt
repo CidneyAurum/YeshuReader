@@ -22,7 +22,8 @@ object AiProviders {
     val presets = listOf(
         ProviderPreset("compatible", "兼容接口", "", ""),
         // 基元律动网关已实测接受该 id。
-        ProviderPreset("tokenrhythm", "基元律动", "https://tokenrhythm.studio/v1", "deepseek-v4-flash"),
+        // 用稳定别名而不是带日期的版本号：服务商轮换具体版本时，别名不会失效。
+        ProviderPreset("tokenrhythm", "基元律动", "https://tokenrhythm.studio/v1", "deepseek-flash"),
         // DeepSeek 官方 API 使用 deepseek-chat / deepseek-reasoner 这类对外模型名，
         // 不要照抄网关或内部版本号。
         ProviderPreset("deepseek", "DeepSeek", "https://api.deepseek.com", "deepseek-chat"),
