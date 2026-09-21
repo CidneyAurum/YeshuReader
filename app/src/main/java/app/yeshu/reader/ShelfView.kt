@@ -36,6 +36,8 @@ class ShelfView(private val act: Activity) : FrameLayout(act) {
     private var bgImage: ImageView? = null
     private var aiProgress: TextView? = null
     private var aiBusy = false
+    // 进行中的 AI 请求：浮层点按取消与视图分离取消共用同一个 token
+    private var aiToken: AiClient.CancelToken? = null
     private lateinit var etSearch: android.widget.EditText
     private lateinit var statTv: TextView
     private lateinit var sortBtn: TextView
@@ -352,7 +354,8 @@ class ShelfView(private val act: Activity) : FrameLayout(act) {
                 @Suppress("DEPRECATION")
                 act.startActivityForResult(i, Glass.REQ_BG)
             }
-            shelfItem("sliders", "设置") { (act as MainActivity).showSettings() }
+            // 名称与各处的「AI 设置」提示保持一致：用户是照着提示来找入口的。
+            shelfItem("sliders", "AI 设置") { (act as MainActivity).showSettings() }
         }
     }
 
@@ -360,6 +363,7 @@ class ShelfView(private val act: Activity) : FrameLayout(act) {
      * 通用 AI 任务执行：配置检查 + 视图内进度提示 + 子线程 + UI 回调。
      * 不使用 ProgressDialog：它持有 Activity 窗口且无法取消；进度浮层随本视图分离自动消失，
      * 回调前校验 isAttachedToWindow，避免向已销毁的界面写数据。
+     * 请求带 CancelToken 并走流式：浮层点按即停，增量上屏让等待可见。
      */
     private fun aiTask(loading: String, promptSys: String, buildPrompt: () -> String, onDone: (String) -> Unit) {
         val cfg = AiClient.config(db)
@@ -374,23 +378,59 @@ class ShelfView(private val act: Activity) : FrameLayout(act) {
         }
         if (aiBusy) return
         aiBusy = true
-        showAiProgress(loading)
+        val token = AiClient.CancelToken().also { aiToken = it }
+        val pill = showAiProgress("生成中… 点按停止", token)
+        pill.contentDescription = "$loading，点按停止"
         Thread({
             var err: String? = null
             var reply = ""
-            try { reply = AiClient.chat(cfg, promptSys, buildPrompt()) } catch (t: Throwable) { err = t.message ?: t.toString() }
+            val streamed = StringBuilder()
+            try {
+                reply = AiClient.withCancellation(token) {
+                    AiClient.chat(
+                        cfg, promptSys, buildPrompt(),
+                        onDelta = { delta ->
+                            streamed.append(delta)
+                            act.runOnUiThread {
+                                if (aiToken !== token || !isAttachedToWindow) return@runOnUiThread
+                                pill.text = "✨ " + streamed.toString().trim().takeLast(PROGRESS_TAIL_CHARS)
+                            }
+                        },
+                        onRestart = {
+                            // 断流重发：作废已上屏增量，避免「半截 + 全文」重复
+                            streamed.setLength(0)
+                            act.runOnUiThread {
+                                if (aiToken === token && isAttachedToWindow) pill.text = "✨ 生成中… 点按停止"
+                            }
+                        },
+                        timeoutMs = 120_000
+                    )
+                }
+            } catch (t: Throwable) {
+                // 统一走 userFacingError：错误文案与其他 AI 入口一致且不泄漏响应正文
+                if (!token.isCancelled()) err = AiClient.userFacingError(t)
+            }
             val e = err
+            val cancelled = token.isCancelled()
             act.runOnUiThread {
+                if (aiToken === token) aiToken = null
                 aiBusy = false
                 if (!isAttachedToWindow) return@runOnUiThread
                 dismissAiProgress()
-                if (e != null) showResult("AI 调用失败", e) else onDone(reply)
+                when {
+                    cancelled -> Unit
+                    e != null -> showResult("AI 调用失败", e)
+                    else -> onDone(reply)
+                }
             }
         }, "yeshu-ai-shelf").start()
     }
 
-    /** 视图内进度提示：不持有 Activity 窗口，随 ShelfView 分离自然消失。 */
-    private fun showAiProgress(message: String) {
+    /**
+     * 视图内进度提示：不持有 Activity 窗口，随 ShelfView 分离自然消失。
+     * 传入 token 时浮层可点按取消，并返回 TextView 供流式增量更新。
+     */
+    private fun showAiProgress(message: String, token: AiClient.CancelToken? = null): TextView {
         dismissAiProgress()
         val d = density(act)
         val tv = TextView(act).apply {
@@ -398,19 +438,33 @@ class ShelfView(private val act: Activity) : FrameLayout(act) {
             textSize = 14f
             setTextColor(Color.WHITE)
             gravity = Gravity.CENTER
+            maxWidth = Glass.dp(300, d)
+            maxLines = 4
+            ellipsize = android.text.TextUtils.TruncateAt.END
             background = GradientDrawable().apply {
                 cornerRadius = Glass.dp(14, d).toFloat()
                 setColor(Color.argb(232, 26, 32, 52))
             }
             setPadding(Glass.dp(20, d), Glass.dp(14, d), Glass.dp(20, d), Glass.dp(14, d))
             elevation = Glass.dp(12, d).toFloat()
-            contentDescription = message
+            if (token != null) {
+                isClickable = true
+                foreground = Glass.pressFx()
+                contentDescription = "$message，点按停止"
+                setOnClickListener {
+                    token.cancel()
+                    dismissAiProgress()
+                }
+            } else {
+                contentDescription = message
+            }
         }
         val lp = LayoutParams(-2, -2, Gravity.BOTTOM or Gravity.CENTER_HORIZONTAL).apply {
             bottomMargin = Glass.dp(112, d)
         }
         addView(tv, lp)
         aiProgress = tv
+        return tv
     }
 
     private fun dismissAiProgress() {
@@ -467,6 +521,9 @@ class ShelfView(private val act: Activity) : FrameLayout(act) {
     }
 
     override fun onDetachedFromWindow() {
+        // 离开页面即中断进行中的 AI 请求，避免继续占用连接
+        aiToken?.cancel()
+        aiToken = null
         // 进度浮层随视图分离移除；后台任务在回调前会再次校验附着状态
         dismissAiProgress()
         aiBusy = false
@@ -1437,13 +1494,16 @@ class ShelfView(private val act: Activity) : FrameLayout(act) {
     /** AI 简介：取书前几千字生成百字简介+类型标签，存 notes(kind=intro) */
     private fun aiIntro(b: Book) {
         aiTask("正在为《${b.title.take(10)}》生成简介…",
-            "你是专业的图书编辑。用简体中文回答。",
+            // 简介语言跟随书籍正文：英文/日文书不该拿到中文简介
+            "你是专业的图书编辑。输出语言：与书籍主要语言一致。",
             buildPrompt = {
                 val f = File(act.filesDir, b.fileName)
                 val head = try {
                     if (b.format == "pdf") "(PDF 文档)" else DocParser.parseText(f).fullText.take(6000)
                 } catch (e: Exception) { "(无法提取文本)" }
-                "请为这本书写一段吸引人但不剧透的简介（80-120 字），结尾用【】标注类型标签（如【科幻·悬疑】）。\n\n" +
+                // 把开头正文一并给出，模型据此判断书籍主要语言
+                "请为这本书写一段吸引人但不剧透的简介（80-120 字），输出语言：与书籍主要语言一致，" +
+                    "结尾用【】标注类型标签（如【科幻·悬疑】）。\n\n" +
                     "书名：《${b.title}》\n【开头内容】\n$head"
             },
             onDone = { reply ->
@@ -1885,7 +1945,7 @@ class ShelfView(private val act: Activity) : FrameLayout(act) {
         if (!AiClient.isReady(cfg)) {
             AlertDialog.Builder(act)
                 .setTitle("未配置 AI")
-                .setMessage("请先点击右上角「AI 设置」填写接口地址、Key 和模型名。")
+                .setMessage("请先在书架「更多」→「AI 设置」填写接口地址、Key 和模型名。")
                 .setPositiveButton("去设置") { _, _ -> (act as MainActivity).showSettings() }
                 .setNegativeButton("取消", null)
                 .show().also { Glass.styleDialog(it, density(act)) }
@@ -1893,34 +1953,78 @@ class ShelfView(private val act: Activity) : FrameLayout(act) {
         }
         if (aiBusy) return
         aiBusy = true
-        showAiProgress("正在生成，请稍候…")
+        val token = AiClient.CancelToken().also { aiToken = it }
+        val pill = showAiProgress("生成中… 点按停止", token)
+        pill.contentDescription = "正在生成《${b.title}》摘要，点按停止"
         Thread {
             var err: String? = null
             var reply = ""
+            val streamed = StringBuilder()
             try {
                 val f = File(act.filesDir, b.fileName)
                 val text = if (b.format == "pdf") throw RuntimeException("PDF 文本提取将在后续版本支持")
                            else DocParser.parseText(f).fullText
                 if (text.isBlank()) throw RuntimeException("文档没有可读文本")
-                reply = AiClient.chat(
-                    cfg,
-                    "你是专业的中文阅读助手。用简体中文回答，输出使用简洁的结构化格式。",
-                    "请为下面的内容生成摘要：先一句话概括，再用 3-6 个要点列出核心内容。\n\n【内容开始】\n" +
-                        text.take(24000) + "\n【内容结束】"
-                )
-                db.addNote(b.id, "summary", reply)
+                val hint = languageHint(text.take(2000))
+                reply = AiClient.withCancellation(token) {
+                    AiClient.chat(
+                        cfg,
+                        "你是专业的阅读助手。输出语言：${hint ?: "与书籍主要语言一致"}，输出使用简洁的结构化格式。",
+                        "请为下面的内容生成摘要：先一句话概括，再用 3-6 个要点列出核心内容。\n\n【内容开始】\n" +
+                            text.take(24000) + "\n【内容结束】",
+                        onDelta = { delta ->
+                            streamed.append(delta)
+                            act.runOnUiThread {
+                                if (aiToken !== token || !isAttachedToWindow) return@runOnUiThread
+                                pill.text = "✨ " + streamed.toString().trim().takeLast(PROGRESS_TAIL_CHARS)
+                            }
+                        },
+                        onRestart = {
+                            // 断流重发：作废已上屏增量，避免「半截 + 全文」重复
+                            streamed.setLength(0)
+                            act.runOnUiThread {
+                                if (aiToken === token && isAttachedToWindow) pill.text = "✨ 生成中… 点按停止"
+                            }
+                        },
+                        timeoutMs = 120_000
+                    )
+                }
+                // 先落库再回主线程：视图若已分离，结果也不该丢；取消则不写半截结果
+                if (!token.isCancelled()) db.addNote(b.id, "summary", reply)
             } catch (t: Throwable) {
-                err = t.message ?: t.toString()
+                // 统一走 userFacingError：错误文案与其他 AI 入口一致且不泄漏响应正文
+                if (!token.isCancelled()) err = AiClient.userFacingError(t)
             }
             val e = err
+            val cancelled = token.isCancelled()
             act.runOnUiThread {
+                if (aiToken === token) aiToken = null
                 aiBusy = false
                 if (!isAttachedToWindow) return@runOnUiThread
                 dismissAiProgress()
-                if (e != null) showResult("AI 调用失败", e)
-                else showResult("《${b.title}》· AI 摘要", reply)
+                when {
+                    cancelled -> Unit
+                    e != null -> showResult("AI 调用失败", e)
+                    else -> showResult("《${b.title}》· AI 摘要", reply)
+                }
             }
         }.start()
+    }
+
+    /**
+     * 书籍主要语言的弱判断。DocumentAiService.detectLanguage 尚未落地，
+     * 这里只按正文字符脚本兜底，避免英文/日文书拿到中文摘要与简介。
+     */
+    private fun languageHint(sample: String): String? {
+        val cjk = sample.count { it.code in 0x4E00..0x9FFF }
+        val kana = sample.count { it.code in 0x3040..0x30FF }
+        val latin = sample.count { it.isLetter() && it.code < 0x250 }
+        return when {
+            kana > 20 -> "日语"
+            cjk > 20 && cjk >= latin / 3 -> "简体中文"
+            latin > 20 -> "英语"
+            else -> null
+        }
     }
 
     private fun showResult(title: String, body: String) {
@@ -2022,6 +2126,8 @@ class ShelfView(private val act: Activity) : FrameLayout(act) {
         // 走 ACTION_SEND 的文本上限（UTF-16 下约 400 KB），超过则改为写入文件，
         // 避免 Intent extra 撞上 Binder 事务上限抛 TransactionTooLargeException
         const val MAX_SHARE_TEXT_CHARS = 200_000
+        // 流式进度浮层里回显的尾部字符数：够看出在生成，又不至于撑爆浮层
+        const val PROGRESS_TAIL_CHARS = 80
         // 封面解码线程池：避免在 refresh() 主线程解码大图造成掉帧/ANR
         val coverExecutor: java.util.concurrent.ExecutorService = Executors.newFixedThreadPool(2) { r ->
             Thread(r, "yeshu-shelf-cover").apply { isDaemon = true }

@@ -44,7 +44,12 @@ class Db(context: Context) {
     )
 
     private fun NoteEntity.toModel() = NoteRow(id, kind, content, bookId, createdAt)
+    private fun NoteEntity.toDetail() = NoteDetail(id, bookId, kind, content, createdAt, anchor, status)
     private fun FolderEntity.toModel() = Folder(id, name, parentId)
+
+    private fun AiArtifactEntity.toModel() = AiArtifact(
+        id, bookId, kind, status, content, citationsJson, documentHash, model, promptVersion, createdAt, updatedAt
+    )
 
     fun insertBook(
         title: String,
@@ -289,21 +294,97 @@ class Db(context: Context) {
 
     fun removeAiKey(profileId: String) = SecureKeyStore(appContext).removeProfileApiKey(profileId)
 
+    /**
+     * 笔记详情：比 [NoteRow] 多带出处锚点与校验状态，供笔记中枢的详情面板使用。
+     * 列表仍用 [NoteRow]，避免每个列表项都携带锚点解析的负担。
+     */
+    data class NoteDetail(
+        val id: Long,
+        val bookId: Long,
+        val kind: String,
+        val content: String,
+        val createdAt: Long,
+        val anchor: String,
+        val status: String
+    )
+
     fun addNote(
         bookId: Long,
         kind: String,
         content: String,
         id: Long = 0L,
         createdAt: Long = System.currentTimeMillis(),
+        anchor: String = "",
+        status: String = ""
     ): Long = dao.addNote(
-        NoteEntity(id = id, bookId = bookId, kind = kind, content = content, createdAt = createdAt)
+        NoteEntity(
+            id = id,
+            bookId = bookId,
+            kind = kind,
+            content = content,
+            createdAt = createdAt,
+            anchor = anchor,
+            status = status
+        )
     )
 
     fun listNotes(bookId: Long, kind: String? = null): List<NoteRow> =
         (if (kind == null) dao.listNotes(bookId) else dao.listNotes(bookId, kind)).map { it.toModel() }
 
+    /** 笔记中枢列表：带出处锚点，便于卡片上直接显示来源位置。 */
+    fun recentNoteDetails(limit: Int = 80): List<NoteDetail> = dao.recentNotes(limit).map { it.toDetail() }
+
+    /**
+     * 按 id 取一条笔记的完整内容与锚点。DAO 没有单条查询，但笔记表规模有限且详情面板
+     * 只在用户点按时打开一次，整表扫描一次可以接受。
+     */
+    fun getNoteDetail(id: Long): NoteDetail? = dao.allNotes().firstOrNull { it.id == id }?.toDetail()
+
     fun recentNotes(limit: Int = 20): List<NoteRow> = dao.recentNotes(limit).map { it.toModel() }
     fun deleteNote(id: Long) = dao.deleteNote(id)
+
+    /**
+     * 删除笔记并清理它对应的 AI 成果：ai_artifacts 没有外键级联，只删笔记会让成果
+     * 永久留在库里却再无入口（生成时笔记与成果写的是同一份校验后正文，按内容即可配对）。
+     * 返回被一并删除的成果，供调用方在“撤销”时原样恢复。
+     */
+    fun deleteNoteWithArtifact(id: Long): AiArtifact? {
+        var removed: AiArtifact? = null
+        room.runInTransaction {
+            val note = dao.allNotes().firstOrNull { it.id == id }
+            if (note != null) {
+                val artifact = dao.listArtifacts(note.bookId).firstOrNull {
+                    it.kind == note.kind && it.content == note.content
+                }
+                if (artifact != null) {
+                    removed = artifact.toModel()
+                    deleteArtifact(artifact.id)
+                }
+            }
+            dao.deleteNote(id)
+        }
+        return removed
+    }
+
+    /**
+     * 把只存在于缓存里的成果补一条笔记：命中 ai_artifacts 缓存时不会重新生成，也就不会
+     * 落笔记，用户因此看不到这次的结果。内容相同即视为已有笔记，不重复堆积。
+     */
+    fun ensureNoteForArtifact(artifact: AiArtifact): Long {
+        if (artifact.content.isBlank()) return 0L
+        val existing = dao.listNotes(artifact.bookId).firstOrNull {
+            it.kind == artifact.kind && it.content == artifact.content
+        }
+        if (existing != null) return existing.id
+        return dao.addNote(
+            NoteEntity(
+                bookId = artifact.bookId,
+                kind = artifact.kind,
+                content = artifact.content,
+                createdAt = artifact.updatedAt
+            )
+        )
+    }
 
     fun saveArtifact(artifact: AiArtifact): Long = dao.saveArtifact(
         AiArtifactEntity(
@@ -321,8 +402,18 @@ class Db(context: Context) {
         )
     )
 
-    fun listArtifacts(bookId: Long): List<AiArtifact> = dao.listArtifacts(bookId).map {
-        AiArtifact(it.id, it.bookId, it.kind, it.status, it.content, it.citationsJson, it.documentHash, it.model, it.promptVersion, it.createdAt, it.updatedAt)
+    fun listArtifacts(bookId: Long): List<AiArtifact> = dao.listArtifacts(bookId).map { it.toModel() }
+
+    /** 笔记中枢的“AI 成果”区按全局范围读取：成果的归属书可能已被删除。 */
+    fun listAllArtifacts(): List<AiArtifact> = dao.allArtifacts().map { it.toModel() }
+
+    /**
+     * 按 id 删除单条 AI 成果。DAO 只提供按书删除，这里直接用底层连接执行，
+     * 避免为了删一条成果而清掉同一本书的其他成果。
+     */
+    fun deleteArtifact(id: Long) {
+        if (id <= 0) return
+        room.openHelper.writableDatabase.execSQL("DELETE FROM ai_artifacts WHERE id = ?", arrayOf(id))
     }
 
     companion object {

@@ -14,6 +14,14 @@ data class ImportResult(val id: Long, val title: String, val format: String, val
 
 object LibraryImporter {
     private val supportedFormats = setOf("pdf", "epub", "docx", "pptx", "txt", "md", "jpg", "png")
+    /**
+     * MIME → 格式。与 `DocParser` 支持的格式保持一致。
+     *
+     * 各内容提供者对冷门格式（fb2 / odt / cbz / wps）经常报出任意 MIME，甚至报
+     * application/octet-stream，所以这里除了精确映射，还保留 octet-stream 这一项：
+     * 选择器允许选中，真正的格式由文件内容判定，判不出来时给出可读原因。
+     * 否则用户会在选择器里看到文件是灰的，根本选不中。
+     */
     private val mimeFormats = mapOf(
         "application/pdf" to "pdf",
         "application/x-pdf" to "pdf",
@@ -22,12 +30,32 @@ object LibraryImporter {
         "application/vnd.ms-word.document.macroenabled.12" to "docx",
         "application/vnd.openxmlformats-officedocument.presentationml.presentation" to "pptx",
         "application/vnd.openxmlformats-officedocument.presentationml.slideshow" to "pptx",
+        "application/vnd.oasis.opendocument.text" to "odt",
+        "application/vnd.oasis.opendocument.text-template" to "odt",
+        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" to "xlsx",
+        "application/vnd.ms-excel.sheet.macroenabled.12" to "xlsx",
+        "text/html" to "html",
+        "application/xhtml+xml" to "html",
+        "application/x-fictionbook+xml" to "fb2",
+        "application/fb2" to "fb2",
+        "application/rtf" to "rtf",
+        "text/rtf" to "rtf",
         "text/plain" to "txt",
         "text/markdown" to "md",
         "text/x-markdown" to "md",
+        "text/csv" to "csv",
+        "text/tab-separated-values" to "csv",
+        "application/vnd.comicbook+zip" to "cbz",
+        "application/x-cbz" to "cbz",
+        "application/zip" to "zip",
+        "application/x-zip-compressed" to "zip",
         "image/jpeg" to "jpg",
         "image/jpg" to "jpg",
-        "image/png" to "png"
+        "image/png" to "png",
+        "image/webp" to "webp",
+        "image/gif" to "gif",
+        "image/bmp" to "bmp",
+        "application/octet-stream" to ""
     )
 
     /** 与 [mimeFormats] 保持一致，避免选择器把应用已支持（如 DOCM/PPSX/text/x-markdown）的文件置灰。 */
@@ -154,6 +182,10 @@ object LibraryImporter {
         "jpeg" -> "jpg"
         else -> format.lowercase().ifBlank { "txt" }
     }
+
+    /** 扩展名 → 格式。MIME 缺失或不可信时的兜底判型依据。 */
+    internal fun formatForExtension(fileName: String): String =
+        app.yeshu.reader.parse.DocParser.detect(fileName)
 
     private fun sanitizeName(value: String): String = value
         .replace(Regex("[^\\p{L}\\p{N}._ -]"), "_")

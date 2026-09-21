@@ -167,10 +167,16 @@ class NotesView(private val act: Activity, private val bookId: Long) : FrameLayo
         }
         for (row in notes) {
             val label = NoteKindLabels.label(row.kind)
-            val body = when {
-                row.kind == "chat" && row.content.startsWith("U:") -> "🙋 " + row.content.removePrefix("U:")
-                row.kind == "chat" && row.content.startsWith("A:") -> "🤖 " + row.content.removePrefix("A:")
+            // 角色前缀只在列表里用 emoji 表达；全文弹层展示去掉前缀的正文
+            val raw = when {
+                row.kind == "chat" && row.content.startsWith("U:") -> row.content.removePrefix("U:")
+                row.kind == "chat" && row.content.startsWith("A:") -> row.content.removePrefix("A:")
                 else -> row.content
+            }
+            val body = when {
+                row.kind == "chat" && row.content.startsWith("U:") -> "🙋 $raw"
+                row.kind == "chat" && row.content.startsWith("A:") -> "🤖 $raw"
+                else -> raw
             }
             val card = LinearLayout(act).apply {
                 orientation = LinearLayout.VERTICAL
@@ -180,7 +186,7 @@ class NotesView(private val act: Activity, private val bookId: Long) : FrameLayo
                 isFocusable = true
                 elevation = Glass.dp(3, d).toFloat()
                 setPadding(Glass.dp(16, d), Glass.dp(13, d), Glass.dp(12, d), Glass.dp(10, d))
-                setOnClickListener { showFull(row.content) }
+                setOnClickListener { showFull(raw) }
                 setOnLongClickListener {
                     performHapticFeedback(HapticFeedbackConstants.LONG_PRESS)
                     confirmDelete(row)
@@ -335,21 +341,76 @@ class NotesView(private val act: Activity, private val bookId: Long) : FrameLayo
         super.onDetachedFromWindow()
     }
 
+    /**
+     * 全文弹层：引用锚点（[CHAPTER:2] / [PAGE:12] …）渲染成可点链接。
+     * 有链接时必须用 LinkMovementMethod（与文本选择互斥，两者同时开会让链接点不动），
+     * 没有链接时保持可选中复制。
+     */
     private fun showFull(content: String) {
         val d = density(act)
+        val linked = withCitationLinks(content)
+        val hasLinks = linked is android.text.Spanned &&
+            linked.getSpans(0, linked.length, android.text.style.ClickableSpan::class.java).isNotEmpty()
         val sc = ScrollView(act)
         sc.addView(TextView(act).apply {
-            text = content
+            text = linked
             textSize = 14f
             // 对话框底色跟随主题，正文颜色也必须跟着走
             setTextColor(if (pal.dark) pal.textP else Color.parseColor("#222222"))
-            setTextIsSelectable(true)
+            if (hasLinks) {
+                movementMethod = android.text.method.LinkMovementMethod.getInstance()
+            } else {
+                setTextIsSelectable(true)
+            }
             setPadding(Glass.dp(20, d), Glass.dp(14, d), Glass.dp(20, d), Glass.dp(20, d))
         })
         AlertDialog.Builder(act)
             .setView(sc)
             .setPositiveButton("关闭", null)
             .show().also { Glass.styleDialog(it, density(act)) }
+    }
+
+    /** 把引用锚点包成可点 span；无锚点时原样返回，避免多建一个 Spannable。 */
+    private fun withCitationLinks(content: String): CharSequence {
+        val matches = CITATION.findAll(content).toList()
+        if (matches.isEmpty()) return content
+        val linkColor = if (pal.dark) Color.parseColor("#8FB6FF") else Color.parseColor("#3B5BDB")
+        val out = android.text.SpannableString(content)
+        for (match in matches) {
+            val anchor = match.value
+            out.setSpan(
+                object : android.text.style.ClickableSpan() {
+                    override fun onClick(widget: View) {
+                        android.widget.Toast.makeText(
+                            act, "引用来源：${anchorLabel(anchor)}", android.widget.Toast.LENGTH_SHORT
+                        ).show()
+                    }
+
+                    override fun updateDrawState(ds: android.text.TextPaint) {
+                        ds.color = linkColor
+                        ds.isUnderlineText = true
+                    }
+                },
+                match.range.first,
+                match.range.last + 1,
+                android.text.Spanned.SPAN_EXCLUSIVE_EXCLUSIVE
+            )
+        }
+        return out
+    }
+
+    /** 锚点 token → 中文位置描述；解析失败时回退原始 token。 */
+    private fun anchorLabel(token: String): String {
+        val parts = token.removePrefix("[").removeSuffix("]").split(":")
+        val index = parts.getOrNull(1)?.toIntOrNull() ?: return token
+        return when (parts.firstOrNull()) {
+            "PAGE" -> "第 $index 页"
+            "CHAPTER" -> "第 $index 章"
+            "PARAGRAPH" -> "第 $index 段"
+            "SLIDE" -> "第 $index 张幻灯片"
+            "IMAGE" -> "第 $index 张图"
+            else -> token
+        }
     }
 
     /** ✨ AI 整理：全部笔记归纳为一页结构化精读笔记，存 kind=digest */
@@ -365,24 +426,43 @@ class NotesView(private val act: Activity, private val bookId: Long) : FrameLayo
             return
         }
         val book = db.getBook(bookId)
-        showAiProgress("正在归纳 ${notes.size} 条笔记…")
-        // 可取消请求：视图分离时中断网络 I/O；已生成好的结果仍会落库，不静默丢弃
+        // 可取消请求：浮层点按或视图分离时中断网络 I/O；已生成好的结果仍会落库，不静默丢弃
         val token = AiClient.CancelToken().also { digestToken = it }
+        val pill = showAiProgress("生成中… 点按停止", token)
+        pill.contentDescription = "正在归纳 ${notes.size} 条笔记，点按停止"
         Thread({
             var err: String? = null
             var reply = ""
+            val streamed = StringBuilder()
             try {
                 val body = notes.joinToString("\n\n") { row ->
                     "【${NoteKindLabels.label(row.kind)}】\n${row.content.take(1500)}"
                 }
+                // 输出语言跟随笔记（即书籍）的主要语言，而不是固定中文
+                val hint = languageHint(body.take(2000))
                 reply = AiClient.withCancellation(token) {
                     AiClient.chat(cfg,
-                        "你是专业的读书教练。用简体中文，输出结构化 Markdown 风格的纯文本。",
+                        "你是专业的读书教练。输出语言：${hint ?: "与书籍主要语言一致"}，输出结构化 Markdown 风格的纯文本。",
                         "以下是读者读《${book?.title ?: "一本书"}》期间积累的全部 AI 笔记。请归纳整理成一页「精读笔记」：" +
                             "① 核心主题一句话；② 3-5 个关键要点（合并重复内容）；③ 值得记住的金句摘录（如有）；④ 一条行动建议。" +
-                            "只输出整理结果。\n\n【笔记开始】\n${body.take(22000)}\n【笔记结束】")
+                            "只输出整理结果。\n\n【笔记开始】\n${body.take(22000)}\n【笔记结束】",
+                        onDelta = { delta ->
+                            streamed.append(delta)
+                            act.runOnUiThread {
+                                if (digestToken !== token || !isAttachedToWindow) return@runOnUiThread
+                                pill.text = "✨ " + streamed.toString().trim().takeLast(PROGRESS_TAIL_CHARS)
+                            }
+                        },
+                        onRestart = {
+                            // 断流重发：作废已上屏增量，避免「半截 + 全文」重复
+                            streamed.setLength(0)
+                            act.runOnUiThread {
+                                if (digestToken === token && isAttachedToWindow) pill.text = "✨ 生成中… 点按停止"
+                            }
+                        },
+                        timeoutMs = 120_000)
                 }
-                // 先落库再回主线程：视图若已分离，结果也不该丢
+                // 先落库再回主线程：视图若已分离，结果也不该丢；取消则不写半截结果
                 if (!token.isCancelled()) db.addNote(bookId, "digest", reply)
             } catch (t: Throwable) {
                 if (!token.isCancelled()) err = AiClient.userFacingError(t)
@@ -408,8 +488,27 @@ class NotesView(private val act: Activity, private val bookId: Long) : FrameLayo
         }, "yeshu-digest").apply { isDaemon = true }.start()
     }
 
-    /** 不使用 ProgressDialog：它持有 Activity 窗口且无法取消；浮层随视图分离自动消失。 */
-    private fun showAiProgress(message: String) {
+    /**
+     * 笔记正文主要语言的弱判断。DocumentAiService.detectLanguage 尚未落地，
+     * 这里只按字符脚本兜底，避免英文/日文书笔记被归纳成中文。
+     */
+    private fun languageHint(sample: String): String? {
+        val cjk = sample.count { it.code in 0x4E00..0x9FFF }
+        val kana = sample.count { it.code in 0x3040..0x30FF }
+        val latin = sample.count { it.isLetter() && it.code < 0x250 }
+        return when {
+            kana > 20 -> "日语"
+            cjk > 20 && cjk >= latin / 3 -> "简体中文"
+            latin > 20 -> "英语"
+            else -> null
+        }
+    }
+
+    /**
+     * 不使用 ProgressDialog：它持有 Activity 窗口且无法取消；浮层随视图分离自动消失。
+     * 传入 token 时浮层可点按取消，并返回 TextView 供流式增量更新。
+     */
+    private fun showAiProgress(message: String, token: AiClient.CancelToken? = null): TextView {
         dismissAiProgress()
         val d = density(act)
         val tv = TextView(act).apply {
@@ -417,18 +516,32 @@ class NotesView(private val act: Activity, private val bookId: Long) : FrameLayo
             textSize = 14f
             setTextColor(Color.WHITE)
             gravity = Gravity.CENTER
+            maxWidth = Glass.dp(300, d)
+            maxLines = 4
+            ellipsize = android.text.TextUtils.TruncateAt.END
             background = GradientDrawable().apply {
                 cornerRadius = Glass.dp(14, d).toFloat()
                 setColor(Color.argb(232, 26, 32, 52))
             }
             setPadding(Glass.dp(20, d), Glass.dp(14, d), Glass.dp(20, d), Glass.dp(14, d))
             elevation = Glass.dp(12, d).toFloat()
-            contentDescription = message
+            if (token != null) {
+                isClickable = true
+                foreground = Glass.pressFx()
+                contentDescription = "$message，点按停止"
+                setOnClickListener {
+                    token.cancel()
+                    dismissAiProgress()
+                }
+            } else {
+                contentDescription = message
+            }
         }
         addView(tv, LayoutParams(-2, -2, Gravity.BOTTOM or Gravity.CENTER_HORIZONTAL).apply {
             bottomMargin = Glass.dp(112, d)
         })
         aiProgress = tv
+        return tv
     }
 
     private fun dismissAiProgress() {
@@ -468,5 +581,11 @@ class NotesView(private val act: Activity, private val bookId: Long) : FrameLayo
     private companion object {
         /** Binder 事务上限约 1MB，留足余量。 */
         const val SHARE_TEXT_LIMIT = 200_000
+
+        /** 流式进度浮层里回显的尾部字符数 */
+        const val PROGRESS_TAIL_CHARS = 80
+
+        /** 与 DocumentAiService 引用格式一致：[CHAPTER:2] / [PAGE:12] / [PARAGRAPH:40] 等。 */
+        val CITATION = Regex("\\[(PAGE|SLIDE|CHAPTER|PARAGRAPH|IMAGE):(\\d+)]")
     }
 }

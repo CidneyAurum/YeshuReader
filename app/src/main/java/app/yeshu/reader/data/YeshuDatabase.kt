@@ -42,7 +42,11 @@ data class NoteEntity(
     @ColumnInfo(name = "book_id") val bookId: Long,
     val kind: String,
     val content: String,
-    @ColumnInfo(name = "created_at") val createdAt: Long
+    @ColumnInfo(name = "created_at") val createdAt: Long,
+    /** 出处锚点，如 CHAPTER:3 / PAGE:12 / PARAGRAPH:40；空表示没有可定位的来源。 */
+    @ColumnInfo(defaultValue = "''") val anchor: String = "",
+    /** "" 正常；"unvalidated" 表示模型输出未通过校验但用户选择保留。 */
+    @ColumnInfo(defaultValue = "''") val status: String = ""
 )
 
 @Entity(tableName = "folders")
@@ -259,7 +263,7 @@ data class TopBookRow(
         ReadLogEntity::class,
         AiArtifactEntity::class
     ],
-    version = 7,
+    version = 8,
     exportSchema = true
 )
 abstract class YeshuDatabase : RoomDatabase() {
@@ -280,7 +284,8 @@ abstract class YeshuDatabase : RoomDatabase() {
                     MIGRATION_3_7,
                     MIGRATION_4_7,
                     MIGRATION_5_7,
-                    MIGRATION_6_7
+                    MIGRATION_6_7,
+                    MIGRATION_7_8
                 )
                 .allowMainThreadQueries()
                 .build()
@@ -295,6 +300,20 @@ abstract class YeshuDatabase : RoomDatabase() {
         val MIGRATION_4_7 = legacyMigration(4)
         val MIGRATION_5_7 = legacyMigration(5)
         val MIGRATION_6_7 = legacyMigration(6)
+
+        /**
+         * v8：笔记补上出处锚点与状态。
+         * - anchor：金句/引文来自哪一段（如 CHAPTER:3 / PAGE:12 / PARAGRAPH:40），
+         *   否则「金句」列表只是一堆无法定位的文本。
+         * - status：校验未通过但仍被用户保留的结果会标为 unvalidated，
+         *   便于界面提示与后续重新校验。
+         */
+        val MIGRATION_7_8 = object : Migration(7, 8) {
+            override fun migrate(db: SupportSQLiteDatabase) {
+                db.execSQL("ALTER TABLE `notes` ADD COLUMN `anchor` TEXT NOT NULL DEFAULT ''")
+                db.execSQL("ALTER TABLE `notes` ADD COLUMN `status` TEXT NOT NULL DEFAULT ''")
+            }
+        }
 
         private fun legacyMigration(from: Int) = object : Migration(from, 7) {
             override fun migrate(db: SupportSQLiteDatabase) = rebuildLegacySchema(db)

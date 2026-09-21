@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<FictionBook xmlns="http://www.gribuser.ru/xml/fictionbook/2.0"
+             xmlns:l="http://www.w3.org/1999/xlink">
+  <description><title-info><book-title>FB2 测试书</book-title></title-info></description>
+  <body>
+    <section>
+      <title><p>第一章 FB2 标题</p></title>
+      <p>这是 FB2 的正文段落。</p>
+      <section><title><p>1.1 小节</p></title><p>小节正文。</p></section>
+    </section>
+    <section><title><p>第二章 收尾</p></title><p>最后一段。</p></section>
+  </body>
+</FictionBook>

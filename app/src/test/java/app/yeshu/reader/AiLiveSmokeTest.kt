@@ -48,6 +48,52 @@ class AiLiveSmokeTest {
     }
 
     @Test
+    fun `采样参数被真实网关接受`() {
+        // 学习包依赖低温度 + 明确长度上限；网关拒绝这两个参数时必须能降级而不是直接失败。
+        val answer = AiClient.chat(
+            config(),
+            system = "你是测试助手。",
+            user = "只回复两个字：可用",
+            temperature = 0.2,
+            maxTokens = 64,
+        )
+        assertTrue("回答为空", answer.isNotBlank())
+    }
+
+    @Test
+    fun `json 模式被真实网关接受`() {
+        val answer = AiClient.chat(
+            config(),
+            system = "你是 JSON 生成器。只输出 JSON，不要解释。",
+            user = """输出 {"ok":true} 这个对象""",
+            temperature = 0.0,
+            maxTokens = 200,
+            jsonMode = true,
+        )
+        val text = answer.trim()
+        assertTrue("返回内容不是 JSON：${text.take(120)}", text.startsWith("{"))
+    }
+
+    @Test
+    fun `探测接口报告模型与延迟`() {
+        // probe 在失败时抛错，成功时返回结构化结果。
+        val probe = AiClient.probe(config())
+        assertTrue("未报告模型名", probe.model.isNotBlank())
+        assertTrue("延迟未测量", probe.latencyMs >= 0)
+        assertTrue("描述信息不完整：${probe.describe()}", probe.describe().contains(probe.model))
+        assertEquals("状态码应为 200", 200, probe.httpStatus)
+    }
+
+    @Test
+    fun `用量统计被解析出来`() {
+        val usage = java.util.concurrent.atomic.AtomicReference<AiClient.TokenUsage?>()
+        AiClient.chat(config(), system = "你是测试助手。", user = "只回复两个字：可用", onUsage = { usage.set(it) })
+        val tokens = usage.get()
+        assertNotNull("没有回调用量信息", tokens)
+        assertTrue("未解析出输入 tokens", tokens!!.promptTokens > 0)
+    }
+
+    @Test
     fun `实况流式对话能拿到完整回答`() {
         val answer = AiClient.chat(config(), "你是测试助手。", "只回复两个字：可用")
         assertTrue("回答为空", answer.isNotBlank())

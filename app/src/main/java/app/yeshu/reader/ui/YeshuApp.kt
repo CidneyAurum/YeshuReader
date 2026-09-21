@@ -36,6 +36,7 @@ import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.KeyboardOptions
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.AssistChip
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
@@ -89,6 +90,7 @@ import androidx.compose.ui.viewinterop.AndroidView
 import androidx.compose.ui.hapticfeedback.HapticFeedbackType
 import androidx.core.view.WindowCompat
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import app.yeshu.reader.AiArtifact
 import app.yeshu.reader.AiClient
 import app.yeshu.reader.Book
 import app.yeshu.reader.ChatView
@@ -108,14 +110,23 @@ import app.yeshu.reader.ai.SavedAiProfile
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import org.json.JSONArray
 
 private data class TopDestination(val label: String, val glyph: String, val destination: Destination)
 
 private data class WorkbenchSnapshot(
     val books: List<LibraryItem>,
     val noteCount: Int,
-    val minutes: Long
+    val minutes: Long,
+    val aiConfigured: Boolean,
+    val aiIntroSeen: Boolean
 )
+
+/** 首次使用 AI 的一次性说明标记；ReaderView / ShelfView 的入口也读同一个设置键。 */
+private const val AI_INTRO_SEEN_KEY = "ai_intro_seen"
+
+/** 视觉模型候选的命名特征；命名不规则的模型用「显示全部」兜底。 */
+private val VISION_MODEL_HINT = Regex("vl|vision|llava|omni", RegexOption.IGNORE_CASE)
 
 private val topDestinations = listOf(
     TopDestination("工作台", "⌂", Destination.Workbench),
@@ -447,20 +458,25 @@ private fun WorkbenchScreen(
     showIllustrations: Boolean,
     onNavigate: (Destination) -> Unit
 ) {
+    val db = remember { Db(activity) }
+    val scope = rememberCoroutineScope()
     var snapshot by remember { mutableStateOf<WorkbenchSnapshot?>(null) }
     var loading by remember { mutableStateOf(true) }
     var error by remember { mutableStateOf<String?>(null) }
     var reloadTick by remember { mutableStateOf(0) }
+    var showAiIntro by remember { mutableStateOf(false) }
     LaunchedEffect(revision, reloadTick) {
         loading = true
         error = null
         withContext(Dispatchers.IO) {
             runCatching {
-                val db = Db(activity)
                 WorkbenchSnapshot(
                     books = db.listBooks(),
                     noteCount = db.noteCount(),
-                    minutes = db.totalAllReadMs() / 60_000
+                    minutes = db.totalAllReadMs() / 60_000,
+                    // AI 是否可用只在 IO 线程探测一次（含一次 Keystore 读取），入口卡片据此显示状态
+                    aiConfigured = AiClient.isReady(AiClient.config(db)),
+                    aiIntroSeen = db.getSetting(AI_INTRO_SEEN_KEY) == "1"
                 )
             }
         }
@@ -474,6 +490,16 @@ private fun WorkbenchScreen(
     val noteCount = snapshot?.noteCount ?: 0
     val minutes = snapshot?.minutes ?: 0
     val failure = error
+
+    /** 首次进入 AI 设置前先说明 BYOK：费用与数据流向讲清楚，再带用户去配置。 */
+    fun openAiSettings() {
+        if (snapshot?.aiIntroSeen != true) showAiIntro = true else onNavigate(Destination.Settings)
+    }
+
+    fun markIntroSeen() {
+        snapshot = snapshot?.copy(aiIntroSeen = true)
+        scope.launch { withContext(Dispatchers.IO) { db.setSetting(AI_INTRO_SEEN_KEY, "1") } }
+    }
 
     BoxWithConstraints(Modifier.fillMaxSize()) {
         val pageWidth = if (maxWidth > 1180.dp) 1180.dp else maxWidth
@@ -503,6 +529,12 @@ private fun WorkbenchScreen(
                             QuickAction("＋", "导入资料", "PDF · PPTX · DOCX", ElectricBlue, Modifier.weight(1f)) { activity.importDocuments() }
                             QuickAction("▦", "打开书架", "日常阅读与管理", ActiveViolet, Modifier.weight(1f)) { onNavigate(Destination.Shelf) }
                         }
+                        Spacer(Modifier.height(10.dp))
+                        // 书架里叫「AI 设置」的入口藏在「更多」里；工作台给出同名入口，避免提示指向不存在的按钮
+                        AiSettingsEntry(
+                            configured = snapshot?.aiConfigured == true,
+                            onOpen = ::openAiSettings
+                        )
                     }
                     if (recent.isNotEmpty()) {
                         item { SectionHeader("最近内容", "继续小说，或打开刚收到的资料") }
@@ -519,6 +551,71 @@ private fun WorkbenchScreen(
                     }
                 }
             }
+        }
+    }
+
+    if (showAiIntro) {
+        AlertDialog(
+            onDismissRequest = { showAiIntro = false },
+            title = { Text("AI 功能需要你自己的接口", fontWeight = FontWeight.Black) },
+            text = {
+                Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                    Text("AI 功能由你自己提供接口与 Key，费用由服务商收取；只有你点按的操作会发送所选范围。")
+                    Text("页枢不内置账号，也不会自动上传书籍、笔记或阅读记录。", fontSize = 11.sp, color = secondaryText())
+                }
+            },
+            confirmButton = {
+                TextButton(onClick = {
+                    markIntroSeen()
+                    showAiIntro = false
+                    onNavigate(Destination.Settings)
+                }) { Text("去配置", fontWeight = FontWeight.Bold) }
+            },
+            dismissButton = {
+                TextButton(onClick = {
+                    markIntroSeen()
+                    showAiIntro = false
+                }) { Text("稍后") }
+            }
+        )
+    }
+}
+
+@Composable
+private fun AiSettingsEntry(configured: Boolean, onOpen: () -> Unit) {
+    GlassPanel(
+        modifier = Modifier.fillMaxWidth().heightIn(min = 72.dp),
+        shape = RoundedCornerShape(24.dp),
+        contentPadding = PaddingValues(horizontal = 15.dp, vertical = 13.dp),
+        elevation = 9.dp,
+        onClick = onOpen
+    ) {
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            Box(
+                Modifier.size(42.dp).clip(RoundedCornerShape(15.dp)).background(ElectricBlue.copy(alpha = 0.14f)),
+                contentAlignment = Alignment.Center
+            ) { Text("◇", fontSize = 20.sp, color = ElectricBlue, fontWeight = FontWeight.Bold) }
+            Spacer(Modifier.width(11.dp))
+            Column(Modifier.weight(1f)) {
+                Text("AI 设置", fontWeight = FontWeight.Bold, maxLines = 1)
+                Text(
+                    if (configured) "接口与模型已就绪，可随时调整" else "填写接口地址、Key 和模型名后即可使用 AI",
+                    fontSize = 10.sp,
+                    color = secondaryText(),
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis
+                )
+            }
+            GlassPill(color = if (configured) LuminousCyan else ActiveViolet) {
+                Text(
+                    if (configured) "已配置" else "未配置",
+                    fontSize = 10.sp,
+                    fontWeight = FontWeight.Bold,
+                    color = MaterialTheme.colorScheme.onSurface
+                )
+            }
+            Spacer(Modifier.width(8.dp))
+            Text("→", color = ElectricBlue, fontWeight = FontWeight.Bold)
         }
     }
 }
@@ -822,57 +919,135 @@ private fun SectionHeader(title: String, subtitle: String) {
     }
 }
 
+/** 可点击的引用锚点：来自成果的 citationsJson，或笔记的 anchor 字段。 */
+private data class CitationAnchor(val token: String, val label: String)
+
+/** 笔记中枢里的 AI 成果条目：锚点预先解析好，避免每次重组都解析一遍 citationsJson。 */
+private data class ArtifactRow(
+    val artifact: AiArtifact,
+    val bookTitle: String?,
+    val anchors: List<CitationAnchor>,
+    val hasNote: Boolean
+) {
+    /** 只有书目仍在书架里时才能跳转过去；bookId = 0 或书目已删除时为 null。 */
+    val sourceBookId: Long? get() = artifact.bookId.takeIf { it != 0L && bookTitle != null }
+}
+
+/** 笔记中枢一次加载的完整数据：笔记（带出处锚点）与全局 AI 成果。 */
+private data class NotesHubData(
+    val notes: List<Pair<Db.NoteDetail, Book?>>,
+    val artifacts: List<ArtifactRow>
+)
+
+/** 详情面板要展示的一条内容，笔记与 AI 成果共用。 */
+private data class DetailContent(
+    val title: String,
+    val badge: String,
+    val meta: String,
+    val body: String,
+    val anchors: List<CitationAnchor>,
+    /** 为空表示没有可跳转的原书（全局阅读报告，或书目已被删除）。 */
+    val bookId: Long?,
+    /** 仅在成果还没有对应笔记时提供「保存为笔记」。 */
+    val saveAsNoteArtifact: AiArtifact? = null
+)
+
 @Composable
 private fun NotesHubScreen(activity: MainActivity, revision: Int) {
     val db = remember { Db(activity) }
+    val scope = rememberCoroutineScope()
     var localRevision by remember { mutableStateOf(0) }
-    // 笔记与书目在 IO 线程读取后再交给界面：Room 开启了 allowMainThreadQueries，
-    // 直接在组合阶段查询会让每次重组都在 UI 线程跑两条查询。刷新期间保留上一次结果，避免闪白。
-    var sourcedNotes by remember { mutableStateOf<List<Pair<app.yeshu.reader.NoteRow, Book?>>?>(null) }
+    // 笔记、书目与 AI 成果在 IO 线程一次性读取后再交给界面：Room 开启了 allowMainThreadQueries，
+    // 直接在组合阶段查询会让每次重组都在 UI 线程跑好几条查询。刷新期间保留上一次结果，避免闪白。
+    var data by remember { mutableStateOf<NotesHubData?>(null) }
     var error by remember { mutableStateOf<String?>(null) }
     var reloadTick by remember { mutableStateOf(0) }
+    var detail by remember { mutableStateOf<DetailContent?>(null) }
+    var pendingDelete by remember { mutableStateOf<Db.NoteDetail?>(null) }
+    val snackbarHostState = remember { SnackbarHostState() }
+
     LaunchedEffect(revision, localRevision, reloadTick) {
         error = null
         withContext(Dispatchers.IO) {
             runCatching {
                 val books = db.listBooks().associateBy { it.id }
-                db.recentNotes(80).mapNotNull { note ->
+                val notes = db.recentNoteDetails(80).mapNotNull { note ->
                     val book = books[note.bookId]
                     // bookId = 0 是全局阅读报告，不属于任何一本书，不能因为查不到书就丢掉。
                     if (book == null && note.bookId != 0L) null else note to book
                 }
+                NotesHubData(
+                    notes = notes,
+                    // ai_artifacts 以前只有 AI 内部缓存会读：对话框一关，成果就再也没有入口
+                    artifacts = db.listAllArtifacts().map { artifact ->
+                        ArtifactRow(
+                            artifact = artifact,
+                            bookTitle = books[artifact.bookId]?.title,
+                            anchors = parseCitations(artifact.citationsJson),
+                            hasNote = notes.any { (note, _) ->
+                                note.bookId == artifact.bookId &&
+                                    note.kind == artifact.kind &&
+                                    note.content == artifact.content
+                            }
+                        )
+                    }
+                )
             }
         }
-            .onSuccess { sourcedNotes = it }
+            .onSuccess { data = it }
             .onFailure { error = it.message?.takeIf(String::isNotBlank) ?: it.javaClass.simpleName }
     }
-    var pendingDelete by remember { mutableStateOf<app.yeshu.reader.NoteRow?>(null) }
-    val snackbarHostState = remember { SnackbarHostState() }
-    val scope = rememberCoroutineScope()
 
-    fun deleteWithUndo(note: app.yeshu.reader.NoteRow) {
+    /** 删除笔记时一并清理它对应的 AI 成果；撤销时把两者都原样恢复。 */
+    fun deleteWithUndo(note: Db.NoteDetail) {
         pendingDelete = null
         scope.launch {
-            withContext(Dispatchers.IO) { db.deleteNote(note.id) }
+            val removedArtifact = withContext(Dispatchers.IO) { db.deleteNoteWithArtifact(note.id) }
             localRevision++
             val result = snackbarHostState.showSnackbar(
-                message = "笔记已删除",
+                message = if (removedArtifact != null) "笔记与对应的 AI 成果已删除" else "笔记已删除",
                 actionLabel = "撤销",
                 withDismissAction = true,
                 duration = SnackbarDuration.Long
             )
             if (result == SnackbarResult.ActionPerformed) {
                 withContext(Dispatchers.IO) {
-                    // 带上原 id 与 createdAt，否则撤销后的笔记会拿到新 id 与时间戳，
-                    // 在按 id DESC 排序的列表里跳到最前面。
-                    db.addNote(note.bookId, note.kind, note.content, note.id, note.createdAt)
+                    // 带上原 id、createdAt 与出处锚点，否则撤销后的笔记会拿到新 id 与时间戳，
+                    // 在按 id DESC 排序的列表里跳到最前面，锚点也会丢失。
+                    db.addNote(note.bookId, note.kind, note.content, note.id, note.createdAt, note.anchor, note.status)
+                    removedArtifact?.let { db.saveArtifact(it) }
                 }
                 localRevision++
             }
         }
     }
 
-    val notes = sourcedNotes
+    /** 打开笔记详情：先用列表里的数据即时上屏，再补上成果里的引用锚点。 */
+    fun openNoteDetail(note: Db.NoteDetail, book: Book?) {
+        val immediate = detailContentOf(note, book, emptyList())
+        detail = immediate
+        scope.launch {
+            val enriched = withContext(Dispatchers.IO) {
+                val fresh = db.getNoteDetail(note.id) ?: note
+                val artifact = db.listArtifacts(fresh.bookId)
+                    .firstOrNull { it.kind == fresh.kind && it.content == fresh.content }
+                detailContentOf(fresh, book, parseCitations(artifact?.citationsJson.orEmpty()))
+            }
+            // 用户已经关掉面板或切到了别的详情时不要覆盖
+            if (detail == immediate) detail = enriched
+        }
+    }
+
+    /** 把只存在于缓存里的成果补一条笔记，让它在笔记列表里也有入口。 */
+    fun saveArtifactAsNote(artifact: AiArtifact) {
+        scope.launch {
+            withContext(Dispatchers.IO) { db.ensureNoteForArtifact(artifact) }
+            detail = null
+            localRevision++
+        }
+    }
+
+    val loaded = data
     val failure = error
     BoxWithConstraints(Modifier.fillMaxSize()) {
         val pageWidth = if (maxWidth > 900.dp) 900.dp else maxWidth
@@ -884,8 +1059,8 @@ private fun NotesHubScreen(activity: MainActivity, revision: Int) {
             item { ScreenHeader("NOTES", "笔记中枢", "阅读摘记、AI 摘要和问答都汇在这里") }
             when {
                 failure != null -> item { WorkbenchErrorCard(failure, "无法读取本地笔记") { reloadTick++ } }
-                notes == null -> item { NotesHubLoadingCard() }
-                notes.isEmpty() -> item {
+                loaded == null -> item { NotesHubLoadingCard() }
+                loaded.notes.isEmpty() && loaded.artifacts.isEmpty() -> item {
                     GlassPanel(
                         modifier = Modifier.fillMaxWidth(),
                         shape = RoundedCornerShape(28.dp),
@@ -903,14 +1078,51 @@ private fun NotesHubScreen(activity: MainActivity, revision: Int) {
                         }
                     }
                 }
-                else -> items(notes, key = { it.first.id }) { (note, book) ->
-                    NoteHubCard(
-                        title = book?.title ?: "阅读报告",
-                        kind = noteKindLabel(note.kind, note.content),
-                        content = cleanNoteContent(note.content),
-                        onOpen = { book?.let { activity.openReader(it.id) } },
-                        onDelete = { pendingDelete = note }
-                    )
+                else -> {
+                    items(loaded.notes, key = { "note-${it.first.id}" }) { (note, book) ->
+                        NoteHubCard(
+                            title = book?.title ?: "阅读报告",
+                            kind = noteKindLabel(note.kind, note.content),
+                            content = cleanNoteContent(note.content),
+                            // bookId = 0 的全局阅读报告不属于任何一本书：正文直接铺开，也没有可跳转的来源
+                            expandBody = note.bookId == 0L,
+                            sourceHint = if (note.bookId == 0L) null else "点击查看全文",
+                            onOpen = { openNoteDetail(note, book) },
+                            onDelete = { pendingDelete = note }
+                        )
+                    }
+                    if (loaded.artifacts.isNotEmpty()) {
+                        item { SectionHeader("AI 成果", "生成过的理解包，关闭对话框后仍可回看") }
+                        items(loaded.artifacts, key = { "artifact-${it.artifact.id}" }) { row ->
+                            ArtifactHubCard(
+                                row = row,
+                                onOpen = {
+                                    detail = DetailContent(
+                                        title = row.bookTitle ?: "已不在书架的书目",
+                                        badge = NoteKindLabels.label(row.artifact.kind),
+                                        meta = "模型 ${row.artifact.model.ifBlank { "未知" }}  ·  ${relativeTime(row.artifact.updatedAt)}",
+                                        body = row.artifact.content,
+                                        anchors = row.anchors,
+                                        bookId = row.sourceBookId,
+                                        saveAsNoteArtifact = row.artifact.takeIf { !row.hasNote }
+                                    )
+                                },
+                                onOpenSource = row.sourceBookId?.let { id ->
+                                    {
+                                        detail = null
+                                        activity.openReader(id)
+                                    }
+                                },
+                                onSaveAsNote = { saveArtifactAsNote(row.artifact) },
+                                onDelete = {
+                                    scope.launch {
+                                        withContext(Dispatchers.IO) { db.deleteArtifact(row.artifact.id) }
+                                        localRevision++
+                                    }
+                                }
+                            )
+                        }
+                    }
                 }
             }
         }
@@ -918,13 +1130,26 @@ private fun NotesHubScreen(activity: MainActivity, revision: Int) {
             hostState = snackbarHostState,
             modifier = Modifier.align(Alignment.BottomCenter).padding(16.dp)
         )
+        detail?.let { request ->
+            DetailSheet(
+                request = request,
+                onOpenSource = {
+                    request.bookId?.let { id ->
+                        detail = null
+                        activity.openReader(id)
+                    }
+                },
+                onSaveAsNote = request.saveAsNoteArtifact?.let { artifact -> { saveArtifactAsNote(artifact) } },
+                onDismiss = { detail = null }
+            )
+        }
     }
 
     pendingDelete?.let { note ->
         AlertDialog(
             onDismissRequest = { pendingDelete = null },
             title = { Text("删除这条笔记？", fontWeight = FontWeight.Black) },
-            text = { Text("删除后可在底部提示中撤销。") },
+            text = { Text("删除后可在底部提示中撤销。若它来自 AI 生成，对应的 AI 成果也会一并删除，撤销时会一起恢复。") },
             confirmButton = {
                 TextButton(
                     onClick = { deleteWithUndo(note) },
@@ -938,11 +1163,48 @@ private fun NotesHubScreen(activity: MainActivity, revision: Int) {
     }
 }
 
+/** 笔记详情内容：状态为 unvalidated 时提示“未通过校验但已保留”。 */
+private fun detailContentOf(
+    note: Db.NoteDetail,
+    book: Book?,
+    extraAnchors: List<CitationAnchor>
+): DetailContent = DetailContent(
+    title = book?.title ?: "阅读报告",
+    badge = noteKindLabel(note.kind, note.content),
+    meta = relativeTime(note.createdAt) + if (note.status == "unvalidated") "  ·  校验未通过，已保留" else "",
+    body = cleanNoteContent(note.content),
+    anchors = (noteAnchors(note.anchor) + extraAnchors).distinct(),
+    bookId = book?.id
+)
+
+/** 解析成果 citationsJson（[{token,type,index,label,excerpt}]）为可点击锚点；坏数据直接忽略。 */
+private fun parseCitations(json: String): List<CitationAnchor> = runCatching {
+    val array = JSONArray(json)
+    buildList<CitationAnchor> {
+        for (index in 0 until array.length()) {
+            val item = array.optJSONObject(index) ?: continue
+            val token = item.optString("token").trim()
+            if (token.isBlank()) continue
+            add(CitationAnchor(token, item.optString("label").trim().ifBlank { token }))
+        }
+    }.distinct()
+}.getOrDefault(emptyList())
+
+/** 笔记 anchor 字段形如 CHAPTER:3 / PAGE:12，统一成 [CHAPTER:3] 形式展示。 */
+private fun noteAnchors(anchor: String): List<CitationAnchor> =
+    Regex("[A-Za-z]+\\s*:\\s*\\d+").findAll(anchor).map { match ->
+        val normalized = match.value.replace(" ", "")
+        CitationAnchor("[$normalized]", normalized)
+    }.distinct().toList()
+
 @Composable
 private fun NoteHubCard(
     title: String,
     kind: String,
     content: String,
+    expandBody: Boolean = false,
+    /** 为空表示没有可跳转的来源（如 bookId = 0 的全局阅读报告），此时不显示来源提示。 */
+    sourceHint: String? = null,
     onOpen: () -> Unit,
     onDelete: () -> Unit
 ) {
@@ -987,13 +1249,18 @@ private fun NoteHubCard(
             Spacer(Modifier.height(9.dp))
             Text(
                 content,
-                maxLines = 3,
-                overflow = TextOverflow.Ellipsis,
+                // 没有来源可跳转的全局报告直接在卡片里读全文，不再截成三行
+                maxLines = if (expandBody) Int.MAX_VALUE else 3,
+                overflow = if (expandBody) TextOverflow.Clip else TextOverflow.Ellipsis,
                 color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.86f)
             )
             Spacer(Modifier.height(10.dp))
             Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
-                Text("点击打开来源", modifier = Modifier.weight(1f), fontSize = 11.sp, color = secondaryText())
+                if (sourceHint != null) {
+                    Text(sourceHint, modifier = Modifier.weight(1f), fontSize = 11.sp, color = secondaryText())
+                } else {
+                    Spacer(Modifier.weight(1f))
+                }
                 TextButton(
                     onClick = {
                         haptics.performHapticFeedback(HapticFeedbackType.LongPress)
@@ -1001,6 +1268,189 @@ private fun NoteHubCard(
                     }
                 ) {
                     Text("删除", color = MaterialTheme.colorScheme.error, fontWeight = FontWeight.Bold)
+                }
+            }
+        }
+    }
+}
+
+/** AI 成果卡片：kind、模型、时间与引用锚点都直接可见，不必再打开对话框找。 */
+@Composable
+private fun ArtifactHubCard(
+    row: ArtifactRow,
+    onOpen: () -> Unit,
+    onOpenSource: (() -> Unit)?,
+    onSaveAsNote: () -> Unit,
+    onDelete: () -> Unit
+) {
+    GlassPanel(
+        modifier = Modifier.fillMaxWidth(),
+        shape = RoundedCornerShape(24.dp),
+        contentPadding = PaddingValues(17.dp),
+        elevation = 8.dp,
+        onClick = onOpen
+    ) {
+        Column {
+            Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+                Text(
+                    row.bookTitle ?: "已不在书架的书目",
+                    modifier = Modifier.weight(1f),
+                    fontWeight = FontWeight.Bold,
+                    color = ActiveViolet,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis
+                )
+                GlassPill(color = ActiveViolet) {
+                    Text(
+                        NoteKindLabels.label(row.artifact.kind),
+                        fontSize = 10.sp,
+                        color = ActiveViolet,
+                        fontWeight = FontWeight.Bold
+                    )
+                }
+            }
+            Spacer(Modifier.height(6.dp))
+            Text(
+                "模型 ${row.artifact.model.ifBlank { "未知" }}  ·  ${relativeTime(row.artifact.updatedAt)}",
+                fontSize = 10.sp,
+                color = secondaryText(),
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis
+            )
+            Spacer(Modifier.height(9.dp))
+            Text(
+                cleanNoteContent(row.artifact.content),
+                maxLines = 3,
+                overflow = TextOverflow.Ellipsis,
+                color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.86f)
+            )
+            if (row.anchors.isNotEmpty()) {
+                Spacer(Modifier.height(9.dp))
+                Row(Modifier.horizontalScroll(rememberScrollState()), horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                    row.anchors.take(8).forEach { anchor -> AnchorChip(anchor, onOpenSource) }
+                    if (row.anchors.size > 8) {
+                        Text("+${row.anchors.size - 8}", fontSize = 10.sp, color = secondaryText())
+                    }
+                }
+            }
+            Spacer(Modifier.height(8.dp))
+            Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+                Text(
+                    if (row.hasNote) "已在笔记列表中；删除笔记会一并删除成果" else "还没有对应笔记，仅存在于缓存",
+                    modifier = Modifier.weight(1f),
+                    fontSize = 11.sp,
+                    color = secondaryText(),
+                    maxLines = 2
+                )
+                if (!row.hasNote) {
+                    TextButton(onClick = onSaveAsNote) {
+                        Text("保存为笔记", color = ActiveViolet, fontWeight = FontWeight.Bold)
+                    }
+                    TextButton(onClick = onDelete) {
+                        Text("删除", color = MaterialTheme.colorScheme.error, fontWeight = FontWeight.Bold)
+                    }
+                }
+            }
+        }
+    }
+}
+
+/** 引用锚点：有原书时点击跳转到那本书（页枢暂不支持按锚点精确定位）。 */
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+private fun AnchorChip(anchor: CitationAnchor, onClick: (() -> Unit)?) {
+    AssistChip(
+        onClick = { onClick?.invoke() },
+        enabled = onClick != null,
+        label = { Text(anchor.label, fontSize = 11.sp, maxLines = 1) },
+        shape = RoundedCornerShape(14.dp)
+    )
+}
+
+/** 笔记与 AI 成果共用的详情面板：完整正文、引用锚点与来源跳转。 */
+@Composable
+private fun DetailSheet(
+    request: DetailContent,
+    onOpenSource: () -> Unit,
+    onSaveAsNote: (() -> Unit)?,
+    onDismiss: () -> Unit
+) {
+    val scrimInteraction = remember { MutableInteractionSource() }
+    val panelInteraction = remember { MutableInteractionSource() }
+    Box(
+        Modifier
+            .fillMaxSize()
+            .background(Color.Black.copy(alpha = 0.42f))
+            .clickable(interactionSource = scrimInteraction, indication = null, onClick = onDismiss)
+    ) {
+        GlassPanel(
+            modifier = Modifier
+                .align(Alignment.BottomCenter)
+                .fillMaxWidth()
+                // 面板自己吃掉点击，否则点在正文上会被蒙层当成“点击关闭”
+                .clickable(interactionSource = panelInteraction, indication = null) { }
+                .padding(horizontal = 10.dp)
+                .navigationBarsPadding(),
+            shape = RoundedCornerShape(28.dp),
+            contentPadding = PaddingValues(18.dp),
+            elevation = 24.dp
+        ) {
+            Column(Modifier.fillMaxWidth().heightIn(max = 560.dp)) {
+                Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+                    Text(
+                        request.title,
+                        modifier = Modifier.weight(1f),
+                        fontWeight = FontWeight.Black,
+                        maxLines = 2,
+                        overflow = TextOverflow.Ellipsis
+                    )
+                    Spacer(Modifier.width(8.dp))
+                    GlassPill(color = ActiveViolet) {
+                        Text(request.badge, fontSize = 10.sp, color = ActiveViolet, fontWeight = FontWeight.Bold)
+                    }
+                }
+                Spacer(Modifier.height(4.dp))
+                Text(request.meta, fontSize = 10.sp, color = secondaryText())
+                if (request.anchors.isNotEmpty()) {
+                    Spacer(Modifier.height(10.dp))
+                    Row(
+                        Modifier.horizontalScroll(rememberScrollState()),
+                        horizontalArrangement = Arrangement.spacedBy(6.dp)
+                    ) {
+                        request.anchors.forEach { anchor ->
+                            AnchorChip(anchor, if (request.bookId != null) onOpenSource else null)
+                        }
+                    }
+                }
+                Spacer(Modifier.height(12.dp))
+                Text(
+                    request.body,
+                    modifier = Modifier.weight(1f, fill = false).verticalScroll(rememberScrollState()),
+                    fontSize = 13.sp,
+                    color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.88f)
+                )
+                Spacer(Modifier.height(14.dp))
+                Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    if (request.bookId != null) {
+                        OutlinedButton(
+                            onClick = onOpenSource,
+                            modifier = Modifier.weight(1f),
+                            shape = RoundedCornerShape(16.dp)
+                        ) { Text("打开原书位置") }
+                    }
+                    if (onSaveAsNote != null) {
+                        OutlinedButton(
+                            onClick = onSaveAsNote,
+                            modifier = Modifier.weight(1f),
+                            shape = RoundedCornerShape(16.dp)
+                        ) { Text("保存为笔记") }
+                    }
+                    Button(
+                        onClick = onDismiss,
+                        modifier = Modifier.weight(1f),
+                        shape = RoundedCornerShape(16.dp),
+                        colors = ButtonDefaults.buttonColors(containerColor = ElectricBlue)
+                    ) { Text("关闭") }
                 }
             }
         }
@@ -1067,6 +1517,11 @@ private fun SettingsScreen(activity: MainActivity) {
     var modelPickerTarget by remember { mutableStateOf<String?>(null) }
     var modelDraft by remember { mutableStateOf("") }
     var confirmDeleteProfile by remember { mutableStateOf(false) }
+    // 有未保存修改时挂起的动作：参数为真表示先把草稿保存到当前配置，再执行原动作
+    var pendingDirtyAction by remember { mutableStateOf<((Boolean) -> Unit)?>(null) }
+    var pendingDuplicate by remember { mutableStateOf(false) }
+    var visionShowAll by remember { mutableStateOf(false) }
+    var presetHint by remember { mutableStateOf<String?>(null) }
     val scope = rememberCoroutineScope()
     val keyLoadToken = remember { intArrayOf(0) }
     val themeMode by activity.userPreferences.themeMode.collectAsStateWithLifecycle(initialValue = "system")
@@ -1096,8 +1551,16 @@ private fun SettingsScreen(activity: MainActivity) {
         modelsPath = modelsPath,
         authHeader = authHeader,
         authPrefix = authPrefix,
-        allowPrivateHttp = allowPrivateHttp
+        allowPrivateHttp = allowPrivateHttp,
+        // 已发现的模型随配置一起保存：切换配置或重进设置页都不必重新联网读取
+        models = discoveredModels
     )
+
+    /** 草稿与已保存配置是否有差异（只填了 Key 还没保存也算）。 */
+    fun isDirty(): Boolean {
+        val stored = profiles.firstOrNull { it.id == activeProfileId }
+        return keyInput.isNotBlank() || (stored != null && draftProfile() != stored)
+    }
 
     fun loadProfile(profile: SavedAiProfile) {
         activeProfileId = profile.id
@@ -1111,7 +1574,9 @@ private fun SettingsScreen(activity: MainActivity) {
         authPrefix = profile.authPrefix
         allowPrivateHttp = profile.allowPrivateHttp
         keyInput = ""
-        discoveredModels = emptyList()
+        discoveredModels = profile.models
+        visionShowAll = false
+        presetHint = null
         refreshSavedKey(profile.baseUrl)
     }
 
@@ -1139,7 +1604,7 @@ private fun SettingsScreen(activity: MainActivity) {
 
     fun applyPickedModel(rawModel: String) {
         val target = modelPickerTarget ?: return
-        val chosen = rawModel.trim().take(240)
+        val chosen = rawModel.trim()
         if (target == "text" && chosen.isBlank()) {
             status = "文本模型不能为空"
             return
@@ -1149,13 +1614,18 @@ private fun SettingsScreen(activity: MainActivity) {
         } else {
             draftProfile().copy(textModel = chosen)
         }
+        // 超长的模型名直接拒绝，不静默截断成另一个名字
+        AiProfileStore.lengthError(updated)?.let {
+            status = "保存模型失败：$it"
+            return
+        }
         scope.launch {
             val result = withContext(Dispatchers.IO) {
                 runCatching { AiProfileStore.save(db, updated, activate = true) }
             }
             val saved = result.getOrNull()
             if (saved == null) {
-                status = "保存模型失败：${AiClient.userFacingError(result.exceptionOrNull()!!)}"
+                status = "保存模型失败：${profileErrorMessage(result.exceptionOrNull()!!)}"
                 return@launch
             }
             if (target == "vision") visionModel = saved.visionModel else textModel = saved.textModel
@@ -1171,6 +1641,72 @@ private fun SettingsScreen(activity: MainActivity) {
         }
     }
 
+    /** 有未保存修改时先问一次，避免切换/新建/复制把半成品静默写进原配置。 */
+    fun withDirtyCheck(action: (saveDraftFirst: Boolean) -> Unit) {
+        if (isDirty()) pendingDirtyAction = action else action(false)
+    }
+
+    /** 切换当前调用配置；[saveDraftFirst] 为真时先把草稿保存到原来的配置。 */
+    suspend fun activateProfile(target: SavedAiProfile, saveDraftFirst: Boolean) {
+        if (saveDraftFirst) {
+            val saved = saveDraft(activate = false)
+            if (saved.isFailure) {
+                status = "切换失败：${profileErrorMessage(saved.exceptionOrNull()!!)}"
+                return
+            }
+        }
+        val activated = withContext(Dispatchers.IO) { AiProfileStore.setActive(db, target.id) }
+        if (activated == null) {
+            status = "切换失败：该配置已不存在"
+            return
+        }
+        loadProfile(activated)
+        status = "已切换到 ${activated.name}"
+    }
+
+    /** 新建空白配置；[saveDraftFirst] 为真时先把草稿保存到原来的配置。 */
+    suspend fun createProfile(saveDraftFirst: Boolean) {
+        if (saveDraftFirst) {
+            val saved = saveDraft(activate = false)
+            if (saved.isFailure) {
+                status = "新建失败：${profileErrorMessage(saved.exceptionOrNull()!!)}"
+                return
+            }
+        }
+        val result = withContext(Dispatchers.IO) { runCatching { AiProfileStore.create(db, "新配置") } }
+        val created = result.getOrNull()
+        if (created == null) {
+            status = "新建失败：${profileErrorMessage(result.exceptionOrNull()!!)}"
+            return
+        }
+        profiles = withContext(Dispatchers.IO) { AiProfileStore.list(db) }
+        loadProfile(created)
+        status = "已新建独立配置，请填写接口地址与模型"
+    }
+
+    /**
+     * 复制当前配置。[copyKey] 决定是否把 API Key 一并复制到新配置，
+     * 默认只复制接口元数据，避免同一个 Key 静默出现在两处。
+     */
+    suspend fun duplicateProfile(copyKey: Boolean) {
+        val saved = saveDraft().getOrNull()
+        if (saved == null) {
+            status = "复制失败：当前配置未能保存"
+            return
+        }
+        val result = withContext(Dispatchers.IO) {
+            runCatching { AiProfileStore.duplicate(db, saved, copyKey = copyKey) }
+        }
+        val copy = result.getOrNull()
+        if (copy == null) {
+            status = "复制失败：${profileErrorMessage(result.exceptionOrNull()!!)}"
+            return
+        }
+        profiles = withContext(Dispatchers.IO) { AiProfileStore.list(db) }
+        loadProfile(copy)
+        status = if (copyKey) "已复制配置及其 Key" else "已复制配置（未复制 Key，需要单独填写）"
+    }
+
     if (modelPickerTarget != null) {
         val isVisionPicker = modelPickerTarget == "vision"
         val presetModels = AiProviders.presets.mapNotNull { preset ->
@@ -1180,7 +1716,9 @@ private fun SettingsScreen(activity: MainActivity) {
         val modelOptions = (discoveredModels + presetModels + listOf(currentModel))
             .filter(String::isNotBlank)
             .distinct()
-        val filtered = modelOptions
+        // 视觉模型只列名字看起来支持图片输入的 id；命名不规则的模型用「显示全部」兜底
+        val visionOptions = modelOptions.filter { VISION_MODEL_HINT.containsMatchIn(it) }
+        val filtered = if (isVisionPicker && !visionShowAll && visionOptions.isNotEmpty()) visionOptions else modelOptions
         AlertDialog(
             onDismissRequest = { modelPickerTarget = null },
             title = { Text(if (isVisionPicker) "选择视觉模型" else "选择文本模型") },
@@ -1195,6 +1733,22 @@ private fun SettingsScreen(activity: MainActivity) {
                         color = secondaryText()
                     )
                     GlassTextField(modelDraft, { modelDraft = it }, "模型 ID")
+                    if (isVisionPicker) {
+                        Text(
+                            if (!visionShowAll && visionOptions.isNotEmpty()) {
+                                "只显示名称含 vl / vision / llava / omni 的模型（${visionOptions.size}/${modelOptions.size}）。"
+                            } else {
+                                "已列出全部候选（${modelOptions.size}）。名称含 vl / vision / llava / omni 的模型通常支持图片输入。"
+                            },
+                            fontSize = 10.sp,
+                            color = secondaryText()
+                        )
+                        if (visionOptions.size < modelOptions.size) {
+                            TextButton(onClick = { visionShowAll = !visionShowAll }) {
+                                Text(if (visionShowAll) "只看视觉模型" else "显示全部")
+                            }
+                        }
+                    }
                     if (filtered.isNotEmpty()) Text("候选模型（${filtered.size}）", fontWeight = FontWeight.Medium)
                     LazyColumn(Modifier.fillMaxWidth().heightIn(max = 280.dp)) {
                         items(filtered, key = { it }) { model ->
@@ -1224,22 +1778,95 @@ private fun SettingsScreen(activity: MainActivity) {
     }
 
     if (confirmDeleteProfile) {
+        // 删除后会激活相邻的配置：先算出是哪一份，确认框里就说清楚会切到哪个
+        val index = profiles.indexOfFirst { it.id == activeProfileId }
+        val fallback = if (index > 0) profiles.getOrNull(index - 1) else profiles.getOrNull(index + 1)
+        val currentName = profiles.firstOrNull { it.id == activeProfileId }?.name ?: profileName
         AlertDialog(
             onDismissRequest = { confirmDeleteProfile = false },
             title = { Text("删除 AI 配置？") },
-            text = { Text("将删除“$profileName”及其单独保存的 API Key，其他配置不受影响。") },
+            text = {
+                Text(
+                    "将删除「$currentName」及其单独保存的 API Key，其他配置不受影响。" +
+                        (fallback?.let { "删除后会自动切换到「${it.name}」。" } ?: "")
+                )
+            },
             confirmButton = {
                 TextButton(onClick = {
                     scope.launch {
-                        val next = withContext(Dispatchers.IO) { AiProfileStore.delete(db, activeProfileId) }
+                        val result = withContext(Dispatchers.IO) {
+                            runCatching { AiProfileStore.delete(db, activeProfileId) }
+                        }
+                        val next = result.getOrNull()
+                        confirmDeleteProfile = false
+                        if (next == null) {
+                            status = "删除失败：${profileErrorMessage(result.exceptionOrNull()!!)}"
+                            return@launch
+                        }
                         profiles = withContext(Dispatchers.IO) { AiProfileStore.list(db) }
                         loadProfile(next)
-                        confirmDeleteProfile = false
-                        status = "配置已删除"
+                        status = "已删除「$currentName」，当前配置切换为「${next.name}」"
                     }
                 }) { Text("删除", color = MaterialTheme.colorScheme.error) }
             },
             dismissButton = { TextButton(onClick = { confirmDeleteProfile = false }) { Text("取消") } }
+        )
+    }
+
+    // 切换/新建前发现草稿有改动：让用户决定写入原配置还是丢弃，绝不静默提交
+    pendingDirtyAction?.let { action ->
+        val currentName = profiles.firstOrNull { it.id == activeProfileId }?.name ?: profileName
+        AlertDialog(
+            onDismissRequest = { pendingDirtyAction = null },
+            title = { Text("保存对「$currentName」的修改？", fontWeight = FontWeight.Black) },
+            text = { Text("当前表单有未保存的修改。保存会写入「$currentName」；放弃则这些修改不会保留。") },
+            confirmButton = {
+                TextButton(onClick = {
+                    pendingDirtyAction = null
+                    action(true)
+                }) { Text("保存修改", fontWeight = FontWeight.Bold) }
+            },
+            dismissButton = {
+                Row {
+                    TextButton(onClick = {
+                        pendingDirtyAction = null
+                        action(false)
+                    }) { Text("放弃") }
+                    TextButton(onClick = { pendingDirtyAction = null }) { Text("取消") }
+                }
+            }
+        )
+    }
+
+    if (pendingDuplicate) {
+        AlertDialog(
+            onDismissRequest = { pendingDuplicate = false },
+            title = { Text("复制配置") },
+            text = {
+                Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                    Text("先保存当前表单，再复制成一份新配置。")
+                    Text(
+                        "默认只复制接口地址、路径与模型名；API Key 不会复制到新配置，需要在新配置里单独填写。",
+                        fontSize = 11.sp,
+                        color = secondaryText()
+                    )
+                }
+            },
+            confirmButton = {
+                TextButton(onClick = {
+                    pendingDuplicate = false
+                    scope.launch { duplicateProfile(copyKey = false) }
+                }) { Text("仅复制配置", fontWeight = FontWeight.Bold) }
+            },
+            dismissButton = {
+                Row {
+                    TextButton(onClick = {
+                        pendingDuplicate = false
+                        scope.launch { duplicateProfile(copyKey = true) }
+                    }) { Text("连 Key 一起复制") }
+                    TextButton(onClick = { pendingDuplicate = false }) { Text("取消") }
+                }
+            }
         )
     }
 
@@ -1347,16 +1974,10 @@ private fun SettingsScreen(activity: MainActivity) {
                                 FilterChip(
                                     selected = profile.id == activeProfileId,
                                     onClick = {
-                                        scope.launch {
-                                            val saved = saveDraft(activate = false)
-                                            if (saved.isFailure) {
-                                                status = "切换失败：${AiClient.userFacingError(saved.exceptionOrNull()!!)}"
-                                            } else {
-                                                val activated = withContext(Dispatchers.IO) {
-                                                    AiProfileStore.setActive(db, profile.id)
-                                                }
-                                                activated?.let(::loadProfile)
-                                                status = "已切换到 ${profile.name}"
+                                        // 切走之前先问一次未保存的草稿，避免静默写进原配置
+                                        if (profile.id != activeProfileId) {
+                                            withDirtyCheck { saveFirst ->
+                                                scope.launch { activateProfile(profile, saveFirst) }
                                             }
                                         }
                                     },
@@ -1368,29 +1989,15 @@ private fun SettingsScreen(activity: MainActivity) {
                         Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                             OutlinedButton(
                                 onClick = {
-                                    scope.launch {
-                                        saveDraft(activate = false)
-                                        val created = withContext(Dispatchers.IO) { AiProfileStore.create(db, "新配置") }
-                                        profiles = withContext(Dispatchers.IO) { AiProfileStore.list(db) }
-                                        loadProfile(created)
-                                        status = "已新建独立配置"
+                                    withDirtyCheck { saveFirst ->
+                                        scope.launch { createProfile(saveFirst) }
                                     }
                                 },
                                 modifier = Modifier.weight(1f),
                                 shape = RoundedCornerShape(15.dp)
                             ) { Text("新建") }
                             OutlinedButton(
-                                onClick = {
-                                    scope.launch {
-                                        val saved = saveDraft().getOrNull()
-                                        if (saved != null) {
-                                            val copy = withContext(Dispatchers.IO) { AiProfileStore.duplicate(db, saved) }
-                                            profiles = withContext(Dispatchers.IO) { AiProfileStore.list(db) }
-                                            loadProfile(copy)
-                                            status = "已复制配置及其 Key"
-                                        }
-                                    }
-                                },
+                                onClick = { pendingDuplicate = true },
                                 modifier = Modifier.weight(1f),
                                 shape = RoundedCornerShape(15.dp)
                             ) { Text("复制") }
@@ -1413,20 +2020,28 @@ private fun SettingsScreen(activity: MainActivity) {
                                         modelsPath = AiClient.DEFAULT_MODELS_PATH
                                         authHeader = AiClient.DEFAULT_AUTH_HEADER
                                         authPrefix = AiClient.DEFAULT_AUTH_PREFIX
-                                        allowPrivateHttp = false
+                                        // 局域网预设（如 Ollama）本身就走明文 HTTP，直接替用户打开开关
+                                        allowPrivateHttp = preset.allowPrivateHttp
+                                        presetHint = preset.hint.takeIf(String::isNotBlank)
                                         refreshSavedKey(preset.baseUrl)
-                                        discoveredModels = emptyList()
-                                        if (preset.id == "ollama") status = "本地 Ollama 使用 HTTP 时，请手动开启并确认局域网 HTTP"
+                                        status = null
                                     },
                                     label = { Text(preset.name) },
                                     shape = RoundedCornerShape(16.dp)
                                 )
                             }
                         }
+                        val ollamaHint = AiProviders.presets.firstOrNull { it.id == "ollama" }?.hint
+                        val activeHint = presetHint ?: ollamaHint?.takeIf { baseUrl.contains(AiProviders.OLLAMA_PLACEHOLDER_HOST) }
+                        activeHint?.let { hint ->
+                            GlassPill(color = ActiveViolet) {
+                                Text(hint, fontSize = 10.sp, color = MaterialTheme.colorScheme.onSurface)
+                            }
+                        }
                         GlassTextField(baseUrl, {
                             baseUrl = it
                             refreshSavedKey(it)
-                            discoveredModels = emptyList()
+                            // 已发现的模型按配置保存：改地址不再清空列表，避免每次敲键都要重新联网读取
                         }, "Base URL（含 https://、端口和基础路径）")
                         Text(
                             "请求体协议：OpenAI Chat Completions。下面的接口路径、鉴权方式和模型均可独立填写。",
@@ -1444,8 +2059,13 @@ private fun SettingsScreen(activity: MainActivity) {
                             value = visionModel,
                             onValueChange = { visionModel = it },
                             label = "视觉模型（可留空）",
-                            availableCount = discoveredModels.size,
-                            onPick = { modelDraft = visionModel; modelPickerTarget = "vision" }
+                            // 只统计看起来支持图片输入的模型，避免「选择 80」但只有 3 个真能用
+                            availableCount = discoveredModels.count { VISION_MODEL_HINT.containsMatchIn(it) },
+                            onPick = {
+                                modelDraft = visionModel
+                                visionShowAll = false
+                                modelPickerTarget = "vision"
+                            }
                         )
                         GlassTextField(chatPath, { chatPath = it }, "Chat 接口路径或完整 URL")
                         GlassTextField(modelsPath, { modelsPath = it }, "模型列表路径（留空则不读取）")
@@ -1553,7 +2173,7 @@ private fun SettingsScreen(activity: MainActivity) {
                                     scope.launch {
                                         val result = saveDraft()
                                         status = if (result.isSuccess) "“$profileName”已保存并设为当前配置"
-                                        else "保存失败：${AiClient.userFacingError(result.exceptionOrNull()!!)}"
+                                        else "保存失败：${profileErrorMessage(result.exceptionOrNull()!!)}"
                                     }
                                 },
                                 modifier = Modifier.weight(1f),
@@ -1564,7 +2184,7 @@ private fun SettingsScreen(activity: MainActivity) {
                                 enabled = !testing,
                                 onClick = {
                                     testing = true
-                                    status = "正在读取模型列表…"
+                                    status = "正在从接口读取模型…"
                                     scope.launch {
                                         val key = if (keyInput.isNotBlank()) keyInput else withContext(Dispatchers.IO) {
                                             db.getAiKey(activeProfileId, baseUrl)
@@ -1577,13 +2197,21 @@ private fun SettingsScreen(activity: MainActivity) {
                                         }
                                         testing = false
                                         fetch.onSuccess { models ->
-                                            discoveredModels = models
+                                            // 读取结果按配置持久化：换配置或重进设置页都不必重新联网
+                                            val refreshed = withContext(Dispatchers.IO) {
+                                                AiProfileStore.saveModels(db, activeProfileId, models)
+                                                AiProfileStore.list(db)
+                                            }
+                                            profiles = refreshed
+                                            // 以落库后的规范值作为草稿，避免与已保存配置产生「假差异」
+                                            discoveredModels = refreshed.firstOrNull { it.id == activeProfileId }?.models
+                                                ?: models
                                             status = if (models.isEmpty()) {
                                                 "模型列表接口已关闭，请手动填写模型"
                                             } else {
                                                 modelDraft = textModel
                                                 modelPickerTarget = "text"
-                                                "已读取 ${models.size} 个模型，请选择本次调用模型"
+                                                "已读取并保存 ${models.size} 个模型，请选择本次调用模型"
                                             }
                                         }.onFailure {
                                             status = "读取失败：${AiClient.userFacingError(it)}；仍可手动填写模型"
@@ -1592,7 +2220,7 @@ private fun SettingsScreen(activity: MainActivity) {
                                 },
                                 modifier = Modifier.weight(1f),
                                 shape = RoundedCornerShape(18.dp)
-                            ) { Text(if (testing) "读取中" else "读取模型") }
+                            ) { Text(if (testing) "读取中" else "从接口读取模型") }
                         }
                         OutlinedButton(
                             enabled = !testing,
@@ -1603,18 +2231,17 @@ private fun SettingsScreen(activity: MainActivity) {
                                     val key = if (keyInput.isNotBlank()) keyInput else withContext(Dispatchers.IO) {
                                         db.getAiKey(activeProfileId, baseUrl)
                                     }
+                                    val cfg = currentAiConfig(
+                                        baseUrl, key, textModel, visionModel, allowPrivateHttp,
+                                        chatPath, modelsPath, authHeader, authPrefix
+                                    )
+                                    // probe 会一并返回模型名、状态码、耗时与 token 用量，
+                                    // 比只判断「请求没抛异常」有用得多。
                                     val result = withContext(Dispatchers.IO) {
                                         runCatching {
-                                            AiClient.chat(
-                                                currentAiConfig(
-                                                    baseUrl, key, textModel, visionModel, allowPrivateHttp,
-                                                    chatPath, modelsPath, authHeader, authPrefix
-                                                ),
-                                                system = null,
-                                                user = "Reply with OK.",
-                                                timeoutMs = 30_000
-                                            )
-                                            "连接成功，当前模型可调用"
+                                            val probe = AiClient.probe(cfg)
+                                            val echo = probe.echo.trim().take(16)
+                                            probe.describe() + if (echo.isNotEmpty()) " · 回显「$echo」" else ""
                                         }.getOrElse { "连接失败：${AiClient.userFacingError(it)}" }
                                     }
                                     testing = false
@@ -1626,7 +2253,9 @@ private fun SettingsScreen(activity: MainActivity) {
                         ) { Text("测试当前模型") }
                         status?.let {
                             val failed = it.startsWith("连接失败") || it.startsWith("读取失败") ||
-                                it.startsWith("保存失败") || it.startsWith("切换失败")
+                                it.startsWith("保存失败") || it.startsWith("保存模型失败") ||
+                                it.startsWith("切换失败") || it.startsWith("新建失败") ||
+                                it.startsWith("复制失败") || it.startsWith("删除失败")
                             GlassPill(color = if (failed) MaterialTheme.colorScheme.error else LuminousCyan) {
                                 Text(it, fontSize = 11.sp, color = if (failed) MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.onSurface)
                             }
@@ -1780,6 +2409,11 @@ private fun currentAiConfig(
     authHeader = authHeader,
     authPrefix = authPrefix
 )
+
+/** 配置表单校验失败直接显示原文；其余异常交给 AiClient 做脱敏映射。 */
+private fun profileErrorMessage(error: Throwable): String =
+    (error as? AiProfileStore.ProfileValidationException)?.message?.takeIf(String::isNotBlank)
+        ?: AiClient.userFacingError(error)
 
 @Composable
 private fun glassTextFieldColors() = OutlinedTextFieldDefaults.colors(

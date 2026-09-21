@@ -11,6 +11,9 @@ import android.widget.FrameLayout
 import android.widget.LinearLayout
 import android.widget.ScrollView
 import android.widget.TextView
+import java.text.SimpleDateFormat
+import java.util.Date
+import java.util.Locale
 
 /** 阅读统计页：总览 + 近7日柱状图 + 时长 Top 榜 + AI 阅读报告 */
 class StatsView(private val act: Activity) : FrameLayout(act) {
@@ -294,23 +297,45 @@ class StatsView(private val act: Activity) : FrameLayout(act) {
             append("投入最多：" + tops.joinToString { "${it.title}(${formatMs(it.ms)})" } + "\n")
             append("近7天每日：$recent7")
         }
-        showAiProgress("正在分析你的阅读数据…")
-        // 可取消请求：视图分离时中断网络 I/O；已生成好的报告仍会落库，不静默丢弃
+        // 可取消请求：浮层点按或视图分离时中断网络 I/O；已生成好的报告仍会落库，不静默丢弃
         val token = AiClient.CancelToken().also { reportToken = it }
+        val pill = showAiProgress("生成中… 点按停止", token)
+        pill.contentDescription = "正在分析你的阅读数据，点按停止"
         Thread({
             var err: String? = null
             var reply = ""
+            var stored = ""
+            val streamed = StringBuilder()
             try {
                 reply = AiClient.withCancellation(token) {
                     AiClient.chat(cfg,
                         "你是一位温暖幽默的私人阅读顾问。用简体中文写一份简短的个性化阅读报告。",
                         "根据以下阅读数据写一份「阅读报告」：① 一句总体评价；② 阅读习惯观察 2 条；" +
                             "③ 一个具体可行的建议（比如下次读什么、什么时段读）；④ 一句鼓励。总共 200 字以内。" +
-                            "\n\n【数据】\n$data")
+                            "\n\n【数据】\n$data",
+                        onDelta = { delta ->
+                            streamed.append(delta)
+                            act.runOnUiThread {
+                                if (reportToken !== token || !isAttachedToWindow) return@runOnUiThread
+                                pill.text = "✨ " + streamed.toString().trim().takeLast(PROGRESS_TAIL_CHARS)
+                            }
+                        },
+                        onRestart = {
+                            // 断流重发：作废已上屏增量，避免「半截 + 全文」重复
+                            streamed.setLength(0)
+                            act.runOnUiThread {
+                                if (reportToken === token && isAttachedToWindow) pill.text = "✨ 生成中… 点按停止"
+                            }
+                        },
+                        timeoutMs = 120_000)
                 }
+                // 一行溯源：模型名 + 生成时间（token 用量待 AiClient.probe 落地后再补）
+                val model = cfg.model.ifBlank { "未知模型" }
+                val stamp = SimpleDateFormat("yyyy-MM-dd HH:mm", Locale.CHINA).format(Date())
+                stored = reply.trim().trimEnd() + "\n\n—— $model · $stamp"
                 // 全局报告用 bookId=0 作哨兵值；笔记中枢会放行 bookId==0，所以这里能显示出来。
                 // 先落库再回主线程：视图若已分离，结果也不该丢。
-                if (!token.isCancelled()) db.addNote(0, "report", reply)
+                if (!token.isCancelled()) db.addNote(0, "report", stored)
             } catch (t: Throwable) {
                 if (!token.isCancelled()) err = AiClient.userFacingError(t)
             }
@@ -327,15 +352,18 @@ class StatsView(private val act: Activity) : FrameLayout(act) {
                         .setPositiveButton("关闭", null).show().also { Glass.styleDialog(it, density(act)) }
                     else -> {
                         refresh()
-                        showReport(reply)
+                        showReport(stored.ifBlank { reply })
                     }
                 }
             }
         }, "yeshu-report").apply { isDaemon = true }.start()
     }
 
-    /** 不使用 ProgressDialog：它持有 Activity 窗口且无法取消；浮层随视图分离自动消失。 */
-    private fun showAiProgress(message: String) {
+    /**
+     * 不使用 ProgressDialog：它持有 Activity 窗口且无法取消；浮层随视图分离自动消失。
+     * 传入 token 时浮层可点按取消，并返回 TextView 供流式增量更新。
+     */
+    private fun showAiProgress(message: String, token: AiClient.CancelToken? = null): TextView {
         dismissAiProgress()
         val d = density(act)
         val tv = TextView(act).apply {
@@ -343,18 +371,32 @@ class StatsView(private val act: Activity) : FrameLayout(act) {
             textSize = 14f
             setTextColor(Color.WHITE)
             gravity = Gravity.CENTER
+            maxWidth = Glass.dp(300, d)
+            maxLines = 4
+            ellipsize = android.text.TextUtils.TruncateAt.END
             background = GradientDrawable().apply {
                 cornerRadius = Glass.dp(14, d).toFloat()
                 setColor(Color.argb(232, 26, 32, 52))
             }
             setPadding(Glass.dp(20, d), Glass.dp(14, d), Glass.dp(20, d), Glass.dp(14, d))
             elevation = Glass.dp(12, d).toFloat()
-            contentDescription = message
+            if (token != null) {
+                isClickable = true
+                foreground = Glass.pressFx()
+                contentDescription = "$message，点按停止"
+                setOnClickListener {
+                    token.cancel()
+                    dismissAiProgress()
+                }
+            } else {
+                contentDescription = message
+            }
         }
         addView(tv, LayoutParams(-2, -2, Gravity.BOTTOM or Gravity.CENTER_HORIZONTAL).apply {
             bottomMargin = Glass.dp(112, d)
         })
         aiProgress = tv
+        return tv
     }
 
     private fun dismissAiProgress() {
@@ -384,5 +426,10 @@ class StatsView(private val act: Activity) : FrameLayout(act) {
         })
         AlertDialog.Builder(act).setTitle("✨ AI 阅读报告").setView(sc)
             .setPositiveButton("关闭", null).show().also { Glass.styleDialog(it, density(act)) }
+    }
+
+    private companion object {
+        /** 流式进度浮层里回显的尾部字符数 */
+        const val PROGRESS_TAIL_CHARS = 80
     }
 }

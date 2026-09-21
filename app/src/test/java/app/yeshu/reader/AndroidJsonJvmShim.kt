@@ -54,6 +54,14 @@ class JSONObject {
 
     fun put(name: String, value: Any?): JSONObject = apply { values[name] = value }
 
+    // android.jar 的 org.json 有基本类型重载，生产代码针对它编译后会直接引用这些签名
+    // （例如 put("temperature", 0.3) → put(String, double)）。垫片缺了它们，
+    // 测试就会在运行时抛 NoSuchMethodError。
+    fun put(name: String, value: Double): JSONObject = apply { values[name] = value }
+    fun put(name: String, value: Int): JSONObject = apply { values[name] = value }
+    fun put(name: String, value: Long): JSONObject = apply { values[name] = value }
+    fun put(name: String, value: Boolean): JSONObject = apply { values[name] = value }
+
     /** 生产代码用 JSONObject.toString() 生成请求体，垫片必须实现它，否则请求体不是 JSON。 */
     override fun toString(): String =
         values.entries.joinToString(",", "{", "}") { (key, value) -> "${quoteJson(key)}:${renderJson(value)}" }
@@ -73,6 +81,11 @@ class JSONArray internal constructor(internal val values: MutableList<Any?>) {
     fun optJSONObject(index: Int): JSONObject? = values.getOrNull(index) as? JSONObject
 
     fun put(value: Any?): JSONArray = apply { values += value }
+
+    fun put(value: Double): JSONArray = apply { values += value }
+    fun put(value: Int): JSONArray = apply { values += value }
+    fun put(value: Long): JSONArray = apply { values += value }
+    fun put(value: Boolean): JSONArray = apply { values += value }
 
     override fun toString(): String = values.joinToString(",", "[", "]") { renderJson(it) }
 }

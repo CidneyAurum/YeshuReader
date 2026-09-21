@@ -248,7 +248,15 @@ object NoteKindLabels {
         "report" to "报告",
         "intro" to "书籍简介",
         "study_pack" to "理解包",
-        "quiz_grade" to "批改"
+        "quiz_grade" to "批改",
+        // 阅读器段落级操作现在会落库（原先 kind=null 直接丢弃），需要各自的标签，
+        // 否则这些产出在笔记列表里都显示成通用「笔记」。
+        "explain" to "解释",
+        "translate" to "翻译",
+        "continue" to "续写",
+        "recap" to "前情",
+        "cast" to "人物",
+        "note" to "笔记"
     )
 
     /** 展示顺序（筛选 chips 等按此序渲染），与 [all] 的键保持一致 */

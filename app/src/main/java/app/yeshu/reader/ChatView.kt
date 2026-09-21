@@ -41,7 +41,8 @@ class ChatView(
     }
 
     companion object {
-        private const val MAX_HISTORY = 12          // 送入模型的轮数上限
+        // 送入模型的字符预算：按字符而非条数截断，长回答不会把更早的轮次挤出上下文
+        private const val MAX_HISTORY_CHARS = 6000
         private val ACCENT = Color.parseColor("#0A84FF")  // iOS 系统蓝
     }
 
@@ -132,7 +133,8 @@ class ChatView(
             val lp = LinearLayout.LayoutParams(Glass.dp(64, d), Glass.dp(48, d))
             lp.marginStart = Glass.dp(8, d)
             layoutParams = lp
-            setOnClickListener { send() }
+            // 生成中同一个键变成「停止」：点按中断网络 I/O，不用等 120s 超时
+            setOnClickListener { if (busy) cancelGeneration() else send() }
         }
         inputBar.addView(btnSend)
         col.addView(inputBar, LinearLayout.LayoutParams(-1, -2))
@@ -150,17 +152,66 @@ class ChatView(
         }
     }
 
-    /** 从 notes 表重建最近聊天（kind=chat，content 前缀 U:/A: 区分角色） */
+    /** 从 notes 表重建聊天（kind=chat，content 前缀 U:/A: 区分角色） */
     private fun loadHistory() {
-        // DAO returns newest first. Keep the newest window, then replay oldest -> newest.
-        val rows = db.listNotes(bookId, "chat").take(MAX_HISTORY).reversed()
-        for (r in rows) {
+        // DAO 返回 newest first；反转成 oldest -> newest 后按时间重放
+        val rows = db.listNotes(bookId, "chat").reversed()
+        var i = 0
+        while (i < rows.size) {
+            val row = rows[i]
             when {
-                r.content.startsWith("U:") -> { history.add("user" to r.content.removePrefix("U:")); bubble("user", r.content.removePrefix("U:")) }
-                r.content.startsWith("A:") -> { history.add("assistant" to r.content.removePrefix("A:")); bubble("assistant", r.content.removePrefix("A:")) }
+                row.content.startsWith("U:") -> {
+                    // 没有紧邻回答的提问是中断残留（取消/失败）：跳过，不重放给模型也不上屏
+                    if (rows.getOrNull(i + 1)?.content?.startsWith("A:") != true) { i++; continue }
+                    val text = row.content.removePrefix("U:")
+                    history.add("user" to text)
+                    bubble("user", text)
+                }
+                row.content.startsWith("A:") -> {
+                    val text = row.content.removePrefix("A:")
+                    history.add("assistant" to text)
+                    bubble("assistant", text)
+                }
             }
+            i++
         }
         scrollToBottom()
+    }
+
+    /**
+     * 按字符预算截取最近若干轮：从最新往回取，直到超出 [MAX_HISTORY_CHARS]。
+     * 只按条数截断会让一条长回答挤掉好几轮更早的对话。
+     */
+    private fun budgetedHistory(): List<Pair<String, String>> {
+        val picked = ArrayDeque<Pair<String, String>>()
+        var used = 0
+        for (index in history.indices.reversed()) {
+            val turn = history[index]
+            val cost = turn.second.length + 8
+            if (picked.isNotEmpty() && used + cost > MAX_HISTORY_CHARS) break
+            picked.addFirst(turn)
+            used += cost
+        }
+        return picked.toList()
+    }
+
+    /** 生成中把发送键切成停止键；点按立即中断网络 I/O */
+    private fun cancelGeneration() {
+        val token = chatToken ?: return
+        token.cancel()
+        // 先给即时反馈；真正的收尾由请求线程回主线程完成
+        btnSend.text = "停止中…"
+        btnSend.isEnabled = false
+        btnSend.contentDescription = "正在停止生成"
+    }
+
+    /** 发送/停止两态：切换文案与可点状态，避免生成中只剩一个禁用按钮 */
+    private fun setSendButton(generating: Boolean) {
+        busy = generating
+        btnSend.text = if (generating) "停止" else "发送"
+        btnSend.contentDescription = if (generating) "停止生成" else "发送消息"
+        btnSend.isEnabled = true
+        btnSend.alpha = 1f
     }
 
     private fun send() {
@@ -169,18 +220,18 @@ class ChatView(
         etInput.setText("")
         history.add("user" to text)
         bubble("user", text)
-        db.addNote(bookId, "chat", "U:$text")
+        // 记下 pending 行 id：请求被取消时要回滚，避免留下没有回答的提问
+        val pendingId = db.addNote(bookId, "chat", "U:$text")
         scrollToBottom()
 
-        busy = true
-        btnSend.isEnabled = false
-        btnSend.alpha = 0.5f
-        // 思考占位气泡
+        setSendButton(true)
+        // 思考占位气泡：流式增量会持续替换它的内容
         val thinking = bubble("assistant", "…")
         scrollToBottom()
 
-        // 可取消请求：视图分离（离开页面/销毁 Activity）时中断网络 I/O 且不落库
+        // 可取消请求：视图分离（离开页面/销毁 Activity）或点按停止时中断网络 I/O 且不落库
         val token = AiClient.CancelToken().also { chatToken = it }
+        val streamed = StringBuilder()
         Thread({
             val cfg = AiClient.config(db)
             val ready = AiClient.isReady(cfg)
@@ -192,7 +243,25 @@ class ChatView(
                         AiClient.chatHistory(
                             cfg,
                             system = buildSystem(),
-                            history = history.takeLast(MAX_HISTORY),
+                            history = budgetedHistory(),
+                            onDelta = { delta ->
+                                streamed.append(delta)
+                                act.runOnUiThread {
+                                    // 已取消/已换请求/已分离：增量不再上屏
+                                    if (token.isCancelled() || chatToken !== token || !isAttachedToWindow) {
+                                        return@runOnUiThread
+                                    }
+                                    thinking.text = streamed.toString()
+                                    scrollToBottom()
+                                }
+                            },
+                            onRestart = {
+                                // 断流重发：作废已上屏的增量，避免「半截 + 全文」重复
+                                streamed.setLength(0)
+                                act.runOnUiThread {
+                                    if (chatToken === token && isAttachedToWindow) thinking.text = "…"
+                                }
+                            },
                             timeoutMs = 120_000
                         )
                     }
@@ -201,15 +270,18 @@ class ChatView(
                 }
             }
             val cancelled = token.isCancelled()
+            // 取消的提问不留在库里：否则下次进入会被当成没有回答的一轮重放
+            if (cancelled) runCatching { db.deleteNote(pendingId) }
             act.runOnUiThread {
                 if (chatToken === token) chatToken = null
                 // 视图已分离时不再触碰 UI，也不写入数据库
                 if (!isAttachedToWindow) return@runOnUiThread
-                busy = false
-                btnSend.isEnabled = true
-                btnSend.alpha = 1f
+                setSendButton(false)
                 when {
                     cancelled -> {
+                        // 同时回滚内存历史里的这轮提问，避免下次又把它当上下文发出去
+                        val last = history.lastOrNull()
+                        if (last?.first == "user" && last.second == text) history.removeAt(history.lastIndex)
                         thinking.text = "（已取消，未保存）"
                         thinking.alpha = 0.6f
                     }
@@ -225,6 +297,7 @@ class ChatView(
                     else -> {
                         val value = reply.orEmpty().trim()
                         thinking.text = value
+                        thinking.alpha = 1f
                         history.add("assistant" to value)
                         db.addNote(bookId, "chat", "A:$value")
                     }
@@ -241,13 +314,31 @@ class ChatView(
         super.onDetachedFromWindow()
     }
 
-    /** system：书名 + 当前章上下文 + 行为约束 */
+    /** system：书名 + 当前章上下文 + 行为约束（输出语言跟随书籍正文，而不是固定中文） */
     private fun buildSystem(): String {
         val book = db.getBook(bookId)
         val ctx = chapterContext.take(2800)
+        val hint = languageHint(ctx.ifBlank { book?.title.orEmpty() })
         return "你是《${book?.title ?: "本书"}》的阅读伴侣。以下是读者正在阅读的章节内容：\n\n$ctx\n\n" +
             "要求：基于章节内容回答读者的提问；读者问到章节之外时坦诚说明并给出合理推测；" +
-            "语气友好自然，回答简洁有信息量；用中文回复。"
+            "语气友好自然，回答简洁有信息量；输出语言：与书籍主要语言一致" +
+            (hint?.let { "（本书正文为$it）" } ?: "") + "。"
+    }
+
+    /**
+     * 书籍主要语言的弱判断。DocumentAiService.detectLanguage 尚未落地，
+     * 这里只按正文字符脚本兜底，避免英文/日文书拿到中文回答。
+     */
+    private fun languageHint(sample: String): String? {
+        val cjk = sample.count { it.code in 0x4E00..0x9FFF }
+        val kana = sample.count { it.code in 0x3040..0x30FF }
+        val latin = sample.count { it.isLetter() && it.code < 0x250 }
+        return when {
+            kana > 20 -> "日语"
+            cjk > 20 && cjk >= latin / 3 -> "简体中文"
+            latin > 20 -> "英语"
+            else -> null
+        }
     }
 
     /** 气泡：user 右对齐蓝色，assistant 左对齐深灰卡。返回内部 TextView 供后续更新。 */

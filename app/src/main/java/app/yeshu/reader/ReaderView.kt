@@ -9,10 +9,15 @@ import android.graphics.Typeface
 import android.graphics.pdf.PdfRenderer
 import android.os.ParcelFileDescriptor
 import android.text.SpannableString
+import android.text.SpannableStringBuilder
 import android.text.Spanned
 import android.text.TextPaint
 import android.text.method.LinkMovementMethod
 import android.text.style.ClickableSpan
+import android.text.style.ForegroundColorSpan
+import android.text.style.LeadingMarginSpan
+import android.text.style.RelativeSizeSpan
+import android.text.style.StyleSpan
 import android.util.SparseArray
 import android.view.Gravity
 import android.view.View
@@ -22,14 +27,19 @@ import android.widget.LinearLayout
 import android.widget.ScrollView
 import android.widget.TextView
 import android.widget.EditText
+import app.yeshu.reader.ai.AiProfileStore
 import app.yeshu.reader.ai.DocumentAiService
+import app.yeshu.reader.ai.SavedAiProfile
 import app.yeshu.reader.parse.Block
 import app.yeshu.reader.parse.DocParser
+import app.yeshu.reader.parse.ParseException
+import app.yeshu.reader.parse.ParsedDoc
 import java.io.File
 import java.net.URI
 import java.util.concurrent.Executors
 import java.util.concurrent.RejectedExecutionException
 import java.util.concurrent.atomic.AtomicBoolean
+import java.util.zip.ZipFile
 import kotlin.math.max
 import kotlin.math.min
 
@@ -50,6 +60,16 @@ class ReaderView(
         private const val PDF_BITMAP_CACHE_BYTES = 48L * 1024 * 1024
         private const val PDF_DEFAULT_PAGE_RATIO = 1.4142f
         private const val PDF_SIZE_SCAN_BATCH = 12
+        /** PDF/图片图像发送确认：用户确认过一次后不再重复询问 */
+        private const val SETTING_VISION_SEND_CONFIRMED = "ai_vision_send_confirmed"
+        /** AI 结果里的 Markdown 标题强调色（与引用链接同色系） */
+        private val AI_HEAD_ACCENT = Color.parseColor("#5B5FF5")
+        private val BOLD_RE = Regex("\\*\\*(.+?)\\*\\*")
+        /** pptx 幻灯片标题形如「第 3 张幻灯片」「— 第 3 页 —」，与 DocumentAiService 的识别规则一致 */
+        private val PPT_SLIDE_RE = Regex("^—?\\s*第\\s*(\\d+)\\s*页\\s*—?$")
+        private val MD_HEADING_RE = Regex("^#{1,6}\\s+.+$")
+        /** 结果里的可跳转引用，例如 [PARAGRAPH:12]、[PAGE:3] */
+        private val CITATION_RE = Regex("\\[(PAGE|SLIDE|CHAPTER|PARAGRAPH):(\\d+)]")
 
         // 三套阅读配色：背景、正文和标题必须作为一个主题整体切换。
         val LIGHT_BG = Color.parseColor("#F7F8FB")
@@ -80,10 +100,26 @@ class ReaderView(
     /** 章节标题索引 [(blockIndex, title)]，顶栏联动与目录共用 */
     private var tocHeads: List<Pair<Int, String>> = emptyList()
     private var docFullText: String = ""
-    private val aiCancelled = java.util.concurrent.atomic.AtomicBoolean(false)
-    private var aiCancelToken: AiClient.CancelToken? = null
-    /** 当前流式 AI 对话框：detach 时必须主动关闭，否则工作线程仍持有已分离的视图树 */
-    private var aiDialog: android.app.Dialog? = null
+
+    /**
+     * 单次流式 AI 任务的私有状态：每个对话框只取消自己的 token。
+     * 之前用模块级单例，第二个任务会覆盖第一个的 token，第一个对话框的「停止」随之失效。
+     */
+    private class AiTask {
+        val cancelled = AtomicBoolean(false)
+        val token = AiClient.CancelToken()
+        var dialog: android.app.Dialog? = null
+    }
+
+    /** Markdown 渲染结果：可上屏的 spans + 各标题的字符偏移（供章节 chip 跳转） */
+    private class AiMarkdown(
+        val text: SpannableStringBuilder,
+        val sections: List<Pair<String, Int>>
+    )
+
+    /** 同一时刻只允许一个 AI 流式任务，避免两个对话框并存、状态互相覆盖 */
+    private var activeAiTask: AiTask? = null
+    private val pal by lazy { LegacyPalette.of(act) }
 
     // 文本分段渲染状态
     private var boxRef: LinearLayout? = null
@@ -139,6 +175,10 @@ class ReaderView(
     private var pdfTopsWidth = -1
     private var pdfBitmapBytes = 0L
     private var imageBitmap: Bitmap? = null
+
+    /** 图片集（CBZ）已解出的页文件与位图，分离时统一回收。 */
+    private var archivePageFiles: List<File> = emptyList()
+    private val archiveBitmaps = mutableListOf<Bitmap>()
     private var imageView: ImageView? = null
 
     // 长按连发循环：detach 时必须移除已排队的回调，否则空转并持有整棵视图树
@@ -538,7 +578,7 @@ class ReaderView(
 
         val sv = ScrollView(act).apply {
             isFillViewport = true
-            setBackgroundColor(if (bookFormat == "pdf" || isImageFormat(bookFormat)) themeStage() else themeBackground())
+            setBackgroundColor(if (bookFormat == "pdf" || isImageFormat(bookFormat) || isImageArchive(bookFormat)) themeStage() else themeBackground())
         }
         col.addView(sv, LinearLayout.LayoutParams(-1, 0, 1f))
         sc = sv
@@ -546,6 +586,7 @@ class ReaderView(
         try {
             when {
                 bookFormat == "pdf" -> setupPdf(f, sv)
+                isImageArchive(bookFormat) -> setupImageArchive(f, sv)
                 isImageFormat(bookFormat) -> setupImage(f, sv)
                 else -> setupBlocks(f, sv)
             }
@@ -702,6 +743,12 @@ class ReaderView(
     private fun setupBlocks(f: File, sv: ScrollView) {
         val d = density(act)
         val doc = DocParser.parseText(f)
+        // 图片型文档（漫画包、纯图片的固定版式 EPUB）解析出的是一份页清单，
+        // 正文只有一行摘要；必须改走页渲染，否则用户只看到「共 N 页」这句提示。
+        if (doc.pageEntries.isNotEmpty()) {
+            renderImageArchive(f, sv, doc)
+            return
+        }
         docBlocks = doc.blocks
         tocHeads = doc.blocks.mapIndexedNotNull { i, b ->
             if (b.type == Block.HEADING) i to b.text else null
@@ -816,7 +863,7 @@ class ReaderView(
         return if (real >= 0) real else estimatedBlockIndex()
     }
 
-    private fun makeBlockView(b: Block): TextView {
+    private fun makeBlockView(b: Block, index: Int): TextView {
         val d = density(act)
         val tv = TextView(act)
         if (b.type == Block.HEADING) {
@@ -837,7 +884,8 @@ class ReaderView(
             tv.setLineSpacing(0f, 1.38f)
             tv.setPadding(Glass.dp(20, d), Glass.dp(6, d), Glass.dp(20, d), Glass.dp(6, d))
             if (b.text.length > 4) {
-                tv.setOnLongClickListener { explainBlock(b.text); true }
+                // 长按菜单要写回块锚点，必须把块下标一并带进去（收藏金句需要可定位的来源）
+                tv.setOnLongClickListener { explainBlock(b.text, index); true }
                 // 单击段落 = 切换沉浸模式（iBooks 式）
                 tv.setOnClickListener { toggleBars() }
             }
@@ -1002,7 +1050,7 @@ class ReaderView(
         val blocks = docBlocks ?: return
         val end = min(blocks.size, renderedUpTo + n)
         for (i in renderedUpTo until end) {
-            box.addView(makeBlockView(blocks[i]), box.childCount - 1, LayoutParams(-1, -2))
+            box.addView(makeBlockView(blocks[i], i), box.childCount - 1, LayoutParams(-1, -2))
         }
         renderedUpTo = end
     }
@@ -1020,8 +1068,116 @@ class ReaderView(
 
     // ---------- PDF：惰性按需渲染 ----------
 
+    /** 单图格式（按图片通道渲染）。与 DocParser 的图片格式集合保持一致。 */
     private fun isImageFormat(format: String): Boolean =
-        format.lowercase() in setOf("jpg", "jpeg", "png")
+        format.lowercase() in setOf("jpg", "jpeg", "png", "webp", "gif", "bmp")
+
+    /** 图片集（漫画包）：按页纵向排列，与单图的渲染方式不同。 */
+    private fun isImageArchive(format: String): Boolean = format.lowercase() == "cbz"
+
+    /**
+     * 图片集（CBZ）渲染：把压缩包里的图片页解到应用私有目录，然后按阅读顺序纵向排列。
+     *
+     * 用纵向长条而不是逐页翻页，是为了复用现有的滚动容器与进度计算——
+     * 翻页模式需要另写一套手势与页码状态，收益不成比例。
+     * 每页前面放一个页码标题，这样目录跳转与章节名都能工作。
+     */
+    private fun setupImageArchive(f: File, sv: ScrollView) {
+        val doc = DocParser.parseText(f)
+        if (doc.pageEntries.isEmpty()) throw ParseException("图片集内没有图片")
+        renderImageArchive(f, sv, doc)
+    }
+
+    /** 图片型文档的页渲染：解包页面并按顺序纵向排列。 */
+    private fun renderImageArchive(f: File, sv: ScrollView, doc: ParsedDoc) {
+        val d = density(act)
+        val dir = File(act.filesDir, "cbz_$bookId").apply { mkdirs() }
+        val pages = mutableListOf<File>()
+        ZipFile(f).use { zip ->
+            doc.pageEntries.forEachIndexed { index, entryName ->
+                val target = File(dir, "page_%05d%s".format(index, entryName.substringAfterLast('.').let { ".$it" }))
+                if (!target.isFile || target.length() == 0L) {
+                    val e = zip.getEntry(entryName) ?: return@forEachIndexed
+                    // 单页上限：漫画单页通常几百 KB，超过 24MB 的一定不是正常页面
+                    zip.getInputStream(e).use { input ->
+                        target.outputStream().use { output ->
+                            val buffer = ByteArray(64 * 1024)
+                            var total = 0L
+                            while (true) {
+                                val read = input.read(buffer)
+                                if (read < 0) break
+                                total += read
+                                if (total > 24L * 1024 * 1024) throw ParseException("图片集内单页过大")
+                                output.write(buffer, 0, read)
+                            }
+                        }
+                    }
+                }
+                pages += target
+            }
+        }
+        if (pages.isEmpty()) throw ParseException("图片集内没有可读取的图片")
+
+        docBlocks = pages.mapIndexed { i, _ -> Block(Block.HEADING, "第 ${i + 1} 页") }
+        tocHeads = docBlocks!!.mapIndexed { i, b -> i to b.text }
+        docFullText = "图片集：共 ${pages.size} 页"
+        renderedUpTo = pages.size
+
+        val box = LinearLayout(act).apply {
+            orientation = LinearLayout.VERTICAL
+            setBackgroundColor(themeStage())
+        }
+        boxRef = box
+        sv.addView(box, LayoutParams(-1, -2))
+
+        archivePageFiles = pages
+        pages.forEachIndexed { index, page ->
+            val label = TextView(act).apply {
+                text = "第 ${index + 1} 页"
+                textSize = 12f
+                setTextColor(Color.argb(150, 255, 255, 255))
+                setBackgroundColor(themeStage())
+                setPadding(Glass.dp(14, d), Glass.dp(6, d), Glass.dp(14, d), Glass.dp(6, d))
+            }
+            box.addView(label, LayoutParams(-1, -2))
+            val image = ImageView(act).apply {
+                adjustViewBounds = true
+                scaleType = ImageView.ScaleType.FIT_CENTER
+                setBackgroundColor(themeStage())
+                setOnClickListener { toggleBars() }
+            }
+            // 按屏宽下采样解码，避免一次性把整本漫画的原图读进内存
+            val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
+            BitmapFactory.decodeFile(page.absolutePath, bounds)
+            var sample = 1
+            while (bounds.outWidth / (sample * 2) >= 1440) sample *= 2
+            val bitmap = BitmapFactory.decodeFile(
+                page.absolutePath,
+                BitmapFactory.Options().apply {
+                    inSampleSize = sample
+                    inPreferredConfig = Bitmap.Config.ARGB_8888
+                }
+            )
+            if (bitmap != null) {
+                archiveBitmaps += bitmap
+                image.setImageBitmap(bitmap)
+            } else {
+                label.text = "第 ${index + 1} 页（无法解码）"
+            }
+            box.addView(image, LayoutParams(-1, -2))
+        }
+        val pad = View(act)
+        box.addView(pad, LayoutParams(-1, Glass.dp(60, d)))
+
+        // 恢复进度
+        val p = db.getBook(bookId)?.progress ?: 0f
+        if (p > 0.001f && p < 0.999f) {
+            sv.post {
+                val range = (box.height - sv.height).coerceAtLeast(0)
+                sv.scrollTo(0, (range * p).toInt())
+            }
+        }
+    }
 
     /** Large photos are sampled before decode so importing a camera image cannot exhaust RAM. */
     private fun setupImage(f: File, sv: ScrollView) {
@@ -1329,7 +1485,8 @@ class ReaderView(
     // ---------- AI 功能 ----------
 
     private fun showAiMenu() {
-        val options = arrayOf("💬 和书聊聊", "✨ 生成理解包", "全文摘要", "内容问答", "出题自测", "前情提要", "人物速查")
+        // 标签必须说实话：这两个功能只读前若干页/前 24k 字符，不能叫「全文」
+        val options = arrayOf("💬 和书聊聊", "✨ 生成理解包", "前段摘要", "节选问答", "出题自测", "前情提要", "人物速查")
         android.app.AlertDialog.Builder(act)
             .setTitle("AI 助手")
             .setItems(options) { _, which ->
@@ -1352,23 +1509,26 @@ class ReaderView(
     fun openAiWorkbench() = showAiMenu()
 
     /** A source-addressable, cached package: summary, outline, concepts, findings, flashcards and quiz. */
-    private fun studyPackAction() {
-        val cfg = aiReady() ?: return
+    private fun studyPackAction(cfgOverride: AiClient.Config? = null) {
+        val cfg = cfgOverride ?: (aiReady() ?: return)
         val item = db.getBook(bookId) ?: return
         val file = File(act.filesDir, item.fileName)
-        val provider = runCatching { URI(AiClient.normalizeBase(cfg.baseUrl)).host }.getOrNull()
-            ?: cfg.baseUrl.take(48)
+        val provider = providerHost()
         when {
             bookFormat == "pdf" -> {
                 val total = pdfRenderer?.pageCount ?: 0
                 if (total <= 0) return showResult("提示", "PDF 没有可分析页面")
+                val front = (0 until min(8, total)).toList()
                 android.app.AlertDialog.Builder(act)
-                    .setTitle("生成理解包")
-                    .setMessage("目标服务：$provider\n只会发送你选择的页面图像。主要结论必须带可验证页码引用。")
+                    // 标题必须写明会发出哪些页，用户才能判断这次上传的范围
+                    .setTitle("生成理解包 · ${visionRangeTitle(front)}")
+                    .setMessage("目标服务：$provider\n只会发送你选择的页面图像，文档原文件不会上传。主要结论必须带可验证页码引用。\n确认后不再重复询问。")
                     .setPositiveButton("前 ${min(8, total)} 页") { _, _ ->
-                        generateVisualStudyPack(item, file, cfg, (0 until min(8, total)).toList(), false)
+                        db.setSetting(SETTING_VISION_SEND_CONFIRMED, "1")
+                        generateVisualStudyPack(item, file, cfg, front, false)
                     }
                     .setNeutralButton("当前页") { _, _ ->
+                        db.setSetting(SETTING_VISION_SEND_CONFIRMED, "1")
                         generateVisualStudyPack(item, file, cfg, listOf(currentPdfPageIndex()), false)
                     }
                     .setNegativeButton("取消", null)
@@ -1376,16 +1536,22 @@ class ReaderView(
             }
             isImageFormat(bookFormat) -> {
                 android.app.AlertDialog.Builder(act)
-                    .setTitle("理解这张图片")
+                    .setTitle("理解这张图片 · 将发送当前图片")
                     .setMessage("目标服务：$provider\n将发送当前图片给已配置的视觉模型；不配置视觉模型时不会尝试伪识别。")
-                    .setPositiveButton("继续") { _, _ -> generateVisualStudyPack(item, file, cfg, listOf(0), true) }
+                    .setPositiveButton("继续") { _, _ ->
+                        db.setSetting(SETTING_VISION_SEND_CONFIRMED, "1")
+                        generateVisualStudyPack(item, file, cfg, listOf(0), true)
+                    }
                     .setNegativeButton("取消", null)
                     .show().also { Glass.styleDialog(it, density(act)) }
             }
             else -> {
                 android.app.AlertDialog.Builder(act)
                     .setTitle("生成理解包")
-                    .setMessage("目标服务：$provider\n范围：全文结构化抽样，最多 ${DocumentAiService.DEFAULT_CONTEXT_CHARS / 1000}k 字符。文档原文件不会上传。")
+                    .setMessage(
+                        "目标服务：$provider\n范围：全文结构化抽样，最多 ${DocumentAiService.MAX_CONTEXT_CHARS / 1000}k 字符" +
+                            "（本文 ${docFullText.length / 1000}k 字符）。文档原文件不会上传。"
+                    )
                     .setPositiveButton("继续") { _, _ -> generateTextStudyPack(item, file, cfg) }
                     .setNegativeButton("取消", null)
                     .show().also { Glass.styleDialog(it, density(act)) }
@@ -1395,13 +1561,29 @@ class ReaderView(
 
     private fun generateTextStudyPack(item: Book, file: File, cfg: AiClient.Config) {
         val service = DocumentAiService(db)
-        runAiStream(null, "文档理解包") { onDelta, onReason, onRestart ->
-            when (val prepared = service.prepare(item, file, cfg)) {
+        // 校验结果由 call 内部写入，validate 在 call 返回后读取，用于决定是否保留正文
+        var validation: String? = null
+        // 命中缓存时不重复落笔记：只有真正生成过才在 onDone 里写
+        var generated = false
+        val scope = "范围：全文结构化抽样，最多 ${DocumentAiService.MAX_CONTEXT_CHARS / 1000}k 字符" +
+            if (docFullText.isNotBlank()) "（本文 ${docFullText.length / 1000}k 字符）" else ""
+        runAiStream(
+            kind = null,
+            title = "文档理解包",
+            cfg = cfg,
+            scopeLine = scope,
+            validate = { validation },
+            onKeep = { text -> persistStudyPack(text, "unvalidated") },
+            onDone = { text -> if (generated) persistStudyPack(text, "") },
+            onRetry = { alt -> generateTextStudyPack(item, file, alt) }
+        ) { onDelta, onReason, onRestart ->
+            when (val prepared = service.prepare(item, file, cfg, DocumentAiService.MAX_CONTEXT_CHARS)) {
                 is DocumentAiService.Preparation.Cached -> {
                     onDelta(prepared.artifact.content)
                     prepared.artifact.content
                 }
                 is DocumentAiService.Preparation.Ready -> {
+                    generated = true
                     val request = prepared.request
                     val output = AiClient.chat(
                         cfg,
@@ -1411,8 +1593,13 @@ class ReaderView(
                         onReason = onReason,
                         onRestart = onRestart
                     )
-                    service.saveCompleted(request, output)
-                    persistStudyPack(output)
+                    // 校验失败不再抛到对话框顶部把正文整段冲掉：先记下原因，正文照常上屏
+                    validation = try {
+                        service.saveCompleted(request, output)
+                        null
+                    } catch (e: DocumentAiService.InvalidModelOutputException) {
+                        e.message ?: "模型输出未通过校验"
+                    }
                     output
                 }
             }
@@ -1430,88 +1617,113 @@ class ReaderView(
             showResult("未配置视觉模型", "请在设置中单独填写视觉模型。页枢不会把文本模型伪装成图片识别模型。")
             return
         }
-        val service = DocumentAiService(db)
-        runAiStream(null, if (singleImage) "图片理解包" else "PDF 理解包") { onDelta, onReason, onRestart ->
-            val pages = if (singleImage) {
-                listOfNotNull(imageBitmap?.copy(Bitmap.Config.ARGB_8888, false))
-            } else {
-                collectPdfPages(pageIndices)
-            }
-            if (pages.isEmpty()) throw IllegalStateException("没有可发送的页面图像")
-            try {
-                val anchorType = if (singleImage) AnchorType.IMAGE else AnchorType.PAGE
-                val anchorNumbers = if (singleImage) listOf(1) else pageIndices.map { it + 1 }
-                val anchors = anchorNumbers.map { number ->
-                    DocumentAnchor(
-                        anchorType,
-                        number,
-                        if (singleImage) "当前图片" else "第 $number 页",
-                        if (singleImage) "用户选择的图片" else "PDF 第 $number 页图像"
+        val label = if (singleImage) "图片理解包" else "PDF 理解包"
+        val rangeTitle = if (singleImage) "将发送当前图片" else visionRangeTitle(pageIndices)
+        // 与摘要/问答/出题共用同一个确认入口：首次确认后不再重复询问
+        confirmVisionSend(
+            label,
+            rangeTitle,
+            "目标服务：${providerHost()}\n只会发送这些页面的图像，文档原文件不会上传。"
+        ) {
+            val service = DocumentAiService(db)
+            var validation: String? = null
+            // 命中缓存时不重复落笔记
+            var generated = false
+            val scope = if (singleImage) "范围：当前图片" else pdfScope(pageIndices)
+            runAiStream(
+                kind = null,
+                title = label,
+                cfg = cfg,
+                scopeLine = scope,
+                validate = { validation },
+                onKeep = { text -> persistStudyPack(text, "unvalidated") },
+                onDone = { text -> if (generated) persistStudyPack(text, "") },
+                onRetry = { alt -> generateVisualStudyPack(item, file, alt, pageIndices, singleImage) }
+            ) { onDelta, onReason, onRestart ->
+                val pages = if (singleImage) {
+                    listOfNotNull(imageBitmap?.copy(Bitmap.Config.ARGB_8888, false))
+                } else {
+                    collectPdfPages(pageIndices)
+                }
+                if (pages.isEmpty()) throw IllegalStateException("没有可发送的页面图像")
+                try {
+                    val anchorType = if (singleImage) AnchorType.IMAGE else AnchorType.PAGE
+                    val anchorNumbers = if (singleImage) listOf(1) else pageIndices.map { it + 1 }
+                    val anchors = anchorNumbers.map { number ->
+                        DocumentAnchor(
+                            anchorType,
+                            number,
+                            if (singleImage) "当前图片" else "第 $number 页",
+                            if (singleImage) "用户选择的图片" else "PDF 第 $number 页图像"
+                        )
+                    }
+                    val context = DocumentAiService.AnchoredContext(
+                        text = anchors.joinToString("\n") { "[${it.type.name}:${it.index}] ${it.label}" },
+                        anchors = anchors,
+                        includedSegments = anchors.size,
+                        totalSegments = if (singleImage) 1 else (pdfRenderer?.pageCount ?: anchors.size),
+                        truncated = !singleImage && anchors.size < (pdfRenderer?.pageCount ?: anchors.size),
+                        maxChars = DocumentAiService.MAX_CONTEXT_CHARS
                     )
+                    val request = DocumentAiService.PreparedRequest(
+                        bookId = item.id,
+                        title = item.title,
+                        documentHash = DocumentAiService.resolveDocumentHash(item, file),
+                        model = cfg.visionModel,
+                        promptVersion = DocumentAiService.PROMPT_VERSION,
+                        kind = DocumentAiService.KIND_STUDY_PACK,
+                        context = context,
+                        systemPrompt = DocumentAiService.buildSystemPrompt(),
+                        userPrompt = DocumentAiService.buildStudyPackPrompt(
+                            item.title,
+                            if (singleImage) "image" else "pdf",
+                            context
+                        ) + "\n图像按以下顺序提供：" + anchors.joinToString { "[${it.type.name}:${it.index}]" }
+                    )
+                    service.findCached(request)?.let { cached ->
+                        onDelta(cached.content)
+                        return@runAiStream cached.content
+                    }
+                    generated = true
+                    val output = AiClient.chatVision(
+                        cfg,
+                        request.systemPrompt,
+                        request.userPrompt,
+                        pages,
+                        onDelta,
+                        onReason = onReason,
+                        onRestart = onRestart
+                    )
+                    validation = try {
+                        service.saveCompleted(request, output)
+                        null
+                    } catch (e: DocumentAiService.InvalidModelOutputException) {
+                        e.message ?: "模型输出未通过校验"
+                    }
+                    output
+                } finally {
+                    pages.forEach { it.recycle() }
                 }
-                val context = DocumentAiService.AnchoredContext(
-                    text = anchors.joinToString("\n") { "[${it.type.name}:${it.index}] ${it.label}" },
-                    anchors = anchors,
-                    includedSegments = anchors.size,
-                    totalSegments = if (singleImage) 1 else (pdfRenderer?.pageCount ?: anchors.size),
-                    truncated = !singleImage && anchors.size < (pdfRenderer?.pageCount ?: anchors.size),
-                    maxChars = DocumentAiService.DEFAULT_CONTEXT_CHARS
-                )
-                val request = DocumentAiService.PreparedRequest(
-                    bookId = item.id,
-                    title = item.title,
-                    documentHash = DocumentAiService.resolveDocumentHash(item, file),
-                    model = cfg.visionModel,
-                    promptVersion = DocumentAiService.PROMPT_VERSION,
-                    kind = DocumentAiService.KIND_STUDY_PACK,
-                    context = context,
-                    systemPrompt = DocumentAiService.buildSystemPrompt(),
-                    userPrompt = DocumentAiService.buildStudyPackPrompt(
-                        item.title,
-                        if (singleImage) "image" else "pdf",
-                        context
-                    ) + "\n图像按以下顺序提供：" + anchors.joinToString { "[${it.type.name}:${it.index}]" }
-                )
-                service.findCached(request)?.let { cached ->
-                    onDelta(cached.content)
-                    return@runAiStream cached.content
-                }
-                val output = AiClient.chatVision(
-                    cfg,
-                    request.systemPrompt,
-                    request.userPrompt,
-                    pages,
-                    onDelta,
-                    onReason = onReason,
-                    onRestart = onRestart
-                )
-                service.saveCompleted(request, output)
-                persistStudyPack(output)
-                output
-            } finally {
-                pages.forEach { it.recycle() }
             }
         }
     }
 
     /**
      * 理解包同时落一条笔记：ai_artifacts 只有 AI 内部缓存会读，对话框关闭后用户再无入口查看。
-     * 只在真正生成（saveCompleted）后写，命中缓存时不重复落库，避免同一内容堆积多条笔记。
+     * 只在真正生成（saveCompleted）或用户点「仍要保存」时写，命中缓存时不重复落库。
+     * [status] 为 "unvalidated" 表示校验未通过但用户选择保留。
      */
-    private fun persistStudyPack(content: String) {
-        if (content.isBlank()) return
-        try {
-            // kind 与 ai_artifacts 的 kind 保持一致，笔记列表按 kind 过滤时也认得出
-            db.addNote(bookId, DocumentAiService.KIND_STUDY_PACK, content)
-        } catch (_: Exception) {}
+    private fun persistStudyPack(content: String, status: String = "") {
+        // kind 与 ai_artifacts 的 kind 保持一致，笔记列表按 kind 过滤时也认得出
+        saveAiNote(DocumentAiService.KIND_STUDY_PACK, content, "", status)
     }
 
     /** 前情提要：当前章之前的内容浓缩，追长篇防忘剧情 */
-    private fun recapAction() {
-        val cfg = aiReady() ?: return
+    private fun recapAction(cfgOverride: AiClient.Config? = null) {
+        val cfg = cfgOverride ?: (aiReady() ?: return)
         val blocks = docBlocks
         if (blocks == null || tocHeads.isEmpty()) {
-            showResult("提示", "本书没有章节结构，无法定位「当前章之前」的内容。\n可以改用「内容问答」。")
+            showResult("提示", "本书没有章节结构，无法定位「当前章之前」的内容。\n可以改用「节选问答」。")
             return
         }
         // 块高差异大：当前块按真实可见位置取，不能用比例反推
@@ -1522,25 +1734,73 @@ class ReaderView(
             showResult("提示", "你还在第一章开头，没有「前情」可讲～")
             return
         }
-        val before = blocks.drop((start - 60).coerceAtLeast(0)).take(60)
-            .joinToString("\n") { it.text }
-        runAiStream("recap", "前情提要") { onDelta, onReason, onRestart ->
+        // 只取当前章前 60 块根本讲不清「到目前为止」：改为对整段前文做带锚点的结构化抽样
+        val before = blocks.subList(0, start)
+        val context = runCatching {
+            DocumentAiService.buildAnchoredContext(
+                ParsedDoc(bookFormat.ifBlank { "txt" }, before, before.joinToString("\n") { it.text }),
+                bookFormat,
+                DocumentAiService.MAX_CONTEXT_CHARS
+            )
+        }.getOrNull()
+        val material = context?.text?.takeIf { it.isNotBlank() } ?: fallbackRecapExcerpt(blocks, start)
+        val scope = if (context != null) {
+            "范围：前文节选（已发送 ${context.includedSegments}/${context.totalSegments} 段，约 ${material.length / 1000}k 字符）"
+        } else {
+            "范围：前文节选（章节标题 + 各章末段，约 ${material.length / 1000}k 字符）"
+        }
+        runAiStream(
+            kind = "recap",
+            title = "前情提要",
+            cfg = cfg,
+            scopeLine = scope,
+            onRetry = { alt -> recapAction(alt) }
+        ) { onDelta, onReason, onRestart ->
             AiClient.chat(cfg, SYS_PROMPT,
-                "读者正在读长篇/资料，下面是当前章节之前的内容节选。请用约 200 字梳理「到目前为止发生了什么」：" +
-                    "关键事件、出场人物及其动机、留下的悬念。只输出提要正文。\n\n【前文开始】\n${before.take(18000)}\n【前文结束】",
+                "读者正在读长篇/资料，下面是当前章节之前的带锚点节选（[CHAPTER:n] 是章节，[PARAGRAPH:n] 是段落）。" +
+                    "请用约 250 字梳理「到目前为止发生了什么」：关键事件、出场人物及其动机、留下的悬念。只输出提要正文。" +
+                    "\n\n【前文开始】\n$material\n【前文结束】",
                 onDelta, onReason = onReason, onRestart = onRestart)
         }
     }
 
+    /**
+     * 前情提要兜底：锚点上下文不可用时，用「每章标题 + 该章末 6 块」拼出「到目前为止」的骨架。
+     * 只保留末段是为了在预算内覆盖尽可能多的章节，而不是把开头几十块铺满。
+     */
+    private fun fallbackRecapExcerpt(blocks: List<Block>, start: Int): String {
+        val heads = tocHeads.filter { it.first < start }
+        if (heads.isEmpty()) {
+            return blocks.subList(0, start).takeLast(60).joinToString("\n") { it.text }.take(24000)
+        }
+        val out = StringBuilder()
+        heads.forEachIndexed { i, head ->
+            val headIndex = head.first
+            val end = if (i + 1 < heads.size) heads[i + 1].first else start
+            out.append("【").append(head.second).append("】\n")
+            out.append(
+                blocks.subList((headIndex + 1).coerceAtMost(end), end).takeLast(6).joinToString("\n") { it.text }
+            ).append("\n")
+        }
+        return out.toString().take(24000)
+    }
+
     /** 人物速查：从当前章提取出场人物与身份 */
-    private fun castAction() {
-        val cfg = aiReady() ?: return
+    private fun castAction(cfgOverride: AiClient.Config? = null) {
+        val cfg = cfgOverride ?: (aiReady() ?: return)
         val chapter = currentChapterText()
         if (chapter.isBlank()) { showResult("提示", "当前章节没有可分析文本"); return }
-        runAiStream("cast", "人物速查") { onDelta, onReason, onRestart ->
+        val sent = chapter.take(12000)
+        runAiStream(
+            kind = "cast",
+            title = "人物速查",
+            cfg = cfg,
+            scopeLine = "范围：当前章节前 ${sent.length / 1000}k 字符（共 ${chapter.length / 1000}k）",
+            onRetry = { alt -> castAction(alt) }
+        ) { onDelta, onReason, onRestart ->
             AiClient.chat(cfg, SYS_PROMPT,
                 "从下面的章节内容中提取出场人物（最多 6 个）。每个人物一行：「名字 —— 身份/角色 + 当前状态或动机」，" +
-                    "按重要性排序。若为非小说类文档，则提取核心概念/术语代替人物。\n\n${chapter.take(12000)}",
+                    "按重要性排序。若为非小说类文档，则提取核心概念/术语代替人物。\n\n$sent",
                 onDelta, onReason = onReason, onRestart = onRestart)
         }
     }
@@ -1566,7 +1826,7 @@ class ReaderView(
         if (!AiClient.isReady(cfg)) {
             android.app.AlertDialog.Builder(act)
                 .setTitle("未配置 AI")
-                .setMessage("请先在书架右上角「AI 设置」填写接口地址、Key 和模型名。\nPDF 功能需要支持图片输入的视觉模型。")
+                .setMessage("请先在书架「更多」→「AI 设置」填写接口地址、Key 和模型名。\nPDF 功能需要支持图片输入的视觉模型。")
                 .setPositiveButton("知道了", null)
                 .show().also { Glass.styleDialog(it, density(act)) }
             return null
@@ -1596,17 +1856,51 @@ class ReaderView(
         return (pageViews.size - 1).coerceAtLeast(0)
     }
 
-    /** 流式 AI 任务：对话框内打字机输出 + 推理模型思考区，成功自动存笔记（kind=null 不存） */
+    /**
+     * 流式 AI 任务：对话框内打字机输出 + 推理模型思考区。
+     * [kind] 非空时成功结果自动落笔记；[validate] 返回非空表示校验未通过——
+     * 此时正文保留上屏，只在上方压一条横幅，并提供「重试 / 仍要保存」。
+     * [scopeLine] 是这次实际读取的范围说明；[onRetry] 用于「重新生成 / 换模型重试」。
+     */
     private fun runAiStream(
         kind: String?,
         title: String,
+        cfg: AiClient.Config? = null,
+        scopeLine: String? = null,
+        anchor: String = "",
+        validate: ((String) -> String?)? = null,
+        onKeep: ((String) -> Unit)? = null,
+        onRetry: ((AiClient.Config) -> Unit)? = null,
         onDone: ((String) -> Unit)? = null,
         call: (onDelta: (String) -> Unit, onReason: (String) -> Unit, onRestart: () -> Unit) -> String
     ) {
+        if (activeAiTask != null) {
+            // 并发任务会留下两个对话框，且「停止」只作用于其中一个，直接拒绝比假装成功更诚实
+            showResult("已有任务进行中", "请先关闭或停止当前的 AI 任务，再发起新的请求。")
+            return
+        }
         val d = density(act)
-        aiCancelled.set(false)
-        val cancelToken = AiClient.CancelToken().also { aiCancelToken = it }
-        val scroll = ScrollView(act)
+        val task = AiTask()
+        activeAiTask = task
+        val modelName = cfg?.model.orEmpty()
+        val titleWithModel = if (modelName.isBlank()) title else "$title · $modelName"
+
+        // 范围说明常驻标题下方：用户必须知道这次到底读了哪一段
+        val scopeTv = TextView(act).apply {
+            textSize = 11.5f
+            setTextColor(pal.textS)
+            setPadding(Glass.dp(22, d), Glass.dp(10, d), Glass.dp(22, d), 0)
+            visibility = if (scopeLine.isNullOrBlank()) View.GONE else View.VISIBLE
+            text = scopeLine.orEmpty()
+        }
+        // 校验/错误横幅：压在正文上方，正文本身不再被整段替换
+        val bannerTv = TextView(act).apply {
+            textSize = 12.5f
+            setTextColor(Color.parseColor("#B3261E"))
+            setLineSpacing(Glass.dp(2, d).toFloat(), 1.1f)
+            setPadding(Glass.dp(22, d), Glass.dp(10, d), Glass.dp(22, d), 0)
+            visibility = View.GONE
+        }
         // 推理模型思考区：灰色小字流式滚动，正文开始后收起为一行摘要
         val thinkTv = TextView(act).apply {
             textSize = 12f
@@ -1623,55 +1917,166 @@ class ReaderView(
             setTextColor(Color.parseColor("#222222"))
             setLineSpacing(Glass.dp(4, d).toFloat(), 1f)
             setPadding(Glass.dp(22, d), Glass.dp(12, d), Glass.dp(22, d), Glass.dp(20, d))
+            // 流式结果以前只能干看着，连复制都做不到
+            setTextIsSelectable(true)
+        }
+        val sectionRow = horizontalChipRow().apply { visibility = View.GONE }
+        val actionRow = horizontalChipRow()
+        val footerTv = TextView(act).apply {
+            textSize = 11f
+            setTextColor(pal.textT)
+            setPadding(Glass.dp(22, d), 0, Glass.dp(22, d), Glass.dp(8, d))
         }
         val box = LinearLayout(act).apply {
             orientation = LinearLayout.VERTICAL
             addView(thinkTv)
             addView(tv)
         }
+        val scroll = ScrollView(act)
         scroll.addView(box)
-        val dlgBuilder = android.app.AlertDialog.Builder(act)
-        dlgBuilder.setTitle("$title · 生成中")
-        dlgBuilder.setView(scroll)
-        dlgBuilder.setNegativeButton("停止") { _, _ ->
-                aiCancelled.set(true)
-                cancelToken.cancel()
+        val outer = LinearLayout(act).apply {
+            orientation = LinearLayout.VERTICAL
+            addView(scopeTv)
+            addView(bannerTv)
+            addView(sectionRow)
+            addView(scroll, LinearLayout.LayoutParams(-1, Glass.dp(320, d)))
+            addView(actionRow)
+            addView(footerTv)
         }
+        val dlgBuilder = android.app.AlertDialog.Builder(act)
+        dlgBuilder.setTitle("$titleWithModel · 生成中")
+        dlgBuilder.setView(outer)
+        // 停止/重试等动作都放在正文下方的 chip 行里，避免按钮文字与状态不一致
         dlgBuilder.setPositiveButton("关闭", null)
         val dlg = dlgBuilder.create()
+        task.dialog = dlg
         // 任何关闭方式（返回键、点外部、代码 dismiss）都要取消请求，否则「已取消」的生成仍会写进笔记
         dlg.setOnDismissListener {
-            aiCancelled.set(true)
-            cancelToken.cancel()
-            if (aiDialog === dlg) aiDialog = null
+            task.cancelled.set(true)
+            task.token.cancel()
+            if (activeAiTask === task) activeAiTask = null
         }
-        aiDialog = dlg
         dlg.show()
         Glass.styleDialog(dlg, density(act))
+
         val lastUi = longArrayOf(0L)
+        val replyRef = arrayOf("")
+        val sectionsRef = arrayOf<List<Pair<String, Int>>>(emptyList())
+
+        fun renderBody(text: String) {
+            val md = renderAiMarkdown(text)
+            applyCitationSpans(md.text)
+            sectionsRef[0] = md.sections
+            tv.text = md.text
+            tv.movementMethod = LinkMovementMethod.getInstance()
+            tv.highlightColor = Color.TRANSPARENT
+        }
+
+        fun refreshSectionChips() {
+            val sections = sectionsRef[0]
+            if (sections.isEmpty()) {
+                sectionRow.visibility = View.GONE
+                return
+            }
+            fillChipRow(sectionRow, sections.map { (name, offset) ->
+                aiChip(name) { scrollToSection(scroll, tv, offset) }
+            })
+        }
+
+        fun retry(alt: AiClient.Config?) {
+            val target = alt ?: cfg
+            val action = onRetry
+            if (target == null || action == null) {
+                toast("这次结果不支持重试")
+                return
+            }
+            // 先关旧对话框（会清空 activeAiTask），否则新任务会被「已有任务进行中」挡住
+            dlg.dismiss()
+            action(target)
+        }
+
+        fun pickProfileForRetry() {
+            val current = cfg?.model.orEmpty()
+            val others = AiProfileStore.list(db)
+                .filter { it.textModel.trim().isNotBlank() && it.textModel.trim() != current }
+            if (others.isEmpty()) {
+                toast("没有其他可切换的模型配置")
+                return
+            }
+            android.app.AlertDialog.Builder(act)
+                .setTitle("换模型重试")
+                .setItems(others.map { "${it.name} · ${it.textModel}" }.toTypedArray()) { _, which ->
+                    retry(configForProfile(others[which]))
+                }
+                .setNegativeButton("取消", null)
+                .show().also { Glass.styleDialog(it, density(act)) }
+        }
+
+        fun showActions(streaming: Boolean, keepable: Boolean) {
+            val chips = mutableListOf<TextView>()
+            if (streaming) {
+                chips += aiChip("停止") {
+                    task.cancelled.set(true)
+                    task.token.cancel()
+                }
+            } else {
+                chips += aiChip("复制") { copyAiText(title, replyRef[0]) }
+                chips += aiChip("分享") { shareAiText(title, replyRef[0]) }
+                if (kind == null && replyRef[0].isNotBlank()) {
+                    chips += aiChip("存为笔记") {
+                        saveAiNote("note", replyRef[0], anchor, "")
+                        toast("已存为笔记")
+                    }
+                }
+                if (keepable) {
+                    chips += aiChip("重试") { retry(null) }
+                    chips += aiChip("仍要保存") {
+                        val content = replyRef[0]
+                        // onKeep 存在时由调用方决定 kind（理解包要写 study_pack），避免同一内容落两条笔记
+                        if (onKeep != null) {
+                            onKeep.invoke(content)
+                        } else {
+                            saveAiNote(kind ?: "note", content, anchor, "unvalidated")
+                        }
+                        toast("已按「未校验」保存")
+                        dlg.dismiss()
+                    }
+                } else {
+                    chips += aiChip("重新生成") { retry(null) }
+                }
+                if (onRetry != null && cfg != null) chips += aiChip("换模型重试") { pickProfileForRetry() }
+                chips += aiChip("关闭") { dlg.dismiss() }
+            }
+            fillChipRow(actionRow, chips)
+        }
+
+        showActions(streaming = true, keepable = false)
+        footerTv.text = "模型：${modelName.ifBlank { "未配置" }} · 生成中"
+
         // 工作线程必须是 daemon：否则对话框已关、界面已 detach，进程仍被这条线程吊住
         val worker = Thread {
             var err: String? = null
+            var problem: String? = null
             var reply = ""
             val acc = StringBuilder()
             val rAcc = StringBuilder()
             try {
-                reply = AiClient.withCancellation(cancelToken) {
+                reply = AiClient.withCancellation(task.token) {
                     call({ delta ->
                         acc.append(delta)
                         if (rAcc.isNotEmpty()) {
                             act.runOnUiThread { thinkTv.text = "💭 已深度思考 ${rAcc.length} 字" }
                         }
                         val now = System.currentTimeMillis()
-                        if (!aiCancelled.get() && now - lastUi[0] > 150) {
+                        if (!task.cancelled.get() && now - lastUi[0] > 150) {
                             lastUi[0] = now
                             act.runOnUiThread {
-                                tv.text = acc.toString()
+                                renderBody(acc.toString())
                                 scroll.post { scroll.fullScroll(View.FOCUS_DOWN) }
                             }
                         }
                     }, { reason ->
-                        if (aiCancelled.get()) return@call
+                        if (task.cancelled.get()) return@call
                         rAcc.append(reason)
                         act.runOnUiThread {
                             thinkTv.visibility = View.VISIBLE
@@ -1687,32 +2092,64 @@ class ReaderView(
                     })
                 }
                 if (reply.isBlank()) throw RuntimeException("模型返回为空")
+                problem = validate?.invoke(reply)
             } catch (t: Throwable) {
-                if (!aiCancelled.get()) err = t.message ?: t.toString()
+                // 统一走 AiClient 的中文错误文案，不再把英文异常原文糊到用户脸上
+                if (!task.cancelled.get()) err = AiClient.userFacingError(t)
             }
             val e = err
-            // 取消状态在这里取一次快照：笔记落库已移到工作线程，UI 分支必须与它判断一致
-            val cancelled = aiCancelled.get()
+            val issue = problem
+            // 取消状态在这里取一次快照：笔记落库在工作线程，UI 分支必须与它判断一致
+            val cancelled = task.cancelled.get()
             // 笔记写库放到工作线程（Room 允许主线程查询，但写库会卡住同一帧的界面刷新）；
-            // 仍然先落库、再上屏，保证用户看到 ✓ 时笔记一定已经存好。
-            if (e == null && !cancelled && kind != null) {
-                try { db.addNote(bookId, kind, reply) } catch (_: Exception) {}
+            // 先落库、再上屏，保证用户看到 ✓ 时笔记一定已经存好。
+            // 校验未通过时不自动落库，改由用户点「仍要保存」再写（status=unvalidated）。
+            if (e == null && issue == null && !cancelled && kind != null) {
+                saveAiNote(kind, reply, anchor, "")
             }
             act.runOnUiThread {
-                if (aiCancelToken === cancelToken) aiCancelToken = null
+                // 已被新任务接管时不能再改界面，否则会清掉新任务的状态
+                if (activeAiTask !== task) return@runOnUiThread
+                replyRef[0] = reply.ifBlank { acc.toString() }
                 when {
                     cancelled -> {
-                        dlg.setTitle("$title · 已停止")
-                        tv.text = acc.toString() + "\n\n（已停止，未保存到笔记）"
+                        dlg.setTitle("$titleWithModel · 已停止")
+                        renderBody(acc.toString().ifBlank { "（已停止，没有收到内容）" })
+                        bannerTv.visibility = View.VISIBLE
+                        bannerTv.text = "已停止，未保存到笔记"
+                        showActions(streaming = false, keepable = true)
                     }
-                    e != null -> dlg.setTitle("$title · 失败").also { tv.text = "调用失败：\n$e" }
+                    e != null -> {
+                        dlg.setTitle("$titleWithModel · 失败")
+                        renderBody(acc.toString().ifBlank { "调用失败：$e" })
+                        bannerTv.visibility = View.VISIBLE
+                        bannerTv.text = "调用失败：$e"
+                        showActions(streaming = false, keepable = true)
+                    }
+                    issue != null -> {
+                        // 校验失败不再整段丢弃：正文照常显示，只在上方给出原因与补救动作
+                        dlg.setTitle("$titleWithModel · 校验未通过")
+                        renderBody(reply)
+                        bannerTv.visibility = View.VISIBLE
+                        bannerTv.text = "校验未通过：$issue"
+                        showActions(streaming = false, keepable = true)
+                    }
                     else -> {
-                        dlg.setTitle("$title ✓")
-                        applyCitationLinks(tv, reply)
-                        scroll.post { scroll.fullScroll(View.FOCUS_DOWN) }
+                        dlg.setTitle("$titleWithModel ✓")
+                        renderBody(reply)
+                        showActions(streaming = false, keepable = false)
                         onDone?.invoke(reply)
                     }
                 }
+                refreshSectionChips()
+                footerTv.text = "模型：${modelName.ifBlank { "未配置" }}" + when {
+                    cancelled -> " · 已停止"
+                    e != null -> " · 调用失败"
+                    issue != null -> " · 未通过校验"
+                    validate != null -> " · 已通过校验"
+                    else -> ""
+                }
+                scroll.post { scroll.fullScroll(View.FOCUS_DOWN) }
             }
         }.apply { isDaemon = true }
         worker.start()
@@ -1720,14 +2157,17 @@ class ReaderView(
 
     /** Make validated AI source tokens actionable so conclusions can jump back to their source. */
     private fun applyCitationLinks(target: TextView, content: String) {
-        val pattern = Regex("\\[(PAGE|SLIDE|CHAPTER|PARAGRAPH):(\\d+)]")
-        val matches = pattern.findAll(content).toList()
-        if (matches.isEmpty()) {
-            target.text = content
-            return
-        }
         val linked = SpannableString(content)
-        matches.forEach { match ->
+        applyCitationSpans(linked)
+        target.text = linked
+        target.movementMethod = LinkMovementMethod.getInstance()
+        target.highlightColor = Color.TRANSPARENT
+    }
+
+    /** 把 [PAGE:n] / [PARAGRAPH:n] 之类引用变成可点击跳转的 span（不动 movementMethod） */
+    private fun applyCitationSpans(linked: android.text.Spannable) {
+        // 先在纯文本上定位，再改 span，避免边遍历边改同一个 CharSequence
+        CITATION_RE.findAll(linked.toString()).toList().forEach { match ->
             val type = match.groupValues[1]
             val index = match.groupValues[2].toIntOrNull() ?: return@forEach
             linked.setSpan(object : ClickableSpan() {
@@ -1739,9 +2179,6 @@ class ReaderView(
                 }
             }, match.range.first, match.range.last + 1, Spanned.SPAN_EXCLUSIVE_EXCLUSIVE)
         }
-        target.text = linked
-        target.movementMethod = LinkMovementMethod.getInstance()
-        target.highlightColor = Color.TRANSPARENT
     }
 
     private fun jumpToCitation(type: String, oneBasedIndex: Int) {
@@ -1753,72 +2190,465 @@ class ReaderView(
                     scroll.post { scroll.smoothScrollTo(0, max(0, target.top - Glass.dp(8, density(act)))) }
                 } else showResult("无法定位", "当前结果引用的 PDF 页不在可用范围内。")
             }
-            "CHAPTER", "SLIDE" -> {
-                val block = tocHeads.getOrNull(oneBasedIndex - 1)?.first
+            // 章节/幻灯片/段落都按「非标题块」重新计数：编号不等于块下标，直接相减会被标题顶偏
+            "CHAPTER", "SLIDE", "PARAGRAPH" -> {
+                val block = blockIndexForAnchor(type, oneBasedIndex)
                 if (block != null) jumpToBlock(block, flash = true)
-                else showResult("无法定位", "当前结果引用的章节或幻灯片无法定位。")
-            }
-            "PARAGRAPH" -> {
-                val block = (oneBasedIndex - 1).coerceAtLeast(0)
-                if (block < (docBlocks?.size ?: 0)) jumpToBlock(block, flash = true)
-                else showResult("无法定位", "当前结果引用的段落超出文档范围。")
+                else showResult("无法定位", "当前结果引用的${anchorTypeLabel(type)}超出文档范围，文档可能已更新。")
             }
             else -> showResult("无法定位", "无法识别引用类型「$type」，请手动定位。")
         }
     }
 
-    private fun aiSummary() {
-        val cfg = aiReady() ?: return
+    // ---------- 引用锚点 ↔ 块下标 ----------
+
+    private fun isHeadingBlock(b: Block, markdown: Boolean): Boolean =
+        b.type == Block.HEADING || (markdown && MD_HEADING_RE.matches(b.text.trim()))
+
+    private fun slideNumberOf(text: String): Int? =
+        PPT_SLIDE_RE.matchEntire(text.trim())?.groupValues?.get(1)?.toIntOrNull()
+
+    /**
+     * 锚点 → 块下标。
+     * DocumentAiService 的 PARAGRAPH/SLIDE/CHAPTER 编号只统计「非标题块」
+     * （见 proseSegments / slideSegments 里的 paragraph++ / chapter++），
+     * 所以这里必须按同一规则重新走一遍 docBlocks，不能把编号当块下标用。
+     */
+    private fun blockIndexForAnchor(type: String, index: Int): Int? {
+        val blocks = docBlocks ?: return null
+        if (index <= 0 || blocks.isEmpty()) return null
+        val markdown = bookFormat == "md"
+        when (type) {
+            "PARAGRAPH" -> {
+                var paragraph = 0
+                blocks.forEachIndexed { i, b ->
+                    if (b.text.isBlank() || isHeadingBlock(b, markdown)) return@forEachIndexed
+                    paragraph++
+                    if (paragraph == index) return i
+                }
+            }
+            "SLIDE" -> {
+                var slide = 0
+                blocks.forEachIndexed { i, b ->
+                    if (b.text.isBlank()) return@forEachIndexed
+                    if (b.type == Block.HEADING) {
+                        val n = slideNumberOf(b.text)
+                        if (n != null) {
+                            slide = n.coerceAtLeast(1)
+                            if (slide == index) return i
+                            return@forEachIndexed
+                        }
+                    }
+                    if (slide == 0) {
+                        slide = 1
+                        if (slide == index) return i
+                    }
+                }
+            }
+            "CHAPTER" -> {
+                var chapter = 0
+                blocks.forEachIndexed { i, b ->
+                    if (b.text.isBlank() || !isHeadingBlock(b, markdown)) return@forEachIndexed
+                    chapter++
+                    if (chapter == index) return i
+                }
+            }
+        }
+        return null
+    }
+
+    /** 块下标 → 锚点字符串：与 [blockIndexForAnchor] 用同一套「非标题块」计数 */
+    private fun anchorForBlockIndex(index: Int): String {
+        val blocks = docBlocks ?: return ""
+        if (index !in blocks.indices) return ""
+        val markdown = bookFormat == "md"
+        var paragraph = 0
+        for (i in 0..index) {
+            val b = blocks[i]
+            if (b.text.isBlank() || isHeadingBlock(b, markdown)) continue
+            paragraph++
+        }
+        return if (paragraph > 0) "PARAGRAPH:$paragraph" else ""
+    }
+
+    private fun anchorTypeLabel(type: String): String = when (type) {
+        "CHAPTER" -> "章节"
+        "SLIDE" -> "幻灯片"
+        "PARAGRAPH" -> "段落"
+        "PAGE" -> "页面"
+        else -> "位置"
+    }
+
+    // ---------- AI 结果 UI 工具 ----------
+
+    /**
+     * 轻量 Markdown → Spannable：标题加粗放大、列表项缩进、**加粗** 去掉星号。
+     * 同时返回各标题在结果中的字符偏移，供章节 chip 跳转；不处理表格/代码块等重语法。
+     */
+    private fun renderAiMarkdown(raw: String): AiMarkdown {
+        val d = density(act)
+        val out = SpannableStringBuilder()
+        val sections = mutableListOf<Pair<String, Int>>()
+        val heading = Regex("^(#{1,6})\\s+(.*)$")
+        val bullet = Regex("^([-*+])\\s+(.*)$")
+        val numbered = Regex("^(\\d{1,2}[.、)])\\s+(.*)$")
+        raw.trimEnd().split("\n").forEach { line ->
+            val trimmed = line.trim()
+            val head = heading.matchEntire(trimmed)
+            val item = if (head == null) bullet.matchEntire(trimmed) else null
+            val ordered = if (head == null && item == null) numbered.matchEntire(trimmed) else null
+            when {
+                head != null -> {
+                    if (out.isNotEmpty()) out.append("\n")
+                    val title = head.groupValues[2].trim()
+                    sections += title to out.length
+                    val start = out.length
+                    appendInlineBold(out, title)
+                    out.setSpan(StyleSpan(Typeface.BOLD), start, out.length, Spanned.SPAN_EXCLUSIVE_EXCLUSIVE)
+                    out.setSpan(
+                        RelativeSizeSpan(if (head.groupValues[1].length <= 2) 1.22f else 1.1f),
+                        start, out.length, Spanned.SPAN_EXCLUSIVE_EXCLUSIVE
+                    )
+                    out.setSpan(
+                        ForegroundColorSpan(AI_HEAD_ACCENT),
+                        start, out.length, Spanned.SPAN_EXCLUSIVE_EXCLUSIVE
+                    )
+                    out.append("\n")
+                }
+                item != null -> {
+                    val start = out.length
+                    out.append("• ")
+                    appendInlineBold(out, item.groupValues[2])
+                    out.setSpan(
+                        LeadingMarginSpan.Standard(Glass.dp(18, d)),
+                        start, out.length, Spanned.SPAN_EXCLUSIVE_EXCLUSIVE
+                    )
+                    out.append("\n")
+                }
+                ordered != null -> {
+                    // 编号必须保留：作答和批改都要靠题号对位
+                    val start = out.length
+                    out.append(ordered.groupValues[1]).append(" ")
+                    appendInlineBold(out, ordered.groupValues[2])
+                    out.setSpan(
+                        LeadingMarginSpan.Standard(Glass.dp(18, d)),
+                        start, out.length, Spanned.SPAN_EXCLUSIVE_EXCLUSIVE
+                    )
+                    out.append("\n")
+                }
+                else -> {
+                    appendInlineBold(out, line.trimEnd())
+                    out.append("\n")
+                }
+            }
+        }
+        return AiMarkdown(out, sections)
+    }
+
+    /** 追加一段文本，并把 **加粗** 语法转成真正的粗体 span */
+    private fun appendInlineBold(out: SpannableStringBuilder, text: String) {
+        var last = 0
+        BOLD_RE.findAll(text).forEach { match ->
+            out.append(text, last, match.range.first)
+            val start = out.length
+            out.append(match.groupValues[1])
+            out.setSpan(StyleSpan(Typeface.BOLD), start, out.length, Spanned.SPAN_EXCLUSIVE_EXCLUSIVE)
+            last = match.range.last + 1
+        }
+        out.append(text, last, text.length)
+    }
+
+    /** 章节 chip：把结果框滚到对应标题（字符偏移 → 行号 → 像素） */
+    private fun scrollToSection(scroll: ScrollView, tv: TextView, offset: Int) {
+        val layout = tv.layout ?: return
+        val length = tv.text?.length ?: return
+        if (offset < 0 || offset > length) return
+        val line = layout.getLineForOffset(offset)
+        scroll.smoothScrollTo(
+            0,
+            (tv.top + layout.getLineTop(line) - Glass.dp(8, density(act))).coerceAtLeast(0)
+        )
+    }
+
+    /** 横向可滚动的 chip 行：章节导航与结果操作共用 */
+    private fun horizontalChipRow(): android.widget.HorizontalScrollView {
+        val d = density(act)
+        return android.widget.HorizontalScrollView(act).apply {
+            isHorizontalScrollBarEnabled = false
+            addView(LinearLayout(act).apply {
+                orientation = LinearLayout.HORIZONTAL
+                setPadding(Glass.dp(18, d), Glass.dp(6, d), Glass.dp(18, d), Glass.dp(6, d))
+            })
+        }
+    }
+
+    private fun aiChip(label: String, onClick: () -> Unit): TextView {
+        val d = density(act)
+        return TextView(act).apply {
+            text = label
+            textSize = 12.5f
+            setTextColor(pal.textP)
+            background = android.graphics.drawable.GradientDrawable().apply {
+                setColor(pal.surface2)
+                cornerRadius = Glass.dp(13, d).toFloat()
+                setStroke(Glass.dp(1, d), pal.surface3)
+            }
+            setPadding(Glass.dp(11, d), Glass.dp(6, d), Glass.dp(11, d), Glass.dp(6, d))
+            isClickable = true
+            setOnClickListener { onClick() }
+        }
+    }
+
+    private fun fillChipRow(row: android.widget.HorizontalScrollView, chips: List<TextView>) {
+        val container = row.getChildAt(0) as? LinearLayout ?: return
+        container.removeAllViews()
+        val d = density(act)
+        chips.forEachIndexed { index, chip ->
+            container.addView(chip, LinearLayout.LayoutParams(-2, -2).also { lp ->
+                if (index > 0) lp.setMargins(Glass.dp(8, d), 0, 0, 0)
+            })
+        }
+        row.visibility = if (chips.isEmpty()) View.GONE else View.VISIBLE
+    }
+
+    private fun toast(message: String) {
+        android.widget.Toast.makeText(act, message, android.widget.Toast.LENGTH_SHORT).show()
+    }
+
+    /** 复制结果到剪贴板：流式结果以前只能干看着，连复制都做不到 */
+    private fun copyAiText(label: String, body: String) {
+        if (body.isBlank()) return toast("没有可复制的内容")
+        val cm = act.getSystemService(Context.CLIPBOARD_SERVICE) as? android.content.ClipboardManager
+        if (cm == null) return toast("当前设备不支持剪贴板")
+        cm.setPrimaryClip(android.content.ClipData.newPlainText(label, body))
+        toast("已复制")
+    }
+
+    private fun shareAiText(label: String, body: String) {
+        if (body.isBlank()) return toast("没有可分享的内容")
+        val send = android.content.Intent(android.content.Intent.ACTION_SEND).apply {
+            type = "text/plain"
+            putExtra(android.content.Intent.EXTRA_SUBJECT, label)
+            putExtra(android.content.Intent.EXTRA_TEXT, body)
+        }
+        val ok = runCatching {
+            act.startActivity(android.content.Intent.createChooser(send, "分享 AI 结果"))
+        }.isSuccess
+        if (!ok) showResult("无法分享", "当前设备没有可用的分享目标。")
+    }
+
+    /**
+     * AI 结果落笔记的唯一入口。
+     * [anchor]（块锚点）与 [status]（"unvalidated" 等）需要 NoteEntity 的新列；
+     * Db.addNote 目前还没开放这两个形参，所以这里暂时只写 kind/content，
+     * 等 Db.addNote 加上 anchor/status 后在本方法内一次补齐（见交付报告的跨文件请求）。
+     */
+    private fun saveAiNote(kind: String, content: String, anchor: String = "", status: String = "") {
+        if (content.isBlank()) return
+        try {
+            db.addNote(bookId, kind, content)
+        } catch (_: Exception) {}
+    }
+
+    /** 所有 chatVision 调用的统一确认入口：标题必须写明发送范围，首次确认后不再重复询问 */
+    private fun confirmVisionSend(label: String, rangeTitle: String, message: String, onConfirm: () -> Unit) {
+        if (db.getSetting(SETTING_VISION_SEND_CONFIRMED) == "1") {
+            onConfirm()
+            return
+        }
+        android.app.AlertDialog.Builder(act)
+            .setTitle("$label · $rangeTitle")
+            .setMessage(message)
+            .setPositiveButton("确认发送") { _, _ ->
+                db.setSetting(SETTING_VISION_SEND_CONFIRMED, "1")
+                onConfirm()
+            }
+            .setNegativeButton("取消", null)
+            .show().also { Glass.styleDialog(it, density(act)) }
+    }
+
+    private fun providerHost(): String {
+        val base = runCatching { AiClient.config(db).baseUrl }.getOrDefault("")
+        return runCatching { URI(AiClient.normalizeBase(base)).host }.getOrNull() ?: base.take(48)
+    }
+
+    /** 结果头部的范围说明：PDF 说页码，文本说抽样字符数 */
+    private fun pdfScope(indices: List<Int>): String {
+        if (indices.isEmpty()) return "范围：无可用页面"
+        // indices 始终按升序构造，首尾即最小/最大页
+        return "范围：第 ${indices.first() + 1}–${indices.last() + 1} 页（共 $pdfPageCount 页）"
+    }
+
+    private fun visionRangeTitle(indices: List<Int>): String {
+        if (indices.isEmpty()) return "将发送 0 页图像"
+        return "将发送第 ${indices.first() + 1}–${indices.last() + 1} 页图像（共 $pdfPageCount 页）"
+    }
+
+    private fun textScope(sentChars: Int): String =
+        "范围：全文抽样，已发送 ${sentChars / 1000}k/${docFullText.length / 1000}k 字符"
+
+    /** 用另一个 profile 构造一次性 Config（只在本次重试生效，不改变当前激活配置） */
+    private fun configForProfile(profile: SavedAiProfile): AiClient.Config {
+        val baseUrl = profile.baseUrl.trim()
+        return AiClient.Config(
+            baseUrl = baseUrl,
+            key = db.getAiKey(profile.id, baseUrl),
+            model = profile.textModel.trim(),
+            visionModel = profile.visionModel.trim(),
+            allowPrivateHttp = profile.allowPrivateHttp,
+            chatPath = profile.chatPath,
+            modelsPath = profile.modelsPath,
+            authHeader = profile.authHeader,
+            authPrefix = profile.authPrefix
+        )
+    }
+
+    /** 整篇文档的带锚点上下文（预算内抽样），供批改等需要原文依据的功能使用 */
+    private fun anchoredFullContext(): String {
+        val blocks = docBlocks ?: return ""
+        if (blocks.isEmpty()) return ""
+        return runCatching {
+            DocumentAiService.buildAnchoredContext(
+                ParsedDoc(bookFormat.ifBlank { "txt" }, blocks, docFullText),
+                bookFormat,
+                DocumentAiService.MAX_CONTEXT_CHARS
+            ).text
+        }.getOrDefault("")
+    }
+
+    /** 从题面数出题目数量：优先行首编号，兜底按问号计数（不再假定「5 题 × 20 分」） */
+    private fun countQuestions(text: String): Int {
+        val numbered = Regex("(?m)^\\s*(?:#{1,6}\\s*)?(?:第\\s*)?(\\d{1,2})\\s*[.、)）:：]?")
+            .findAll(text)
+            .mapNotNull { it.groupValues[1].toIntOrNull() }
+            .filter { it in 1..50 }
+            .toSet()
+        if (numbered.isNotEmpty()) return numbered.size
+        return text.count { it == '？' || it == '?' }.coerceAtLeast(1)
+    }
+
+    /** 粗略判断源语言，只用于隐藏没有意义的翻译目标 */
+    private fun detectSourceLanguage(text: String): String {
+        val sample = text.take(400)
+        if (sample.isBlank()) return ""
+        val cjk = sample.count { it.code in 0x4E00..0x9FFF }
+        val kana = sample.count { it.code in 0x3040..0x30FF }
+        val latin = sample.count { it in 'a'..'z' || it in 'A'..'Z' }
+        return when {
+            kana > 2 -> "日本語"
+            cjk * 100 / sample.length >= 15 -> "中文"
+            latin * 100 / sample.length >= 40 -> "English"
+            else -> ""
+        }
+    }
+
+    private fun aiSummary(cfgOverride: AiClient.Config? = null) {
+        val cfg = cfgOverride ?: (aiReady() ?: return)
         if (bookFormat == "pdf") {
-            runAiStream("summary", "AI 摘要") { onDelta, onReason, onRestart ->
-                val pages = collectPdfPages(6)
-                try {
-                    AiClient.chatVision(cfg, SYS_PROMPT,
-                        "这是一份课件/文档的前几页截图。请生成摘要：先一句话概括主题，再用要点列出核心内容。",
-                        pages, onDelta, onReason = onReason, onRestart = onRestart)
-                } finally {
-                    pages.forEach { it.recycle() }
+            val total = pdfRenderer?.pageCount ?: 0
+            val indices = (0 until min(6, total)).toList()
+            if (indices.isEmpty()) { showResult("提示", "PDF 没有可分析页面"); return }
+            val scope = pdfScope(indices)
+            confirmVisionSend(
+                "前段摘要",
+                visionRangeTitle(indices),
+                "目标服务：${providerHost()}\n只会发送这些页面的图像，文档原文件不会上传。"
+            ) {
+                runAiStream(
+                    kind = "summary",
+                    title = "前段摘要",
+                    cfg = cfg,
+                    scopeLine = scope,
+                    onRetry = { alt -> aiSummary(alt) }
+                ) { onDelta, onReason, onRestart ->
+                    val pages = collectPdfPages(indices)
+                    try {
+                        AiClient.chatVision(cfg, SYS_PROMPT,
+                            "这是一份课件/文档的第 ${indices.first() + 1}–${indices.last() + 1} 页截图（共 $total 页）。" +
+                                "请生成摘要：先一句话概括主题，再用要点列出核心内容。",
+                            pages, onDelta, onReason = onReason, onRestart = onRestart)
+                    } finally {
+                        pages.forEach { it.recycle() }
+                    }
                 }
             }
         } else {
             val text = docFullText
             if (text.isBlank()) { showResult("提示", "本文档没有可提取文本"); return }
-            runAiStream("summary", "AI 摘要") { onDelta, onReason, onRestart ->
+            val sent = text.take(24000)
+            runAiStream(
+                kind = "summary",
+                title = "前段摘要",
+                cfg = cfg,
+                scopeLine = textScope(sent.length),
+                onRetry = { alt -> aiSummary(alt) }
+            ) { onDelta, onReason, onRestart ->
                 AiClient.chat(cfg, SYS_PROMPT,
-                    "请为下面的内容生成摘要：先一句话概括，再用 3-6 个要点列出核心内容。\n\n【内容开始】\n${text.take(24000)}\n【内容结束】",
+                    "请为下面的内容生成摘要：先一句话概括，再用 3-6 个要点列出核心内容。\n\n【内容开始】\n$sent\n【内容结束】",
                     onDelta, onReason = onReason, onRestart = onRestart)
             }
         }
     }
 
-    private fun askAction() {
-        val cfg = aiReady() ?: return
+    private fun askAction(cfgOverride: AiClient.Config? = null) {
+        val cfg = cfgOverride ?: (aiReady() ?: return)
         val input = EditText(act).apply {
             hint = "想问这份资料的任何问题…"
             setSingleLine(false)
             maxLines = 3
         }
         android.app.AlertDialog.Builder(act)
-            .setTitle("内容问答")
+            .setTitle("节选问答")
             .setView(input)
             .setPositiveButton("提问") { _, _ ->
                 val q = input.text.toString().trim()
                 if (q.isEmpty()) return@setPositiveButton
                 if (bookFormat == "pdf") {
-                    runAiStream("ask", "问答 · $q") { onDelta, onReason, onRestart ->
-                        val pages = collectPdfPages(6)
-                        try {
-                            AiClient.chatVision(cfg, SYS_PROMPT,
-                                "根据这些页面截图回答问题：$q\n若图中没有答案请直说。", pages, onDelta, onReason = onReason, onRestart = onRestart)
-                        } finally {
-                            pages.forEach { it.recycle() }
+                    val total = pdfRenderer?.pageCount ?: 0
+                    val indices = (0 until min(6, total)).toList()
+                    if (indices.isEmpty()) {
+                        showResult("提示", "PDF 没有可分析页面")
+                        return@setPositiveButton
+                    }
+                    val scope = pdfScope(indices)
+                    confirmVisionSend(
+                        "节选问答",
+                        visionRangeTitle(indices),
+                        "目标服务：${providerHost()}\n只会发送这些页面的图像，文档原文件不会上传。"
+                    ) {
+                        runAiStream(
+                            kind = "ask",
+                            title = "问答 · $q",
+                            cfg = cfg,
+                            scopeLine = scope,
+                            onRetry = { alt -> askAction(alt) }
+                        ) { onDelta, onReason, onRestart ->
+                            val pages = collectPdfPages(indices)
+                            try {
+                                AiClient.chatVision(cfg, SYS_PROMPT,
+                                    "根据这些页面截图回答问题：$q\n若图中没有答案请直说。",
+                                    pages, onDelta, onReason = onReason, onRestart = onRestart)
+                            } finally {
+                                pages.forEach { it.recycle() }
+                            }
                         }
                     }
                 } else {
                     val text = docFullText
-                    runAiStream("ask", "问答 · $q") { onDelta, onReason, onRestart ->
+                    if (text.isBlank()) {
+                        showResult("提示", "本文档没有可提取文本")
+                        return@setPositiveButton
+                    }
+                    val sent = text.take(24000)
+                    runAiStream(
+                        kind = "ask",
+                        title = "问答 · $q",
+                        cfg = cfg,
+                        scopeLine = textScope(sent.length),
+                        onRetry = { alt -> askAction(alt) }
+                    ) { onDelta, onReason, onRestart ->
                         AiClient.chat(cfg, SYS_PROMPT,
-                            "根据以下资料回答问题。若资料中没有答案请直说。\n\n问题：$q\n\n【资料开始】\n${text.take(24000)}\n【资料结束】",
+                            "根据以下资料回答问题。若资料中没有答案请直说。\n\n问题：$q\n\n【资料开始】\n$sent\n【资料结束】",
                             onDelta, onReason = onReason, onRestart = onRestart)
                     }
                 }
@@ -1827,11 +2657,14 @@ class ReaderView(
             .show().also { Glass.styleDialog(it, density(act)) }
     }
 
-    private fun quizAction() {
-        val cfg = aiReady() ?: return
+    private fun quizAction(cfgOverride: AiClient.Config? = null) {
+        val cfg = cfgOverride ?: (aiReady() ?: return)
+        val pdfIndices = if (bookFormat == "pdf") (0 until min(8, pdfRenderer?.pageCount ?: 0)).toList() else emptyList()
+        val scope = if (bookFormat == "pdf") pdfScope(pdfIndices) else textScope(min(20000, docFullText.length))
         val build = { onDelta: (String) -> Unit, onReason: (String) -> Unit, onRestart: () -> Unit ->
             if (bookFormat == "pdf") {
-                val pages = collectPdfPages(8)
+                if (pdfIndices.isEmpty()) throw RuntimeException("PDF 没有可分析页面")
+                val pages = collectPdfPages(pdfIndices)
                 try {
                     AiClient.chatVision(cfg, SYS_PROMPT,
                         "根据这些页面截图出 5 道自测题（选择/简答混合）。只输出题目本身，不要给答案——用户作答后你会批改。",
@@ -1847,15 +2680,35 @@ class ReaderView(
                     onDelta, onReason = onReason, onRestart = onRestart)
             }
         }
-        runAiStream("quiz", "自测题", onDone = { questions ->
-            // 出题完成 → 引导作答批改闭环
-            android.app.AlertDialog.Builder(act)
-                .setTitle("✍️ 作答批改")
-                .setMessage("题目已生成。把你的答案写在下框（可简答，如「1A 2B 3…」），AI 将对照原文批改评分。")
-                .setPositiveButton("去作答") { _, _ -> answerQuiz(cfg, questions) }
-                .setNegativeButton("稍后", null)
-                .show().also { Glass.styleDialog(it, density(act)) }
-        }, call = build)
+        val start = {
+            runAiStream(
+                kind = "quiz",
+                title = "自测题",
+                cfg = cfg,
+                scopeLine = scope,
+                onRetry = { alt -> quizAction(alt) },
+                onDone = { questions ->
+                    // 出题完成 → 引导作答批改闭环
+                    android.app.AlertDialog.Builder(act)
+                        .setTitle("✍️ 作答批改")
+                        .setMessage("题目已生成。把你的答案写在下框（可简答，如「1A 2B 3…」），AI 将对照原文批改评分。")
+                        .setPositiveButton("去作答") { _, _ -> answerQuiz(cfg, questions) }
+                        .setNegativeButton("稍后", null)
+                        .show().also { Glass.styleDialog(it, density(act)) }
+                },
+                call = build
+            )
+        }
+        if (bookFormat == "pdf") {
+            confirmVisionSend(
+                "出题自测",
+                visionRangeTitle(pdfIndices),
+                "目标服务：${providerHost()}\n只会发送这些页面的图像，文档原文件不会上传。",
+                start
+            )
+        } else {
+            start()
+        }
     }
 
     /** 批改：原文 + 题目 + 用户答案 → 逐题判分与讲解 */
@@ -1871,12 +2724,26 @@ class ReaderView(
             .setPositiveButton("提交批改") { _, _ ->
                 val ans = input.text.toString().trim()
                 if (ans.isEmpty()) return@setPositiveButton
-                val refText = if (bookFormat == "pdf") "(PDF 文档)" else docFullText.take(12000)
+                // 判分依据改为带锚点的上下文，而不是硬截前 12k 字符
+                val refText = if (bookFormat == "pdf") {
+                    "(PDF 文档，按题面与常识判断)"
+                } else {
+                    anchoredFullContext().takeIf { it.isNotBlank() } ?: docFullText.take(12000)
+                }
+                // 每题分值按实际题数算，避免「固定 5 题 × 20 分」在题数不符时算错
+                val count = countQuestions(questions).coerceAtLeast(1)
+                val per = 100.0 / count
                 // 批改记录入笔记：kind 必须非空，否则用户答案与判分结果都会被丢弃
-                runAiStream("quiz_grade", "批改结果") { onDelta, onReason, onRestart ->
+                runAiStream(
+                    kind = "quiz_grade",
+                    title = "批改结果",
+                    cfg = cfg,
+                    scopeLine = if (bookFormat == "pdf") "范围：PDF 题面（未附原文）" else textScope(refText.length),
+                    onRetry = { alt -> answerQuiz(alt, questions) }
+                ) { onDelta, onReason, onRestart ->
                     AiClient.chat(cfg, SYS_PROMPT,
                         "你是阅卷老师。下面是原文、题目和学生的答案。请逐题判定对错并简要讲解，" +
-                            "最后给总分（每题 20 分，满分 100）和一句鼓励。\n\n" +
+                            "最后给总分（共 $count 题，每题约 ${"%.1f".format(per)} 分，满分 100）和一句鼓励。\n\n" +
                             "【题目】\n$questions\n\n【学生答案】\n$ans\n\n【原文参考】\n$refText",
                         onDelta, onReason = onReason, onRestart = onRestart)
                 }
@@ -1885,50 +2752,111 @@ class ReaderView(
             .show().also { Glass.styleDialog(it, density(act)) }
     }
 
-    private fun explainBlock(blockText: String) {
-        val cfg = aiReady() ?: return
-        val options = arrayOf("💡 解释含义", "🌍 翻译成中文", "🗣 大白话讲解", "✍️ 续写一段", "⭐ 收藏金句")
-        android.app.AlertDialog.Builder(act)
+    /**
+     * 段落选择菜单：本地动作（收藏）与付费 AI 动作分成两组，
+     * 「收藏金句」不再埋在一堆 AI 调用里，也顺手带上了块锚点。
+     */
+    private fun explainBlock(blockText: String, blockIndex: Int = -1, cfgOverride: AiClient.Config? = null) {
+        val cfg = cfgOverride ?: (aiReady() ?: return)
+        val d = density(act)
+        val anchor = if (blockIndex >= 0) anchorForBlockIndex(blockIndex) else ""
+        val column = LinearLayout(act).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(Glass.dp(6, d), Glass.dp(4, d), Glass.dp(6, d), Glass.dp(6, d))
+        }
+        fun addTitle(text: String) {
+            column.addView(TextView(act).apply {
+                this.text = text
+                textSize = 11.5f
+                setTextColor(pal.textT)
+                setPadding(Glass.dp(14, d), Glass.dp(10, d), Glass.dp(14, d), Glass.dp(2, d))
+            }, LinearLayout.LayoutParams(-1, -2))
+        }
+        fun addRow(label: String, onClick: () -> Unit) {
+            column.addView(TextView(act).apply {
+                this.text = label
+                textSize = 15f
+                setTextColor(pal.textP)
+                setPadding(Glass.dp(14, d), Glass.dp(12, d), Glass.dp(14, d), Glass.dp(12, d))
+                isClickable = true
+                setOnClickListener { onClick() }
+            }, LinearLayout.LayoutParams(-1, -2))
+        }
+        addTitle("本地")
+        val quoteLabel = if (anchor.isNotBlank()) "⭐ 收藏这段（$anchor）" else "⭐ 收藏这段"
+        addRow(quoteLabel) { saveQuote(blockText, anchor) }
+        addTitle("AI 操作（会发送到 ${providerHost()}）")
+        addRow("💡 解释含义") {
+            runBlockAi("explain", "段落解释", blockText, cfg,
+                "请解释下面这段话的含义（是什么意思、为什么重要），简洁作答：", anchor)
+        }
+        addRow("🌍 翻译") { translateBlock(blockText, anchor, cfg) }
+        addRow("🗣 大白话讲解") {
+            runBlockAi("explain", "大白话讲解", blockText, cfg,
+                "用大白话给中学生讲解下面这段话，可以打比方，通俗但不失准确：", anchor)
+        }
+        addRow("✍️ 续写一段") {
+            runBlockAi("continue", "续写", blockText, cfg,
+                "顺着下面的文字风格与情节，自然续写一段（150-250字）：", anchor)
+        }
+        val dlg = android.app.AlertDialog.Builder(act)
             .setTitle("这段话…")
-            .setItems(options) { _, which ->
-                val clip = blockText.take(3000)
-                when (which) {
-                    0 -> runAiStream(null, "段落解释") { onDelta, onReason, onRestart ->
-                        AiClient.chat(cfg, SYS_PROMPT,
-                            "请解释下面这段话的含义（是什么意思、为什么重要），简洁作答：\n\n「$clip」",
-                            onDelta, onReason = onReason, onRestart = onRestart)
-                    }
-                    1 -> runAiStream(null, "翻译") { onDelta, onReason, onRestart ->
-                        AiClient.chat(cfg, SYS_PROMPT,
-                            "把下面的文字翻译成流畅的中文，只输出译文：\n\n「$clip」",
-                            onDelta, onReason = onReason, onRestart = onRestart)
-                    }
-                    2 -> runAiStream(null, "大白话讲解") { onDelta, onReason, onRestart ->
-                        AiClient.chat(cfg, SYS_PROMPT,
-                            "用大白话给中学生讲解下面这段话，可以打比方，通俗但不失准确：\n\n「$clip」",
-                            onDelta, onReason = onReason, onRestart = onRestart)
-                    }
-                    3 -> runAiStream(null, "续写") { onDelta, onReason, onRestart ->
-                        AiClient.chat(cfg, SYS_PROMPT,
-                            "顺着下面的文字风格与情节，自然续写一段（150-250字）：\n\n「$clip」",
-                            onDelta, onReason = onReason, onRestart = onRestart)
-                    }
-                    4 -> {
-                        // 收藏金句落到后台线程：Room 允许主线程查询，但写库不应占用点击帧
-                        val quote = blockText.trim()
-                        Thread {
-                            try { db.addNote(bookId, "quote", quote) } catch (_: Exception) {}
-                            act.runOnUiThread {
-                                android.widget.Toast.makeText(
-                                    act, "已收藏金句 ⭐", android.widget.Toast.LENGTH_SHORT
-                                ).show()
-                            }
-                        }.apply { isDaemon = true }.start()
-                    }
-                }
+            .setView(column)
+            .setNegativeButton("取消", null)
+            .create()
+        dlg.show()
+        Glass.styleDialog(dlg, d)
+    }
+
+    /** 段落级 AI 动作：统一带 kind（结果必须能落笔记）、范围说明与重试入口 */
+    private fun runBlockAi(
+        kind: String,
+        title: String,
+        blockText: String,
+        cfg: AiClient.Config,
+        instruction: String,
+        anchor: String
+    ) {
+        val clip = blockText.trim().take(3000)
+        runAiStream(
+            kind = kind,
+            title = title,
+            cfg = cfg,
+            scopeLine = "范围：选中段落，已发送 ${clip.length} 字符",
+            anchor = anchor,
+            onRetry = { alt -> runBlockAi(kind, title, blockText, alt, instruction, anchor) }
+        ) { onDelta, onReason, onRestart ->
+            AiClient.chat(cfg, SYS_PROMPT, "$instruction\n\n「$clip」", onDelta, onReason = onReason, onRestart = onRestart)
+        }
+    }
+
+    /** 翻译：目标语言可选，源语言自身从列表里剔除（中文书里不再出现「翻译成中文」） */
+    private fun translateBlock(blockText: String, anchor: String, cfg: AiClient.Config) {
+        val source = detectSourceLanguage(blockText)
+        val targets = listOf("中文", "English", "日本語").filterNot { it == source }
+        if (targets.isEmpty()) {
+            showResult("无法翻译", "这段文字的语言无法判断，暂时没有合适的翻译目标。")
+            return
+        }
+        android.app.AlertDialog.Builder(act)
+            .setTitle("翻译成…")
+            .setItems(targets.toTypedArray()) { _, which ->
+                runBlockAi("translate", "翻译 · ${targets[which]}", blockText, cfg,
+                    "把下面的文字翻译成流畅的${targets[which]}，只输出译文：", anchor)
             }
             .setNegativeButton("取消", null)
             .show().also { Glass.styleDialog(it, density(act)) }
+    }
+
+    /** 收藏金句：带上块锚点，笔记列表里能跳回原文（锚点列待 Db.addNote 开放） */
+    private fun saveQuote(blockText: String, anchor: String) {
+        val quote = blockText.trim()
+        if (quote.isEmpty()) return
+        // 写库落到后台线程：Room 允许主线程查询，但写库不应占用点击帧
+        Thread {
+            saveAiNote("quote", quote, anchor, "")
+            act.runOnUiThread { toast("已收藏金句 ⭐") }
+        }.apply { isDaemon = true }.start()
     }
 
     private fun showResult(title: String, body: String) {
@@ -1943,6 +2871,8 @@ class ReaderView(
             setTextIsSelectable(true)
         }
         scroll.addView(tv)
+        // 带引用的结果同样可以点回原文
+        if (CITATION_RE.containsMatchIn(body)) applyCitationLinks(tv, body)
         android.app.AlertDialog.Builder(act)
             .setTitle(title)
             .setView(scroll)
@@ -2289,13 +3219,13 @@ class ReaderView(
     }
 
     override fun onDetachedFromWindow() {
-        aiCancelled.set(true)
-        aiCancelToken?.cancel()
-        aiCancelToken = null
-        // 对话框不会被系统随视图一起销毁，必须主动关闭，否则工作线程仍持有已 detach 的视图树
-        aiDialog?.let { d ->
-            aiDialog = null
-            try { d.dismiss() } catch (_: Exception) {}
+        activeAiTask?.let { task ->
+            task.cancelled.set(true)
+            task.token.cancel()
+            // 对话框不会被系统随视图一起销毁，必须主动关闭，否则工作线程仍持有已 detach 的视图树
+            task.dialog?.let { d -> try { d.dismiss() } catch (_: Exception) {} }
+            task.dialog = null
+            activeAiTask = null
         }
         repeatHandler?.let { h -> repeatLoops.forEach { h.removeCallbacks(it) } }
         repeatLoops.clear()
@@ -2308,5 +3238,14 @@ class ReaderView(
         imageView = null
         imageBitmap?.recycle()
         imageBitmap = null
+        // 图片集的每一页都持有位图，同样先解引用再回收
+        boxRef?.let { box ->
+            for (i in 0 until box.childCount) {
+                (box.getChildAt(i) as? ImageView)?.setImageDrawable(null)
+            }
+        }
+        archiveBitmaps.forEach { if (!it.isRecycled) it.recycle() }
+        archiveBitmaps.clear()
+        archivePageFiles = emptyList()
     }
 }
