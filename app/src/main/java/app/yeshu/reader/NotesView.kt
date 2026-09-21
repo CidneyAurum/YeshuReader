@@ -606,24 +606,19 @@ class NotesView(private val act: Activity, private val bookId: Long) : FrameLayo
         aiProgress = null
     }
 
-    /** 全部笔记导出为 Markdown，走系统分享面板 */
+    /**
+     * 导出本书的划线、笔记与书签为 Markdown。
+     *
+     * 用 HighlightExport 而不是在这里手拼：它还会带上位置锚点、高亮颜色与时间，
+     * 这些是粘到 Obsidian / Notion 之后真正有用的信息。
+     */
     private fun exportAll(bookTitle: String) {
-        val notes = db.listNotes(bookId)
-        if (notes.isEmpty()) {
-            android.widget.Toast.makeText(act, "还没有笔记可导出", android.widget.Toast.LENGTH_SHORT).show()
-            return
-        }
-        val md = StringBuilder("# 《$bookTitle》AI 笔记\n\n")
-        notes.forEach { row ->
-            md.append("## ").append(NoteKindLabels.label(row.kind)).append("\n\n")
-                .append(row.content.trim()).append("\n\n---\n\n")
-        }
+        val full = HighlightExport.forBook(db, bookId, "《$bookTitle》")
         val intent = android.content.Intent(android.content.Intent.ACTION_SEND).apply {
             type = "text/plain"
-            putExtra(android.content.Intent.EXTRA_SUBJECT, "《$bookTitle》AI 笔记")
+            putExtra(android.content.Intent.EXTRA_SUBJECT, "《$bookTitle》划线与笔记")
             // 分享走 Binder extra，超限会抛 TransactionTooLargeException 直接崩掉；
             // 这里截断并明确告知，而不是让用户看到一次崩溃。
-            val full = md.toString()
             val text = if (full.length <= SHARE_TEXT_LIMIT) {
                 full
             } else {
@@ -632,7 +627,7 @@ class NotesView(private val act: Activity, private val bookId: Long) : FrameLayo
             }
             putExtra(android.content.Intent.EXTRA_TEXT, text)
         }
-        act.startActivity(android.content.Intent.createChooser(intent, "分享 AI 笔记"))
+        act.startActivity(android.content.Intent.createChooser(intent, "分享划线与笔记"))
     }
 
     private companion object {

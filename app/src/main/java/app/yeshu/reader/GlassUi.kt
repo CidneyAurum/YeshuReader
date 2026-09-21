@@ -275,6 +275,9 @@ object NoteKindLabels {
         // 阅读器段落级操作现在会落库（原先 kind=null 直接丢弃），需要各自的标签，
         // 否则这些产出在笔记列表里都显示成通用「笔记」。
         "explain" to "解释",
+        // 生词本复用笔记表：这样备份、导出划线、笔记中枢都能自动覆盖它，
+        // 不需要为一份「词 + 出处」再建一张表。
+        "vocab" to "生词",
         "translate" to "翻译",
         "continue" to "续写",
         "recap" to "前情",

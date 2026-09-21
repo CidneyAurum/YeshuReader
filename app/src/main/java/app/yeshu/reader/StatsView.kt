@@ -196,6 +196,46 @@ class StatsView(private val act: Activity) : FrameLayout(act) {
         chart.addView(barRow, LinearLayout.LayoutParams(-1, -2))
         listBox.addView(chart, LinearLayout.LayoutParams(-1, -2).also { it.topMargin = Glass.dp(12, d) })
 
+        // ---- 阅读节奏（R61/R73）----
+        // 这两项都可由现有数据算出：速度来自阅读器按真实会话修正的估算值，
+        // 平均每次阅读时长 = 总时长 / 有阅读记录的天数。不新增数据表。
+        if (totalMs > 0L && days > 0) {
+            val speed = db.getSetting("reader_chars_per_min")?.toIntOrNull()?.coerceIn(80, 2000) ?: 420
+            val perDay = totalMs / days
+            listBox.addView(sectionTitle("阅读节奏"))
+            val card = LinearLayout(act).apply {
+                orientation = LinearLayout.VERTICAL
+                background = GradientDrawable().apply {
+                    cornerRadius = Glass.dp(T.rCard, d).toFloat(); setColor(pal.surface)
+                }
+                setPadding(Glass.dp(16, d), Glass.dp(12, d), Glass.dp(16, d), Glass.dp(12, d))
+            }
+            fun line(label: String, value: String, hint: String) {
+                card.addView(TextView(act).apply {
+                    text = label; textSize = 13f; setTextColor(pal.textT)
+                    setPadding(0, Glass.dp(6, d), 0, 0)
+                })
+                card.addView(TextView(act).apply {
+                    text = value; textSize = 18f; setTextColor(T.accent); setTypeface(null, Typeface.BOLD)
+                })
+                card.addView(TextView(act).apply {
+                    text = hint; textSize = 11f; setTextColor(pal.textS)
+                    setPadding(0, 0, 0, Glass.dp(6, d))
+                })
+            }
+            line(
+                "阅读速度",
+                "约 $speed 字/分钟",
+                "由阅读器按你的真实阅读会话持续修正，用于估算「本章还剩多久」",
+            )
+            line(
+                "平均每次阅读",
+                formatMs(perDay),
+                "按有阅读记录的天数平均（共 $days 天）",
+            )
+            listBox.addView(card, LinearLayout.LayoutParams(-1, -2).also { it.topMargin = Glass.dp(12, d) })
+        }
+
         // ---- 投入最多 ----
         val tops = db.topBooks(5)
         if (tops.isNotEmpty()) {

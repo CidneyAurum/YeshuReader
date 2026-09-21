@@ -288,7 +288,12 @@ class MainActivity : ComponentActivity() {
     fun importBackup() = openBackup.launch(arrayOf("application/zip", "application/json", "*/*"))
 
     override fun onKeyDown(keyCode: Int, event: KeyEvent): Boolean {
-        (currentLegacy as? ReaderView)?.let { if (it.handleVolumeKey(event)) return true }
+        // 音量键翻页与外接键盘（空格/方向键/PageUp/PageDown）都走这里：
+        // 阅读器是嵌在 Compose 里的 legacy View，自己收不到这些按键。
+        (currentLegacy as? ReaderView)?.let {
+            if (it.handleVolumeKey(event)) return true
+            if (it.handleHardwareKey(event)) return true
+        }
         return super.onKeyDown(keyCode, event)
     }
 

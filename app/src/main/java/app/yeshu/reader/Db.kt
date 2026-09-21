@@ -145,6 +145,77 @@ class Db(context: Context) {
     fun totalReadMs(id: Long): Long = dao.totalReadMs(id) ?: 0L
     fun totalAllReadMs(): Long = dao.totalAllReadMs()
 
+    // ---------- 数据完整性自检（R74）----------
+
+    /**
+     * 自检结果。都是「不该存在但可能因异常退出或旧版本缺陷而残留」的状态。
+     *
+     * [orphanNotes] 不含 bookId = 0：那是全局阅读报告的哨兵值，本来就不属于任何一本书。
+     */
+    data class IntegrityReport(
+        val orphanNotes: Int = 0,
+        val danglingBookmarks: Int = 0,
+        val invalidProgress: Int = 0,
+        val danglingHighlights: Int = 0,
+    ) {
+        val clean: Boolean get() = orphanNotes == 0 && danglingBookmarks == 0 && invalidProgress == 0 && danglingHighlights == 0
+    }
+
+    fun integrityReport(): IntegrityReport {
+        val bookIds = listBooks().map { it.id }.toSet()
+        val notes = dao.allNotes()
+        val orphanNotes = notes.count { it.bookId != 0L && it.bookId !in bookIds }
+        val bookmarks = dao.listAllBookmarks()
+        val danglingBookmarks = bookmarks.count { it.bookId !in bookIds }
+        // 进度越界（<0 或 >1）会让进度条画到框外、也让「读完」判定失真。
+        val invalidProgress = listBooks().count { it.progress < 0f || it.progress > 1f }
+        // 划重点必须带锚点，否则笔记列表里跳不回原文，等于一条死记录。
+        val danglingHighlights = notes.count { it.kind == "highlight" && it.anchor.isBlank() }
+        return IntegrityReport(orphanNotes, danglingBookmarks, invalidProgress, danglingHighlights)
+    }
+
+    /**
+     * 修复自检发现的问题。
+     *
+     * 只做无争议的清理：越界进度夹回 [0,1]，孤儿笔记与悬空书签归到「全局」（bookId = 0）
+     * 而不是删除——用户写下的内容不该被一次自检悄悄丢掉。
+     */
+    fun repairIntegrity(): String {
+        val before = integrityReport()
+        if (before.clean) return "没有发现需要修复的问题"
+        val bookIds = listBooks().map { it.id }.toSet()
+        var fixedNotes = 0
+        var fixedBookmarks = 0
+        var fixedProgress = 0
+        dao.allNotes().forEach { note ->
+            if (note.bookId != 0L && note.bookId !in bookIds) {
+                dao.updateNote(note.copy(bookId = 0L)); fixedNotes++
+            }
+        }
+        dao.listAllBookmarks().forEach { mark ->
+            if (mark.bookId !in bookIds) {
+                dao.updateBookmark(mark.copy(bookId = 0L)); fixedBookmarks++
+            }
+        }
+        listBooks().forEach { book ->
+            if (book.progress < 0f || book.progress > 1f) {
+                dao.updateBookProgress(book.id, book.progress.coerceIn(0f, 1f), statusFor(book.progress.coerceIn(0f, 1f))); fixedProgress++
+            }
+        }
+        return buildString {
+            if (fixedNotes > 0) append("归置孤儿笔记 $fixedNotes 条；")
+            if (fixedBookmarks > 0) append("归置悬空书签 $fixedBookmarks 条；")
+            if (fixedProgress > 0) append("修正越界进度 $fixedProgress 本；")
+            if (isEmpty()) append("已检查，没有需要修复的问题")
+        }.trimEnd('；')
+    }
+
+    /** 今天的阅读时长（毫秒）。阅读目标与「今日已读」提示都用它。 */
+    fun todayReadMs(): Long {
+        val today = SimpleDateFormat("yyyy-MM-dd", Locale.CHINA).format(java.util.Date())
+        return dao.recentReadLog(1).firstOrNull { it.day == today }?.ms ?: 0L
+    }
+
     fun dailyReadMs(n: Int): List<Pair<String, Long>> {
         val values = dao.recentReadLog(n).associate { it.day to it.ms }
         val out = mutableListOf<Pair<String, Long>>()
@@ -449,6 +520,9 @@ class Db(context: Context) {
         (if (kind == null) dao.listNotes(bookId) else dao.listNotes(bookId, kind)).map { it.toModel() }
 
     /** 按 kind 取笔记详情（带 anchor/status）：重点的颜色与位置都存在这两列里。 */
+    /** 某本书的全部笔记（含 anchor 与 status）。导出划线时需要这两个字段。 */
+    fun allNoteDetails(bookId: Long): List<NoteDetail> = dao.listNotes(bookId).map { it.toDetail() }
+
     fun listNoteDetails(bookId: Long, kind: String): List<NoteDetail> =
         dao.listNotes(bookId, kind).map { it.toDetail() }
 

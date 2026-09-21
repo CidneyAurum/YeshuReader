@@ -75,6 +75,15 @@ class ReaderView(
         /** 记住上次使用的 AI 动作，供菜单里的「重复上次」使用。 */
         private const val AI_LAST_ACTION_KEY = "ai_last_action"
 
+        /** 自动滚动步进间隔。太快会晕，太慢又感觉没动，2.2s 一屏步长比较接近翻页节奏。 */
+        private const val AUTO_SCROLL_INTERVAL_MS = 2200L
+
+        /** 中文默读速度的默认估算值（字/分钟）。真实速度会用会话数据不断修正。 */
+        private const val DEFAULT_CHARS_PER_MINUTE = 420
+
+        /** 生词条目最长保存多少字。段落长按拿到的是整段，直接全存进去会变成「长难句本」。 */
+        private const val VOCAB_MAX_CHARS = 60
+
         /** 每本书的最近阅读位置标签，书架条目读取它显示「第 N 章 / 第 N 页」。 */
         fun positionSettingKey(bookId: Long): String = "reader_last_position_$bookId"
         private val BOLD_RE = Regex("\\*\\*(.+?)\\*\\*")
@@ -147,6 +156,40 @@ class ReaderView(
 
     // 文本分段渲染状态
     private var boxRef: LinearLayout? = null
+
+    // ---------- 朗读与自动滚动 ----------
+    /** 朗读器。懒创建：只有真正用过朗读的会话才需要初始化 TTS 引擎。 */
+    private var speech: ReaderSpeech? = null
+    private var speechBar: LinearLayout? = null
+    private var speechPaused = false
+    /** 自动滚动的循环任务；非空表示正在自动滚动。 */
+    private var autoScrollTask: Runnable? = null
+    private var autoScrollSpeed = 2
+    /** 朗读语速倍率，跨会话保留。 */
+    private var speechRate = 1f
+
+    // ---------- 排版与视觉（R54–R58）----------
+    /** 正文字体族：默认 / 衬线 / 等宽。 */
+    private var fontFamilyKey = "default"
+    /** 护眼暖色强度 0–100，0 表示关闭。 */
+    private var warmth = 0
+    private var keepAwake = false
+    /** 正文两端对齐。中文好看，英文会出现过大字距，所以做成可选。 */
+    private var justify = false
+    /** 页码显示口径：percent / remaining / position。 */
+    private var pageMode = "percent"
+    private var warmOverlay: View? = null
+    /** 顶栏副标题（章名/页码）。抽成字段是为了让「改页码口径」能立即刷新它。 */
+    private var curHeadTv: TextView? = null
+
+    /** 阅读速度估算（字/分钟）。默认值取中文默读的常见区间中值，随后按真实会话修正。 */
+    private var charsPerMinute = DEFAULT_CHARS_PER_MINUTE
+    /** 每日阅读目标（分钟），0 表示未设。 */
+    private var dailyGoalMinutes = 0
+    /** 本次阅读会话开始时的块下标，用于估算真实阅读速度。 */
+    private var sessionStartBlock = -1
+
+
     private var renderedUpTo = 0
 
     // 沉浸模式：上下栏引用与状态
@@ -581,7 +624,7 @@ class ReaderView(
             ellipsize = android.text.TextUtils.TruncateAt.END
             gravity = Gravity.CENTER
         }
-        val curHeadTv = TextView(act).apply {
+        curHeadTv = TextView(act).apply {
             text = book.author.ifBlank { "继续阅读" }
             textSize = 10f
             setTextColor(Accent.chromeTextSecondary)
@@ -652,22 +695,7 @@ class ReaderView(
             // 顶栏当前章名联动（微信读书式方位感）+ 实时百分比
             // 顶栏副标题：始终显示「真实位置 · 统一百分比」。
             // 没有章节结构的 TXT / PDF / 图片集以前会长期停在一句无意义的格式串。
-            val percent = (currentProgress() * 100).toInt()
-            val (posIndex, posTotal) = progressPosition()
-            val show = if (pdfRenderer != null || bookFormat == "pdf") {
-                "PDF · 第 ${posIndex + 1}${if (posTotal > 0) " / $posTotal" else ""} 页 · $percent%"
-            } else if (posIndex >= 0) {
-                var name: String? = null
-                for (h in tocHeads) { if (h.first <= posIndex) name = h.second else break }
-                if (name.isNullOrBlank()) "第 ${posIndex + 1} / $posTotal 段 · $percent%"
-                else "${name.take(20)} · $percent%"
-            } else {
-                null
-            }
-            if (show != null && curHeadTv.text != show) {
-                curHeadTv.visibility = View.VISIBLE
-                curHeadTv.text = show
-            }
+            refreshTopBar()
             val now = System.currentTimeMillis()
             if (now - lastSavedAt > 1500) {
                 lastSavedAt = now
@@ -738,12 +766,32 @@ class ReaderView(
             setupRepeatable(inc) { applyFontSp(styleSp + 1f) }
             bottom.addView(inc)
         }
+        // 朗读控制条：只在朗读时出现，默认不占位置。
+        speechBar = buildSpeechBar().apply { visibility = View.GONE }
+        col.addView(speechBar, LayoutParams(-1, -2))
         col.addView(bottom, LayoutParams(-1, -2).also { lp ->
             lp.setMargins(Glass.dp(10, d), Glass.dp(2, d), Glass.dp(10, d), Glass.dp(8, d))
         })
         // 底部导航栏 inset 交给工具坞承担（进度条在它上方，一并抬高），
         // 否则三键导航机型上工具坞与进度条会被系统栏盖住；同时回到主线程请求 inset。
         post { col.applySystemBarInsets(bottom) }
+
+        // 护眼暖色与常亮在这里落地一次；之后由设置面板即时更新。
+        applyWarmth()
+        applyKeepAwake()
+
+        // 自动滚动时触摸即暂停，松手继续：否则想停下来看一眼都做不到。
+        sc?.setOnTouchListener { _, ev ->
+            when (ev.actionMasked) {
+                android.view.MotionEvent.ACTION_DOWN -> {
+                    autoScrollTask?.let { repeatHandler?.removeCallbacks(it) }
+                }
+                android.view.MotionEvent.ACTION_UP, android.view.MotionEvent.ACTION_CANCEL -> {
+                    autoScrollTask?.let { task -> repeatHandler?.postDelayed(task, AUTO_SCROLL_INTERVAL_MS) }
+                }
+            }
+            false
+        }
     }
 
     /** 长按连发：按下 380ms 后每 130ms 重复执行；长按后的 click 被吞掉防双重 */
@@ -798,6 +846,14 @@ class ReaderView(
         // 排版参数与已划重点必须在渲染块之前就位，否则首屏块会用默认行距/无色渲染
         lineSpacingFactor = db.getSetting("reader_line_spacing")?.toFloatOrNull()?.coerceIn(1.0f, 2.0f) ?: 1.38f
         marginDp = db.getSetting("reader_margin_dp")?.toIntOrNull()?.coerceIn(8, 40) ?: 20
+        speechRate = db.getSetting("reader_speech_rate")?.toFloatOrNull()?.coerceIn(0.5f, 2f) ?: 1f
+        fontFamilyKey = db.getSetting("reader_font_family") ?: "default"
+        warmth = db.getSetting("reader_warmth")?.toIntOrNull()?.coerceIn(0, 100) ?: 0
+        keepAwake = db.getSetting("reader_keep_awake") == "1"
+        justify = db.getSetting("reader_justify") == "1"
+        pageMode = db.getSetting("reader_page_mode") ?: "percent"
+        charsPerMinute = db.getSetting("reader_chars_per_min")?.toIntOrNull()?.coerceIn(80, 2000) ?: DEFAULT_CHARS_PER_MINUTE
+        dailyGoalMinutes = db.getSetting("reader_daily_goal_min")?.toIntOrNull()?.coerceIn(0, 600) ?: 0
         loadHighlights()
         val box = LinearLayout(act).apply {
             orientation = LinearLayout.VERTICAL
@@ -1001,16 +1057,26 @@ class ReaderView(
         val anchorOffset = if (anchorIdx >= 0) {
             (box.getChildAt(anchorIdx)?.top ?: 0) - (sc?.scrollY ?: 0)
         } else 0
+        // 字体族与对齐也要一起重排：只改字号会让「换成衬线」看起来没生效。
+        val typeface = typefaceFor(fontFamilyKey)
+        val align = if (justify) android.text.Layout.Alignment.ALIGN_NORMAL else null
         for (i in 0 until box.childCount) {
             val v = box.getChildAt(i) as? TextView ?: continue
             if (v.tag == "head") {
                 v.textSize = styleSp + 4f
                 v.setPadding(Glass.dp(marginDp, d), Glass.dp(26, d), Glass.dp(marginDp, d), Glass.dp(10, d))
+                // 标题恒为粗体，字体族换成衬线/等宽时才不会丢失强调
+                v.setTypeface(typeface, Typeface.BOLD)
             } else {
                 v.textSize = styleSp
                 v.setLineSpacing(0f, lineSpacingFactor)
                 v.setPadding(Glass.dp(marginDp, d), Glass.dp(6, d), Glass.dp(marginDp, d), Glass.dp(6, d))
+                v.setTypeface(typeface, Typeface.NORMAL)
+                // 两端对齐用 justificationMode 而不是 alignment：后者对中文无效。
+                v.justificationMode = if (justify) android.text.Layout.JUSTIFICATION_MODE_INTER_WORD
+                else android.text.Layout.JUSTIFICATION_MODE_NONE
             }
+            if (align == null) v.textAlignment = View.TEXT_ALIGNMENT_TEXT_START
         }
         if (anchorIdx >= 0) {
             // 重排是一次 requestLayout，必须等布局完成后再按锚点还原滚动位置
@@ -1025,6 +1091,127 @@ class ReaderView(
                     }
                 }
             )
+        }
+    }
+
+    // ---------- 阅读节奏（R59–R61）----------
+
+    /**
+     * 当前章剩余字数。从当前块往后数到下一个标题为止。
+     *
+     * 用块下标而不是「章节百分比 × 总字数」：后者在长短章差异大的书里误差很大，
+     * 而这里只需要一次线性扫描，成本可以忽略。
+     */
+    private fun chapterRemainingChars(): Int {
+        val blocks = docBlocks ?: return 0
+        val start = currentBlockIndex().coerceAtLeast(0)
+        var end = blocks.size
+        for (i in start + 1 until blocks.size) {
+            if (blocks[i].type == Block.HEADING) { end = i; break }
+        }
+        return (start until end).sumOf { blocks[it].text.length }
+    }
+
+    /** 本章剩余阅读时间（分钟）。速度是估算值，界面上必须标「约」。 */
+    private fun chapterRemainingMinutes(): Int {
+        val chars = chapterRemainingChars()
+        if (chars <= 0) return 0
+        return ((chars.toFloat() / charsPerMinute) * 60f / 60f).toInt().coerceAtLeast(1)
+    }
+
+    /**
+     * 用本次会话修正阅读速度。
+     *
+     * 只在会话足够长（≥1 分钟且滚过至少 3 块）时更新：太短的会话（翻一下就走）
+     * 会把速度估到离谱的数值，反过来污染「剩余时间」。
+     */
+    private fun learnReadingSpeed(elapsedMs: Long) {
+        val blocks = docBlocks ?: return
+        val start = sessionStartBlock
+        val end = currentBlockIndex()
+        sessionStartBlock = end
+        if (start < 0 || end <= start || elapsedMs < 60_000L) return
+        val chars = (start until minOf(end, blocks.size)).sumOf { blocks[it].text.length }
+        if (chars < 300) return
+        val measured = (chars * 60_000.0 / elapsedMs).toInt()
+        if (measured !in 80..2000) return
+        // 指数平滑：单次会话波动很大，直接覆盖会让剩余时间忽长忽短。
+        charsPerMinute = (charsPerMinute * 0.6f + measured * 0.4f).toInt().coerceIn(80, 2000)
+        db.setSetting("reader_chars_per_min", charsPerMinute.toString())
+    }
+
+    /** 今日已读分钟数与目标，用于顶栏提示与达成提醒。 */
+    private fun todayReadMinutes(): Int = (Db(act).todayReadMs() / 60_000L).toInt()
+
+    /**
+     * 刷新顶栏副标题。抽成函数是因为滚动、切章、改页码口径三处都要用同一份逻辑；
+     * 页码口径可切（百分比 / 剩余页 / 位置），三种都从同一个进度函数推导。
+     */
+    private fun refreshTopBar() {
+        val suffix = pageModeSuffix()
+        val (posIndex, posTotal) = progressPosition()
+        val show = if (pdfRenderer != null || bookFormat == "pdf") {
+            "PDF · 第 ${posIndex + 1}${if (posTotal > 0) " / $posTotal" else ""} 页 · $suffix"
+        } else if (posIndex >= 0) {
+            var name: String? = null
+            for (h in tocHeads) { if (h.first <= posIndex) name = h.second else break }
+            if (name.isNullOrBlank()) "第 ${posIndex + 1} / $posTotal 段 · $suffix"
+            else "${name.take(20)} · $suffix"
+        } else {
+            null
+        }
+        val tv = curHeadTv ?: return
+        if (show != null && tv.text != show) {
+            tv.visibility = View.VISIBLE
+            tv.text = show
+        }
+    }
+
+    // ---------- 排版与视觉 ----------
+
+    /** 字体族。null 表示跟随系统默认，交给平台挑最合适的无衬线字体。 */
+    private fun typefaceFor(key: String): Typeface? = when (key) {
+        "serif" -> Typeface.SERIF
+        "mono" -> Typeface.MONOSPACE
+        else -> null
+    }
+
+    /** 护眼暖色叠加层。加在阅读器最上层且不接收触摸，只做染色。 */
+    private fun applyWarmth() {
+        if (warmth <= 0) {
+            warmOverlay?.visibility = View.GONE
+            return
+        }
+        val overlay = warmOverlay ?: View(act).apply {
+            isClickable = false
+            isFocusable = false
+            importantForAccessibility = View.IMPORTANT_FOR_ACCESSIBILITY_NO
+            // 暖色而不是纯橙：橙在深色底上会明显偏色，琥珀色更接近「夜间模式」的观感。
+            setBackgroundColor(Color.argb((warmth * 0.55f).toInt().coerceIn(0, 140), 255, 176, 92))
+            addView(this, LayoutParams(-1, -1))
+        }.also { warmOverlay = it }
+        overlay.visibility = View.VISIBLE
+    }
+
+    /** 阅读时保持常亮。只在阅读器存活期间生效，退出即恢复系统行为。 */
+    private fun applyKeepAwake() {
+        if (keepAwake) act.window.addFlags(android.view.WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+        else act.window.clearFlags(android.view.WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+    }
+
+    /**
+     * 当前页码口径下的顶栏文案。
+     *
+     * 三种口径各有场景：百分比适合「还剩多少」，剩余页适合纸质书直觉，
+     * 位置适合按章回阅读。统一从 [currentProgress] 推导，保证与进度条一致。
+     */
+    private fun pageModeSuffix(): String {
+        val percent = (currentProgress() * 100).toInt()
+        val (posIndex, posTotal) = progressPosition()
+        return when (pageMode) {
+            "remaining" -> if (posTotal > 0 && posIndex >= 0) "还剩 ${(posTotal - posIndex - 1).coerceAtLeast(0)} 页" else "$percent%"
+            "position" -> if (posTotal > 0 && posIndex >= 0) "第 ${posIndex + 1} / $posTotal" else "$percent%"
+            else -> "$percent%"
         }
     }
 
@@ -1169,6 +1356,99 @@ class ReaderView(
             applyTypography()
             dialog.dismiss()
             toast("页边距：${next.second}")
+        }
+
+        label("排版")
+        val fontFamilies = listOf("default" to "默认", "serif" to "衬线", "mono" to "等宽")
+        optionRow(
+            "字体",
+            fontFamilies.joinToString(" / ") { it.second } + "（当前 ${fontFamilies.first { it.first == fontFamilyKey }.second}）",
+            false,
+        ) {
+            val index = fontFamilies.indexOfFirst { it.first == fontFamilyKey }.let { if (it < 0) 0 else it }
+            val next = fontFamilies[(index + 1) % fontFamilies.size]
+            fontFamilyKey = next.first
+            db.setSetting("reader_font_family", fontFamilyKey)
+            applyTypography()
+            dialog.dismiss()
+            toast("字体：${next.second}")
+        }
+        optionRow("两端对齐", if (justify) "已开启（中文更整齐，英文可能出现大字距）" else "已关闭", justify) {
+            justify = !justify
+            db.setSetting("reader_justify", if (justify) "1" else "0")
+            applyTypography()
+            dialog.dismiss()
+            toast(if (justify) "已开启两端对齐" else "已关闭两端对齐")
+        }
+
+        label("视觉")
+        val warmthSteps = listOf(0 to "关闭", 25 to "轻", 50 to "中", 75 to "强")
+        optionRow(
+            "护眼暖色",
+            "夜间减少蓝光（当前 ${warmthSteps.firstOrNull { it.first == warmth }?.second ?: "自定义"}）",
+            warmth > 0,
+        ) {
+            val index = warmthSteps.indexOfFirst { it.first == warmth }.let { if (it < 0) 0 else it }
+            val next = warmthSteps[(index + 1) % warmthSteps.size]
+            warmth = next.first
+            db.setSetting("reader_warmth", warmth.toString())
+            applyWarmth()
+            dialog.dismiss()
+            toast("护眼暖色：${next.second}")
+        }
+        optionRow("阅读时常亮", if (keepAwake) "已开启：阅读时不息屏" else "已关闭：跟随系统息屏", keepAwake) {
+            keepAwake = !keepAwake
+            db.setSetting("reader_keep_awake", if (keepAwake) "1" else "0")
+            applyKeepAwake()
+            dialog.dismiss()
+            toast(if (keepAwake) "阅读时保持常亮" else "已恢复系统息屏")
+        }
+
+        label("页码显示")
+        val pageModes = listOf("percent" to "百分比", "remaining" to "剩余页", "position" to "位置")
+        optionRow(
+            "顶栏口径",
+            pageModes.joinToString(" / ") { it.second } + "（当前 ${pageModes.first { it.first == pageMode }.second}）",
+            false,
+        ) {
+            val index = pageModes.indexOfFirst { it.first == pageMode }.let { if (it < 0) 0 else it }
+            val next = pageModes[(index + 1) % pageModes.size]
+            pageMode = next.first
+            db.setSetting("reader_page_mode", pageMode)
+            dialog.dismiss()
+            // 立即刷新一次，不必等下一次滚动。
+            refreshTopBar()
+            toast("页码显示：${next.second}")
+        }
+
+        label("阅读节奏")
+        val remaining = chapterRemainingMinutes()
+        val todayMinutes = todayReadMinutes()
+        optionRow(
+            "本章剩余",
+            if (remaining > 0) "按当前速度约 $remaining 分钟（速度按你的实际阅读不断修正）"
+            else "本文档没有可估算的章节结构",
+            false,
+        ) {
+            toast(
+                if (remaining > 0) "本章还剩约 $remaining 分钟，当前速度约 $charsPerMinute 字/分钟"
+                else "这篇文档没有识别到章节标题，无法估算本章剩余时间"
+            )
+        }
+        val goalSteps = listOf(0, 15, 30, 45, 60)
+        optionRow(
+            "每日阅读目标",
+            if (dailyGoalMinutes == 0) "未设置"
+            else "每天 $dailyGoalMinutes 分钟 · 今日已读 $todayMinutes 分钟" +
+                if (todayMinutes >= dailyGoalMinutes) "（已达成）" else "",
+            dailyGoalMinutes > 0 && todayMinutes >= dailyGoalMinutes,
+        ) {
+            val index = goalSteps.indexOf(dailyGoalMinutes).let { if (it < 0) 0 else it }
+            val next = goalSteps[(index + 1) % goalSteps.size]
+            dailyGoalMinutes = next
+            db.setSetting("reader_daily_goal_min", dailyGoalMinutes.toString())
+            dialog.dismiss()
+            toast(if (next == 0) "已关闭阅读目标" else "每日目标：$next 分钟（今日已读 $todayMinutes 分钟）")
         }
 
         label("字号")
@@ -3527,6 +3807,8 @@ class ReaderView(
         }
         sheet.item("note", "复制这段", "只写进剪贴板，不联网") { copyBlockText(blockText) }
         sheet.item("search", "搜索这段", "用开头几个字在当前文档里找相关内容") { searchForBlockText(blockText) }
+        sheet.item("note", "加入生词本", "存进笔记的「生词」，复习时能跳回这一段") { saveVocab(blockText, anchor) }
+        sheet.item("search", "查词典 / 翻译", "交给系统里已安装的词典或翻译应用") { lookupBlockText(blockText) }
         sheet.item("share", "分享这段", "生成本段图片分享出去") { shareBlockAsImage(blockText, anchor) }
 
         sheet.section("AI 操作", "会把这一段发往 ${providerHost()}，费用由服务商收取")
@@ -3656,6 +3938,40 @@ class ReaderView(
             }
             .setNegativeButton("取消", null)
             .show().also { Glass.styleDialog(it, density(act)) }
+    }
+
+    /**
+     * 加入生词本。
+     *
+     * 复用笔记表（kind = vocab）：备份、导出划线、笔记中枢都能自动带上它，
+     * 不必为「词 + 出处」再维护一张表和一套迁移。
+     */
+    private fun saveVocab(blockText: String, anchor: String) {
+        val word = blockText.trim().take(VOCAB_MAX_CHARS)
+        if (word.isEmpty()) return
+        Thread {
+            saveAiNote("vocab", word, anchor, "")
+            act.runOnUiThread { toast("已加入生词本") }
+        }.apply { isDaemon = true }.start()
+    }
+
+    /** 交给系统已安装的词典/翻译应用处理选中文本，页枢自己不联网也不内置词库。 */
+    private fun lookupBlockText(blockText: String) {
+        val text = blockText.trim()
+        if (text.isEmpty()) return
+        val intent = android.content.Intent(android.content.Intent.ACTION_PROCESS_TEXT).apply {
+            type = "text/plain"
+            putExtra(android.content.Intent.EXTRA_PROCESS_TEXT, text)
+            putExtra(android.content.Intent.EXTRA_PROCESS_TEXT_READONLY, true)
+        }
+        val handlers = act.packageManager.queryIntentActivities(intent, 0)
+            .filter { it.activityInfo.packageName != act.packageName }
+        if (handlers.isEmpty()) {
+            showResult("查词典", "本机没有可处理选中文本的词典或翻译应用。安装一个之后再来试。")
+            return
+        }
+        runCatching { act.startActivity(android.content.Intent.createChooser(intent, "查词典 / 翻译")) }
+            .onFailure { showResult("查词典", "没有找到可用的应用。") }
     }
 
     /** 收藏金句：带上块锚点，笔记列表里能跳回原文（锚点列待 Db.addNote 开放） */
@@ -3878,6 +4194,169 @@ class ReaderView(
     }
 
     /** 窄屏「更多」：把放不下的动作收进同一个分组弹层，保证底栏每格都有足够热区。 */
+    /**
+     * 快速切换书籍：列出最近读过的书（不含当前这本）。
+     *
+     * 长书读到一半想查另一本，退回书架再找位置很打断；这里直接跳。
+     */
+    private fun showQuickSwitch() {
+        val books = Db(act).listBooks()
+            .filter { it.id != bookId }
+            .sortedByDescending { it.lastReadAt }
+            .take(8)
+        if (books.isEmpty()) {
+            showResult("切换书籍", "书架里还没有其它书。")
+            return
+        }
+        val sheet = BottomSheet(act, "切换到")
+        books.forEach { book ->
+            val pct = (book.progress * 100).toInt()
+            val subtitle = buildString {
+                if (book.author.isNotBlank()) append("${book.author} · ")
+                append(if (pct > 0) "已读 $pct%" else "还没开始")
+            }
+            sheet.item("book", book.title.take(24), subtitle) {
+                (act as MainActivity).openReader(book.id)
+            }
+        }
+        sheet.show()
+    }
+
+    // ---------- 朗读 ----------
+
+    /**
+     * 朗读与自动滚动都要接管滚动位置，同时开必然互相打架，所以互相排斥。
+     * 这里在启动任一方之前显式停掉另一方，而不是让它们竞争。
+     */
+    private fun startSpeech() {
+        stopAutoScroll()
+        val blocks = docBlocks ?: return
+        val texts = blocks.map { it.text }
+        if (texts.none { it.isNotBlank() }) {
+            showResult("朗读", "这篇文档没有可朗读的文字。")
+            return
+        }
+        val engine = speech ?: ReaderSpeech(
+            activity = act,
+            onProgress = { index -> followSpeech(index) },
+            onFinished = { hideSpeechBar() },
+            onUnavailable = { message ->
+                hideSpeechBar()
+                showResult("朗读", message)
+            },
+        ).also { speech = it }
+        engine.rate = speechRate
+        engine.start(texts, currentBlockIndex())
+        speechPaused = false
+        showSpeechBar()
+    }
+
+    /** 朗读跟随：把当前块滚到可视区。已经在屏幕内就不动，避免每块都抖一下。 */
+    private fun followSpeech(index: Int) {
+        val sv = sc ?: return
+        val box = boxRef ?: return
+        if (index >= box.childCount) return
+        if (pdfRenderer == null && index >= renderedUpTo && !ensureRenderedUpTo(index, PRELOAD_MAX_CHUNKS)) return
+        val target = box.getChildAt(index) ?: return
+        val top = target.top - Glass.dp(56, density(act))
+        val visibleTop = sv.scrollY
+        val visibleBottom = visibleTop + sv.height
+        // 只有超出可视范围才滚动：块内高亮已经能说明位置，频繁滚动反而晕。
+        if (target.top < visibleTop || target.bottom > visibleBottom) sv.smoothScrollTo(0, max(0, top))
+    }
+
+    private fun buildSpeechBar(): LinearLayout {
+        val d = density(act)
+        val bar = LinearLayout(act).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            background = chromeSurface(radiusDp = 18, alpha = 250)
+            setPadding(Glass.dp(10, d), Glass.dp(6, d), Glass.dp(10, d), Glass.dp(6, d))
+        }
+        fun actionView(text: String, description: String): TextView = TextView(act).apply {
+            this.text = text
+            textSize = 13f
+            gravity = Gravity.CENTER
+            setTextColor(Accent.chromeTextPrimary)
+            background = chromeChip(false)
+            foreground = Glass.pressFx()
+            contentDescription = description
+            layoutParams = LinearLayout.LayoutParams(0, Glass.dp(44, d), 1f)
+        }
+        val pauseResume = actionView("暂停", "暂停朗读")
+        pauseResume.setOnClickListener {
+            val engine = speech ?: return@setOnClickListener
+            speechPaused = !speechPaused
+            if (speechPaused) engine.pause() else engine.resume()
+            pauseResume.text = if (speechPaused) "继续" else "暂停"
+        }
+        val speed = actionView("语速 %.1fx".format(speechRate), "调整朗读语速")
+        speed.setOnClickListener {
+            // 三档循环。做滑杆在朗读中不好操作，档位切换能立刻听到效果。
+            speechRate = when {
+                speechRate < 0.9f -> 1.0f
+                speechRate < 1.4f -> 1.5f
+                else -> 0.75f
+            }
+            speech?.rate = speechRate
+            db.setSetting("reader_speech_rate", speechRate.toString())
+            speed.text = "语速 %.1fx".format(speechRate)
+        }
+        val stop = actionView("停止", "停止朗读")
+        stop.setOnClickListener { stopSpeech() }
+        bar.addView(pauseResume)
+        bar.addView(speed)
+        bar.addView(stop)
+        return bar
+    }
+
+    private fun showSpeechBar() {
+        val bar = speechBar ?: return
+        bar.visibility = View.VISIBLE
+        (bar.getChildAt(0) as? TextView)?.text = "暂停"
+    }
+
+    private fun hideSpeechBar() {
+        speechBar?.visibility = View.GONE
+        speechPaused = false
+    }
+
+    private fun stopSpeech() {
+        speech?.stop()
+        hideSpeechBar()
+    }
+
+    // ---------- 自动滚动 ----------
+
+    /** 自动滚动。触摸屏幕即暂停，松手后继续——否则想停下来看一眼都做不到。 */
+    private fun toggleAutoScroll() {
+        if (autoScrollTask != null) {
+            stopAutoScroll()
+            showResult("自动滚动", "已停止。")
+            return
+        }
+        stopSpeech()
+        val sv = sc ?: return
+        val handler = repeatHandler
+            ?: android.os.Handler(android.os.Looper.getMainLooper()).also { repeatHandler = it }
+        val step = Glass.dp(autoScrollSpeed, density(act))
+        val task = object : Runnable {
+            override fun run() {
+                if (!sv.isAttachedToWindow) return
+                sv.scrollBy(0, step)
+                handler.postDelayed(this, AUTO_SCROLL_INTERVAL_MS)
+            }
+        }
+        autoScrollTask = task
+        handler.postDelayed(task, AUTO_SCROLL_INTERVAL_MS)
+        showResult("自动滚动", "已开始，每 ${AUTO_SCROLL_INTERVAL_MS / 1000.0}s 滚动一屏步长；触摸屏幕或再点一次「自动滚动」即停止。")
+    }
+
+    private fun stopAutoScroll() {
+        autoScrollTask?.let { repeatHandler?.removeCallbacks(it) }
+        autoScrollTask = null
+    }
+
     private fun showMoreActions() {
         BottomSheet(act, "更多")
             .section("本书")
@@ -3887,6 +4366,9 @@ class ReaderView(
             .section("阅读")
             .item("sliders", "阅读设置", "主题 / 行距 / 页边距 / 字号") { showReaderSettings() }
             .item("bulb", "亮度", "单独调节阅读器亮度") { brightnessDialog() }
+            .item("book", "切换书籍", "不用退回书架，直接打开最近读过的书") { showQuickSwitch() }
+            .item("play", "朗读", "用系统语音从当前位置读起，会跟随高亮") { startSpeech() }
+            .item("chevron", "自动滚动", "免手翻页；触摸屏幕即暂停") { toggleAutoScroll() }
             .section("关于本文档")
             .item("folder", "文件信息", "格式 / 大小 / 导入时间 / 内容指纹") { showFileInfo() }
             .show()
@@ -4222,6 +4704,26 @@ class ReaderView(
         return true
     }
 
+    /**
+     * 外接键盘：空格/PageDown 下翻、PageUp 上翻、方向键小步滚动。
+     *
+     * 和音量键走同一条分发路径（MainActivity.onKeyDown），因为阅读器是嵌在 Compose 里的
+     * legacy View，自己收不到这些按键。返回 true 表示已消费。
+     */
+    fun handleHardwareKey(event: android.view.KeyEvent): Boolean {
+        if (event.action != android.view.KeyEvent.ACTION_DOWN) return false
+        val sv = sc ?: return false
+        val page = (sv.height * 0.85).toInt()
+        return when (event.keyCode) {
+            android.view.KeyEvent.KEYCODE_SPACE,
+            android.view.KeyEvent.KEYCODE_PAGE_DOWN -> { sv.smoothScrollBy(0, page); true }
+            android.view.KeyEvent.KEYCODE_PAGE_UP -> { sv.smoothScrollBy(0, -page); true }
+            android.view.KeyEvent.KEYCODE_DPAD_DOWN -> { sv.smoothScrollBy(0, Glass.dp(80, density(act))); true }
+            android.view.KeyEvent.KEYCODE_DPAD_UP -> { sv.smoothScrollBy(0, -Glass.dp(80, density(act))); true }
+            else -> false
+        }
+    }
+
     private var volumeKeyConsumed = false
     private var volumeFlipCached: Boolean? = null
 
@@ -4275,6 +4777,8 @@ class ReaderView(
         )
         if (counted <= 0L) return
         try { db.addReadTime(bookId, counted) } catch (e: Exception) {}
+        // 顺手用这次真实会话修正阅读速度，让「本章剩余时间」越用越准。
+        learnReadingSpeed(counted)
     }
 
     /** 由宿主在 onStop 调用：退到后台时暂停计时并落库，避免用户在别处仍被计入阅读时长 */
@@ -4289,7 +4793,11 @@ class ReaderView(
      * 也不会重复开启第二段计时。
      */
     fun resumeReadSession() {
-        if (readSessionStart == 0L) readSessionStart = System.currentTimeMillis()
+        if (readSessionStart == 0L) {
+            readSessionStart = System.currentTimeMillis()
+            // 记下会话起点块，flush 时才能算出「这段时间读了多少字」。
+            sessionStartBlock = currentBlockIndex()
+        }
     }
 
     override fun onDetachedFromWindow() {
@@ -4303,6 +4811,11 @@ class ReaderView(
         }
         repeatHandler?.let { h -> repeatLoops.forEach { h.removeCallbacks(it) } }
         repeatLoops.clear()
+        // 朗读与自动滚动都持有引擎/Handler，视图销毁后必须收口，否则会继续念或继续滚。
+        stopAutoScroll()
+        speech?.release()
+        speech = null
+        speechBar = null
         // pauseReadSession 是幂等的：saveProgress + flushReadTime 各只生效一次
         pauseReadSession()
         super.onDetachedFromWindow()

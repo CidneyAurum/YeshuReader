@@ -210,7 +210,7 @@ class ShelfView(private val act: Activity) : FrameLayout(act) {
             setPadding(Glass.dp(10, d), Glass.dp(5, d), Glass.dp(10, d), Glass.dp(5, d))
             setOnClickListener {
                 val cur = db.getSetting("shelf_sort") ?: "recent"
-                db.setSetting("shelf_sort", when (cur) { "recent" -> "title"; "title" -> "added"; else -> "recent" })
+                db.setSetting("shelf_sort", ShelfSort.next(cur))
                 refresh()
             }
         }
@@ -919,11 +919,15 @@ class ShelfView(private val act: Activity) : FrameLayout(act) {
             "done" -> rawBooks.filter { it.progress >= 0.99f }
             else -> rawBooks
         }
-        val books: List<Book> = when (sortMode) {
-            "title" -> filtered.sortedBy { it.title }
-            "added" -> filtered.sortedByDescending { it.addedAt }
-            else -> filtered.sortedByDescending { it.lastReadAt }
-        }
+        // 排序规则集中在 ShelfSort 里，便于单测（顺序改坏时很难从界面反推原因）。
+        val books: List<Book> = ShelfSort.sort(
+            items = filtered,
+            mode = sortMode,
+            title = { it.title },
+            author = { it.author },
+            addedAt = { it.addedAt },
+            lastReadAt = { it.lastReadAt },
+        )
         books.forEach(::ensureAutomaticCover)
 
         // 筛选 chips（非搜索时显示）
@@ -957,7 +961,7 @@ class ShelfView(private val act: Activity) : FrameLayout(act) {
         // 统计信息迁至搜索框下方常驻行（含排序按钮文案）
         val finishedN = books.count { it.progress >= 0.99f }
         val readingN = books.count { it.progress > 0.005f && it.progress < 0.99f }
-        val sortLabel = when (sortMode) { "title" -> "标题"; "added" -> "加入"; else -> "最近" }
+        val sortLabel = ShelfSort.label(sortMode)
         statTv.text = buildString {
             append("${books.size} 本书")
             if (subs.isNotEmpty()) append(" · ${subs.size} 个分类")

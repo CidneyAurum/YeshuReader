@@ -11,6 +11,7 @@ import androidx.room.OnConflictStrategy
 import androidx.room.PrimaryKey
 import androidx.room.Query
 import androidx.room.Room
+import androidx.room.Update
 import androidx.room.RoomDatabase
 import androidx.room.migration.Migration
 import androidx.sqlite.db.SupportSQLiteDatabase
@@ -154,6 +155,21 @@ interface YeshuDao {
 
     @Insert
     fun addBookmark(bookmark: BookmarkEntity): Long
+
+    /** 全库书签，自检与导出划线都要用。 */
+    @Query("SELECT * FROM bookmarks ORDER BY created_at DESC")
+    fun listAllBookmarks(): List<BookmarkEntity>
+
+    @Update
+    fun updateBookmark(bookmark: BookmarkEntity)
+
+    /** 整行回写笔记。自检修复孤儿笔记时需要改 book_id。 */
+    @Update
+    fun updateNote(note: NoteEntity)
+
+    /** 夹回越界进度。status 一并重算，避免进度与状态互相矛盾。 */
+    @Query("UPDATE books SET progress=:progress, status=:status WHERE id=:id")
+    fun updateBookProgress(id: Long, progress: Float, status: String)
 
     @Query("SELECT * FROM bookmarks WHERE book_id=:bookId ORDER BY created_at DESC")
     fun listBookmarks(bookId: Long): List<BookmarkEntity>

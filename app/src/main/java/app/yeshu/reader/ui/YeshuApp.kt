@@ -100,6 +100,7 @@ import app.yeshu.reader.Book
 import app.yeshu.reader.ChatView
 import app.yeshu.reader.Db
 import app.yeshu.reader.Destination
+import app.yeshu.reader.HighlightExport
 import app.yeshu.reader.LibraryItem
 import app.yeshu.reader.MainActivity
 import app.yeshu.reader.NoteKindLabels
@@ -1212,7 +1213,33 @@ private fun NotesHubScreen(activity: MainActivity, revision: Int) {
                         }
                     }
                     if (loaded.marks.isNotEmpty()) {
-                        item { SectionHeader("标记", "书签与划过的重点，点击回到原文位置") }
+                        item {
+                            SectionHeader("标记", "书签与划过的重点，点击回到原文位置")
+                        }
+                        item {
+                            // 跨书导出：Readwise 式的用法，粘进笔记库后按书分节。
+                            val scope = rememberCoroutineScope()
+                            OutlinedButton(
+                                onClick = {
+                                    scope.launch {
+                                        val md = withContext(Dispatchers.IO) { HighlightExport.forAllBooks(db) }
+                                        val intent = android.content.Intent(android.content.Intent.ACTION_SEND).apply {
+                                            type = "text/plain"
+                                            putExtra(android.content.Intent.EXTRA_SUBJECT, "页枢 · 全部划线与笔记")
+                                            // 走 Binder 有 1MB 上限，超限会直接崩；截断并告知。
+                                            val limit = 200_000
+                                            val body = if (md.length <= limit) md
+                                                else md.take(limit) + "\n\n…（内容过长，已截断）"
+                                            putExtra(android.content.Intent.EXTRA_TEXT, body)
+                                        }
+                                        runCatching {
+                                            activity.startActivity(android.content.Intent.createChooser(intent, "导出全部划线"))
+                                        }
+                                    }
+                                },
+                                shape = RoundedCornerShape(18.dp),
+                            ) { Text("导出全部划线") }
+                        }
                         items(loaded.marks, key = { it.key }) { mark ->
                             MarkHubCard(mark) { activity.openReader(mark.bookId, mark.anchor) }
                         }
@@ -2533,6 +2560,41 @@ private fun SettingsScreen(activity: MainActivity) {
                                 colors = ButtonDefaults.buttonColors(containerColor = ActiveViolet)
                             ) { Text("导出完整备份") }
                             OutlinedButton(onClick = activity::importBackup, shape = RoundedCornerShape(18.dp)) { Text("导入恢复") }
+                        }
+                        // 数据自检：只做无争议的清理，孤儿笔记归到「全局」而不是删除。
+                        val scope = rememberCoroutineScope()
+                        var integrityNote by remember { mutableStateOf("") }
+                        Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+                            OutlinedButton(
+                                shape = RoundedCornerShape(18.dp),
+                                onClick = {
+                                    scope.launch {
+                                        val r = withContext(Dispatchers.IO) { db.integrityReport() }
+                                        integrityNote = if (r.clean) {
+                                            "自检通过：没有孤儿笔记、悬空书签或越界进度。"
+                                        } else {
+                                            val parts = buildList {
+                                                if (r.orphanNotes > 0) add("孤儿笔记 ${r.orphanNotes} 条")
+                                                if (r.danglingBookmarks > 0) add("悬空书签 ${r.danglingBookmarks} 个")
+                                                if (r.invalidProgress > 0) add("越界进度 ${r.invalidProgress} 本")
+                                                if (r.danglingHighlights > 0) add("无锚点重点 ${r.danglingHighlights} 条")
+                                            }
+                                            "发现${parts.joinToString("、")}。可点「修复」清理。"
+                                        }
+                                    }
+                                },
+                            ) { Text("数据自检") }
+                            OutlinedButton(
+                                shape = RoundedCornerShape(18.dp),
+                                onClick = {
+                                    scope.launch {
+                                        integrityNote = withContext(Dispatchers.IO) { db.repairIntegrity() }
+                                    }
+                                },
+                            ) { Text("修复") }
+                        }
+                        if (integrityNote.isNotBlank()) {
+                            Text(integrityNote, fontSize = 11.sp, color = secondaryText())
                         }
                     }
                 }
