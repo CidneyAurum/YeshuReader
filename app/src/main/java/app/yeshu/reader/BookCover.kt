@@ -14,7 +14,10 @@ import android.util.LruCache
  */
 object BookCover {
 
-    // 内存缓存：同一本书只画一次
+    // 内存缓存：同一本书只画一次。
+    // 这里刻意不在 entryRemoved 里 recycle：占位封面会被直接交给存活的 ImageView 绘制，
+    // 缓存的同一个 Bitmap 可能同时被多个 ImageView 引用，回收会让它们抛出
+    // "trying to use a recycled bitmap"。淘汰的位图交给 GC 处理更安全。
     private val cache = LruCache<String, Bitmap>(24)
 
     /** 生成占位封面（w x h 像素）。title 用于稳定取色与排版。 */
@@ -27,7 +30,8 @@ object BookCover {
         val density = w / 160f   // 以 160px 宽为基准缩放排版
 
         // 1) 稳定取色：书名 hash → 低饱和双色对，垂直渐变
-        val idx = (title.hashCode().let { if (it < 0) -it else it }) % T.coverPairs.size
+        // Math.floorMod 保证 Int.MIN_VALUE 也能得到非负下标（-Int.MIN_VALUE 会溢出）
+        val idx = Math.floorMod(title.hashCode(), T.coverPairs.size)
         val (topHex, botHex) = T.coverPairs[idx]
         val paint = Paint(Paint.ANTI_ALIAS_FLAG)
         paint.shader = LinearGradient(

@@ -53,6 +53,10 @@ class JSONObject {
     }
 
     fun put(name: String, value: Any?): JSONObject = apply { values[name] = value }
+
+    /** 生产代码用 JSONObject.toString() 生成请求体，垫片必须实现它，否则请求体不是 JSON。 */
+    override fun toString(): String =
+        values.entries.joinToString(",", "{", "}") { (key, value) -> "${quoteJson(key)}:${renderJson(value)}" }
 }
 
 class JSONArray internal constructor(internal val values: MutableList<Any?>) {
@@ -69,6 +73,35 @@ class JSONArray internal constructor(internal val values: MutableList<Any?>) {
     fun optJSONObject(index: Int): JSONObject? = values.getOrNull(index) as? JSONObject
 
     fun put(value: Any?): JSONArray = apply { values += value }
+
+    override fun toString(): String = values.joinToString(",", "[", "]") { renderJson(it) }
+}
+
+private fun quoteJson(value: String): String {
+    val sb = StringBuilder(value.length + 2)
+    sb.append('"')
+    for (char in value) {
+        when (char) {
+            '"' -> sb.append("\\\"")
+            '\\' -> sb.append("\\\\")
+            '\n' -> sb.append("\\n")
+            '\r' -> sb.append("\\r")
+            '\t' -> sb.append("\\t")
+            '\b' -> sb.append("\\b")
+            '\u000C' -> sb.append("\\f")
+            else -> if (char < ' ') sb.append("\\u%04x".format(char.code)) else sb.append(char)
+        }
+    }
+    sb.append('"')
+    return sb.toString()
+}
+
+private fun renderJson(value: Any?): String = when (value) {
+    null -> "null"
+    is String -> quoteJson(value)
+    is Boolean, is Number -> value.toString()
+    is JSONObject, is JSONArray -> value.toString()
+    else -> quoteJson(value.toString())
 }
 
 class JSONException(message: String) : RuntimeException(message)

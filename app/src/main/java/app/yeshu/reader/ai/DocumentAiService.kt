@@ -213,6 +213,8 @@ class DocumentAiService(
 
         private const val MIN_CONTEXT_CHARS = 2_048
         private const val MAX_SEGMENT_TEXT_CHARS = 1_200
+        /** 校验失败提示的上限，避免把整段模型输出或超长引用列表塞进对话框。 */
+        private const val MAX_VALIDATION_MESSAGE_CHARS = 240
         private val SUPPORTED_FORMATS = setOf("txt", "md", "epub", "docx", "pptx")
         private val CITABLE_TYPES = setOf(
             AnchorType.PAGE,
@@ -611,19 +613,30 @@ class DocumentAiService(
             return bullets.filter { extractCitationTokens(it).isEmpty() }
         }
 
-        private fun validationMessage(output: ValidatedOutput): String = buildString {
-            append("Model output failed validation")
-            if (output.content.isBlank()) append(": empty output")
-            if (output.missingSections.isNotEmpty()) append("; missing sections=${output.missingSections.joinToString()}")
-            if (output.citations.valid.isEmpty()) append("; no valid citations")
+        /**
+         * 面向用户的失败原因：先给中文结论和下一步操作，再附上有限长度的诊断细节。
+         * 这个字符串会直接出现在“调用失败：”之后，所以不能以英文校验原文开头。
+         */
+        private fun validationMessage(output: ValidatedOutput): String {
+            val lead = when {
+                output.content.isBlank() -> "模型没有返回任何内容，可以重试，或换用更稳定的模型"
+                output.citations.invalid.isNotEmpty() -> "模型引用了不存在的段落，已拒绝这次结果，可以重试，或换用更稳定的模型"
+                output.citations.valid.isEmpty() -> "模型没有给出可核对的引用，已拒绝这次结果，可以重试，或换用更强的模型"
+                output.missingSections.isNotEmpty() -> "模型没有按六段格式输出，可以重试，或换用更强的模型"
+                output.uncitedConclusionLines.isNotEmpty() -> "模型的结论没有标注出处，已拒绝这次结果，可以重试"
+                else -> "模型输出未通过校验，可以重试，或换用更强的模型"
+            }
+            val details = mutableListOf<String>()
+            if (output.missingSections.isNotEmpty()) {
+                details += "缺少段落：${output.missingSections.joinToString("、")}"
+            }
             if (output.citations.invalid.isNotEmpty()) {
-                append("; invalid citations=")
-                append(output.citations.invalid.joinToString { it.raw })
+                details += "无效引用：${output.citations.invalid.take(5).joinToString("、") { it.raw }}"
             }
             if (output.uncitedConclusionLines.isNotEmpty()) {
-                append("; uncited conclusions=")
-                append(output.uncitedConclusionLines.joinToString { it.take(80) })
+                details += "未标注出处的结论条目：${output.uncitedConclusionLines.size} 条"
             }
+            return (listOf(lead) + details).joinToString("\n").take(MAX_VALIDATION_MESSAGE_CHARS)
         }
 
         private fun jsonEscape(value: String): String = buildString(value.length + 16) {

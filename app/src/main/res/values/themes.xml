@@ -1,5 +1,12 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
+    <!--
+      平台主题（窗口背景 / 自动填充弹窗 / 对话框外框 / 系统栏）必须与 app 的浅色主题一致，
+      所以父主题是 Light 变体。app 内的深色模式由用户偏好驱动（LegacyTheme/LegacyPalette、
+      Compose YeshuTheme），不随 uiMode 切换，因此这里不提供 values-night 覆盖：
+      否则用户「强制浅色 + 系统深色」时平台界面会反向错配。
+      对话框底色/文字由 Glass.styleDialog 按调色板逐个覆盖。
+    -->
     <style name="AppTheme" parent="android:Theme.Material.Light.NoActionBar">
         <item name="android:fontFamily">sans</item>
         <item name="android:windowLightStatusBar">false</item>

@@ -3,7 +3,6 @@ package app.yeshu.reader
 import android.app.Activity
 import android.content.Intent
 import android.graphics.Bitmap
-import android.graphics.BitmapFactory
 import android.graphics.Color
 import android.graphics.RenderEffect
 import android.graphics.Typeface
@@ -12,14 +11,9 @@ import android.net.Uri
 import android.os.Build
 import android.view.Gravity
 import android.view.View
-import android.widget.FrameLayout
-import android.widget.ImageView
-import android.widget.LinearLayout
 import android.widget.ScrollView
-import android.widget.TextView
 import androidx.core.view.ViewCompat
 import androidx.core.view.WindowInsetsCompat
-import java.io.File
 import kotlin.math.roundToInt
 
 /** 让根布局避开系统栏：顶部状态栏/刘海用 padding 下移内容；底部手势导航区用 margin 抬高 content（背景保持全屏 edge-to-edge） */
@@ -49,10 +43,6 @@ fun View.applySystemBarInsets(content: View? = null): View {
 /** 玻璃拟态公共组件：全局背景 + 毛玻璃卡片 */
 object Glass {
     const val REQ_BG = 101
-    const val REQ_BOOK = 102
-    const val REQ_SETTINGS = 103
-
-    fun bgFile(ctx: Activity) = File(ctx.filesDir, "bg.jpg")
 
     /** iOS 毛玻璃卡片：半透明白 + 大圆角 + 细白描边 */
     fun card(): GradientDrawable = GradientDrawable().apply {
@@ -80,7 +70,7 @@ object Glass {
         val pressed = Color.argb(60, 255, 255, 255)
         return android.graphics.drawable.StateListDrawable().apply {
             addState(intArrayOf(android.R.attr.state_pressed),
-                GradientDrawable().apply { setColor(pressed); cornerRadius = 999f })
+                GradientDrawable().apply { setColor(pressed); cornerRadius = T.rPill.toFloat() })
             addState(intArrayOf(), GradientDrawable().apply { setColor(normal) })
         }
     }
@@ -88,30 +78,63 @@ object Glass {
     /** 胶囊形底（搜索框/主按钮） */
     fun pillBg(tint: Int = Color.argb(100, 255, 255, 255)): GradientDrawable =
         GradientDrawable().apply {
-            cornerRadius = 999f
+            cornerRadius = T.rPill.toFloat()
             setColor(tint)
             setStroke(2, Color.argb(55, 255, 255, 255))
         }
 
-    /** 对话框玻璃化：圆角浅底 + 无系统直角框，show() 之后调用 */
-    fun styleDialog(dlg: android.app.Dialog, density: Float) {
+    /**
+     * 对话框玻璃化：圆角浅底 + 无系统直角框，show() 之后调用。
+     * 底色跟随当前主题（夜间阅读时不能再整屏闪白），palette 默认从对话框上下文解析，
+     * 因此 ReaderView/ShelfView 等旧调用点无需改动。
+     */
+    fun styleDialog(
+        dlg: android.app.Dialog,
+        density: Float,
+        palette: LegacyPalette = LegacyPalette.of(dlg.context)
+    ) {
         dlg.window?.setBackgroundDrawable(
             GradientDrawable().apply {
-                setColor(Color.argb(242, 249, 250, 253))
+                setColor(if (palette.dark) palette.surface else Color.argb(242, 249, 250, 253))
                 cornerRadius = dp(26, density).toFloat()
             }
         )
+        // 平台浅色主题给对话框内部文字的是深色，深底上会读不出来，需显式改成调色板颜色
+        if (palette.dark) {
+            (dlg.window?.decorView as? android.view.ViewGroup)?.let { recolorDialogText(it, palette) }
+        }
     }
 
-    /** iOS 风格空状态卡：大 emoji + 主文案 + 副文案（深色实底 surface） */
-    fun emptyState(activity: Activity, emoji: String, title: String, sub: String): android.view.View {
+    /** 深色对话框：递归把标题/正文/按钮/输入框的文字改成浅色（EditText 连 hint 一起改） */
+    private fun recolorDialogText(v: View, palette: LegacyPalette) {
+        when (v) {
+            is android.widget.EditText -> {
+                v.setTextColor(palette.textP)
+                v.setHintTextColor(palette.textT)
+            }
+            is android.widget.Button -> v.setTextColor(Color.parseColor("#8FB6FF"))
+            is android.widget.TextView -> v.setTextColor(palette.textP)
+        }
+        if (v is android.view.ViewGroup) {
+            for (i in 0 until v.childCount) recolorDialogText(v.getChildAt(i), palette)
+        }
+    }
+
+    /** iOS 风格空状态卡：大 emoji + 主文案 + 副文案（跟随主题的表面/文字色） */
+    fun emptyState(
+        activity: Activity,
+        emoji: String,
+        title: String,
+        sub: String,
+        palette: LegacyPalette = LegacyPalette.of(activity)
+    ): android.view.View {
         val d = density(activity)
         val box = android.widget.LinearLayout(activity).apply {
             orientation = android.widget.LinearLayout.VERTICAL
             gravity = Gravity.CENTER
             background = GradientDrawable().apply {
                 cornerRadius = dp(16 * 3, d).toFloat()
-                setColor(Color.parseColor("#1C1C1E"))
+                setColor(if (palette.dark) Color.parseColor("#1C1C1E") else palette.surface)
             }
             setPadding(dp(28, d), dp(34, d), dp(28, d), dp(34, d))
         }
@@ -123,7 +146,7 @@ object Glass {
         box.addView(android.widget.TextView(activity).apply {
             text = title
             textSize = 17f
-            setTextColor(Color.parseColor("#F5F5F7"))
+            setTextColor(if (palette.dark) Color.parseColor("#F5F5F7") else palette.textP)
             setTypeface(null, Typeface.BOLD)
             gravity = Gravity.CENTER
             setPadding(0, dp(12, d), 0, 0)
@@ -131,7 +154,7 @@ object Glass {
         box.addView(android.widget.TextView(activity).apply {
             text = sub
             textSize = 13f
-            setTextColor(Color.argb(158, 245, 245, 247))
+            setTextColor(if (palette.dark) Color.argb(158, 245, 245, 247) else palette.textS)
             gravity = Gravity.CENTER
             setPadding(0, dp(6, d), 0, 0)
         })
@@ -204,30 +227,33 @@ object Glass {
         return bmp
     }
 
-    /** 根布局：背景图铺满 + 内容容器 */
-    fun root(activity: Activity): Pair<FrameLayout, LinearLayout> {
-        val root = FrameLayout(activity)
-        val iv = ImageView(activity).apply {
-            scaleType = ImageView.ScaleType.CENTER_CROP
-            val f = bgFile(activity)
-            if (f.exists()) setImageBitmap(BitmapFactory.decodeFile(f.absolutePath))
-            setBackgroundColor(Color.parseColor("#3D5A80"))
-        }
-        blur(iv)
-        root.addView(iv, FrameLayout.LayoutParams(-1, -1))
-        val content = LinearLayout(activity).apply { orientation = LinearLayout.VERTICAL }
-        root.addView(content, FrameLayout.LayoutParams(-1, -1))
-        return root to content
-    }
-
-    fun title(text: String, size: Float = 22f) = TextView(null).apply {
-        this.text = text
-        textSize = size
-        setTextColor(Color.WHITE)
-        setTypeface(null, Typeface.BOLD)
-    }
-
+    /** dp → px */
     fun dp(v: Int, density: Float) = (v * density).roundToInt()
 }
 
 fun density(activity: Activity) = activity.resources.displayMetrics.density
+
+/**
+ * 笔记 kind → 中文标签的唯一权威映射。
+ * NotesView / StatsView / YeshuApp 都应引用此处，避免各自维护一份缺键（尤其是 AI 书籍简介 "intro"）的副本。
+ */
+object NoteKindLabels {
+    val all: Map<String, String> = mapOf(
+        "summary" to "摘要",
+        "ask" to "问答",
+        "quiz" to "自测",
+        "chat" to "聊天",
+        "quote" to "金句",
+        "digest" to "精读",
+        "report" to "报告",
+        "intro" to "书籍简介",
+        "study_pack" to "理解包",
+        "quiz_grade" to "批改"
+    )
+
+    /** 展示顺序（筛选 chips 等按此序渲染），与 [all] 的键保持一致 */
+    val order: List<String> = all.keys.toList()
+
+    /** 未知 kind 统一回退为“笔记” */
+    fun label(kind: String): String = all[kind] ?: "笔记"
+}

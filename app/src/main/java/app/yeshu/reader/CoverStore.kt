@@ -49,6 +49,14 @@ object CoverStore {
 
     fun hasCover(ctx: Context, bookId: Long): Boolean = file(ctx, bookId).isFile
 
+    /**
+     * 丢弃某本书的内存封面缓存。封面文件被外部改写（例如备份恢复合并了归档封面）后
+     * 必须调用，否则列表会一直显示旧图直到缓存自然淘汰。
+     */
+    fun invalidate(bookId: Long) {
+        mem.remove(bookId)
+    }
+
     fun isCustom(ctx: Context, bookId: Long): Boolean =
         file(ctx, bookId).isFile && customMarker(ctx, bookId).isFile
 
@@ -412,7 +420,12 @@ object CoverStore {
 
     private fun renderFirstPage(source: File): Bitmap? {
         val descriptor = ParcelFileDescriptor.open(source, ParcelFileDescriptor.MODE_READ_ONLY)
-        val renderer = PdfRenderer(descriptor)
+        val renderer = try {
+            PdfRenderer(descriptor)
+        } catch (t: Throwable) {
+            try { descriptor.close() } catch (_: Exception) {}
+            throw t
+        }
         try {
             if (renderer.pageCount == 0) return null
             renderer.openPage(0).use { page ->
@@ -428,7 +441,9 @@ object CoverStore {
                 return bitmap
             }
         } finally {
-            renderer.close()
+            // PdfRenderer 不持有描述符所有权，必须显式关闭，否则每张 PDF 封面泄漏一个 fd
+            try { renderer.close() } catch (_: Exception) {}
+            try { descriptor.close() } catch (_: Exception) {}
         }
     }
 }

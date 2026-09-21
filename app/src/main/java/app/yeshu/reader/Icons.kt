@@ -32,6 +32,9 @@ class IconView(
 
     init {
         layoutParams = android.view.ViewGroup.LayoutParams(dp(sizeDp), dp(sizeDp))
+        // 纯装饰性的自绘图标本身没有语义，交给外层可点击容器描述，
+        // 否则 TalkBack 会读出一堆「未标记的视图」。
+        importantForAccessibility = IMPORTANT_FOR_ACCESSIBILITY_NO
     }
 
     private fun dp(v: Int) = (v * density).toInt()

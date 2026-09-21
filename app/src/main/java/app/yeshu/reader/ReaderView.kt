@@ -42,6 +42,12 @@ class ReaderView(
     companion object {
         private const val SYS_PROMPT = "你是专业的中文阅读助手。用简体中文回答，输出简洁、结构化。"
         private const val CHUNK = 300
+        /** 按需续载上限：恢复位置/跳转时最多预渲染 PRELOAD_MAX_CHUNKS*CHUNK 块，避免超长文档一次性铺满 */
+        private const val PRELOAD_MAX_CHUNKS = 120
+        /** 单次阅读会话计入时长上限：异常超长会话按上限计入，不再整段丢弃 */
+        private const val READ_SESSION_CAP_MS = 6 * 3600_000L
+        /** PDF 位图缓存预算：按字节回收，避免几百页文档常驻上百 MB */
+        private const val PDF_BITMAP_CACHE_BYTES = 48L * 1024 * 1024
         private const val PDF_DEFAULT_PAGE_RATIO = 1.4142f
         private const val PDF_SIZE_SCAN_BATCH = 12
 
@@ -76,6 +82,8 @@ class ReaderView(
     private var docFullText: String = ""
     private val aiCancelled = java.util.concurrent.atomic.AtomicBoolean(false)
     private var aiCancelToken: AiClient.CancelToken? = null
+    /** 当前流式 AI 对话框：detach 时必须主动关闭，否则工作线程仍持有已分离的视图树 */
+    private var aiDialog: android.app.Dialog? = null
 
     // 文本分段渲染状态
     private var boxRef: LinearLayout? = null
@@ -125,7 +133,17 @@ class ReaderView(
     private var pageViews: Array<PdfPageView?> = emptyArray()
     private var pageRenderPending = BooleanArray(0)
     private var pdfBody: LinearLayout? = null
+    // PDF 页面累计偏移缓存：滚动时二分定位可见页，替代每帧遍历全部页视图
+    private var pdfTops = IntArray(0)
+    private var pdfTopsDirty = true
+    private var pdfTopsWidth = -1
+    private var pdfBitmapBytes = 0L
     private var imageBitmap: Bitmap? = null
+    private var imageView: ImageView? = null
+
+    // 长按连发循环：detach 时必须移除已排队的回调，否则空转并持有整棵视图树
+    private var repeatHandler: android.os.Handler? = null
+    private val repeatLoops = mutableListOf<Runnable>()
 
     private class PdfPageView(context: Context) : ImageView(context) {
         private var heightToWidth = PDF_DEFAULT_PAGE_RATIO
@@ -158,7 +176,7 @@ class ReaderView(
         }
     }
 
-    private class PdfSession(val renderer: PdfRenderer) {
+    private class PdfSession(val renderer: PdfRenderer, private val descriptor: ParcelFileDescriptor) {
         private val closed = AtomicBoolean(false)
         private val executor = Executors.newSingleThreadExecutor { task ->
             Thread(task, "reader-pdf").apply { isDaemon = true }
@@ -226,12 +244,19 @@ class ReaderView(
             try {
                 executor.execute {
                     try { renderer.close() } catch (_: Exception) {}
+                    closeDescriptor()
                 }
             } catch (_: RejectedExecutionException) {
                 try { renderer.close() } catch (_: Exception) {}
+                closeDescriptor()
             } finally {
                 executor.shutdown()
             }
+        }
+
+        /** PdfRenderer 不持有 fd 所有权：渲染器关闭后再关描述符，重复关闭按空操作容忍 */
+        private fun closeDescriptor() {
+            try { descriptor.close() } catch (_: Exception) {}
         }
     }
 
@@ -380,9 +405,15 @@ class ReaderView(
                 db.deleteSetting("screen_bright")
             }
         savedBrightness?.toIntOrNull()?.takeIf { it in 10..100 }?.let { pct ->
-            val lp = act.window.attributes
-            lp.screenBrightness = pct / 100f
-            act.window.attributes = lp
+            // 宿主可能在 IO 线程构造本视图（YeshuApp 的 withContext(Dispatchers.IO)），
+            // 改窗口亮度属于主线程契约，延后到 post 执行。
+            post {
+                try {
+                    val lp = act.window.attributes
+                    lp.screenBrightness = pct / 100f
+                    act.window.attributes = lp
+                } catch (_: Exception) {}
+            }
         }
         val f = File(act.filesDir, book.fileName)
         bookFormat = book.format.ifBlank { DocParser.detect(book.fileName) }
@@ -417,7 +448,7 @@ class ReaderView(
         val col = LinearLayout(act).apply { orientation = LinearLayout.VERTICAL }
         root.addView(col, LayoutParams(-1, -1))
         addView(root, LayoutParams(-1, -1))
-        applySystemBarInsets(col)
+        // 系统栏 inset 与窗口属性都必须在主线程请求，这里延后到 post（见下方 applySystemBarInsets）。
 
         // 顶栏：紧凑悬浮玻璃条，左右等宽使书名真正居中。
         val top = LinearLayout(act).apply {
@@ -552,9 +583,12 @@ class ReaderView(
                 val range = (bx?.height ?: 0) - sv.height
                 if (bx != null && range > 0) {
                     val frac = (sv.scrollY.toFloat() / range).coerceIn(0f, 1f)
-                    val curIdx = (frac * ((docBlocks?.size ?: 1) - 1)).toInt()
+                    // 块高差异大，章名必须按真实可见块判断，不能用滚动比例反推索引
+                    val curIdx = currentBlockIndex()
                     var name: String? = null
-                    for (h in tocHeads) { if (h.first <= curIdx) name = h.second else break }
+                    if (curIdx >= 0) {
+                        for (h in tocHeads) { if (h.first <= curIdx) name = h.second else break }
+                    }
                     val show = name?.let { it.take(20) + " · " + (frac * 100).toInt() + "%" }
                     if (show != null && curHeadTv.text != show) {
                         curHeadTv.visibility = View.VISIBLE
@@ -626,19 +660,24 @@ class ReaderView(
         col.addView(bottom, LayoutParams(-1, -2).also { lp ->
             lp.setMargins(Glass.dp(10, d), Glass.dp(2, d), Glass.dp(10, d), Glass.dp(8, d))
         })
+        // 底部导航栏 inset 交给工具坞承担（进度条在它上方，一并抬高），
+        // 否则三键导航机型上工具坞与进度条会被系统栏盖住；同时回到主线程请求 inset。
+        post { col.applySystemBarInsets(bottom) }
     }
 
     /** 长按连发：按下 380ms 后每 130ms 重复执行；长按后的 click 被吞掉防双重 */
     private fun setupRepeatable(v: android.view.View, action: () -> Unit) {
-        val h = android.os.Handler(android.os.Looper.getMainLooper())
+        val h = repeatHandler
+            ?: android.os.Handler(android.os.Looper.getMainLooper()).also { repeatHandler = it }
         var longFired = false
         val loop = object : Runnable {
             override fun run() {
-                if (readSessionStart < 0) return  // view 已 detach
+                if (!v.isAttachedToWindow) return  // view 已 detach，停止连发
                 action()
                 h.postDelayed(this, 130)
             }
         }
+        repeatLoops += loop
         v.setOnLongClickListener {
             longFired = true
             action()
@@ -675,29 +714,106 @@ class ReaderView(
         }
         boxRef = box
         renderedUpTo = 0
-        // 底部留白（常驻末位，分块插入到它之前）
-        val pad = View(act).apply { setPadding(0, 0, 0, Glass.dp(60, d)) }
-        box.addView(pad, LayoutParams(-1, Glass.dp(40, d)))
+        // 底部留白（常驻末位，分块插入到它之前）：高度本身就是留白，
+        // 原先 60dp 的 bottom padding 会被 40dp 的固定高度裁掉，这里直接给足高度。
+        val pad = View(act)
+        box.addView(pad, LayoutParams(-1, Glass.dp(60, d)))
         sv.addView(box, LayoutParams(-1, -2))
         appendChunk(CHUNK)
 
-        // 恢复进度时按需预载足够多的块，保证目标位置已渲染
+        // 恢复进度时按需预载足够多的块，保证目标位置已渲染。
+        // 不能只看「已渲染块占比 >= p」：CHUNK 粒度下会停在前缀里，比例套到截断高度上会跳错位置。
         val total = doc.blocks.size
         val p = db.getBook(bookId)?.progress ?: 0f
-        var guard = 0
-        while (total > 0 && renderedUpTo < total &&
-            renderedUpTo.toFloat() / total < p && guard++ < 60) {
-            appendChunk(CHUNK)
+        val restoring = p > 0.001f && p < 0.999f
+        if (restoring && total > 0) {
+            ensureRenderedUpTo(((p * (total - 1)).toInt()).coerceIn(0, total - 1), PRELOAD_MAX_CHUNKS)
         }
 
         sv.post {
-            if (p > 0.001f && p < 0.999f) {
+            if (!restoring) return@post
+            val applyRestore = Runnable {
                 try {
                     val range = (box.height - sv.height).coerceAtLeast(0)
-                    sv.scrollTo(0, (range * p).toInt())
+                    // 前缀未加载完时按已渲染占比换算，把比例限制在真实渲染出的高度内
+                    val loaded = if (total > 0) {
+                        (renderedUpTo.toFloat() / total.toFloat()).coerceIn(0.0001f, 1f)
+                    } else 1f
+                    val fixed = if (loaded >= 0.999f) p else (p / loaded).coerceIn(0f, 1f)
+                    sv.scrollTo(0, (range * fixed).toInt())
                 } catch (e: Exception) {}
             }
+            if (box.height > 0) {
+                applyRestore.run()
+            } else {
+                // 首次布局尚未完成时 box.height 仍是 0，直接滚会退回文首，等一次布局再恢复
+                box.viewTreeObserver.addOnGlobalLayoutListener(
+                    object : android.view.ViewTreeObserver.OnGlobalLayoutListener {
+                        override fun onGlobalLayout() {
+                            val observer = box.viewTreeObserver
+                            if (observer.isAlive) observer.removeOnGlobalLayoutListener(this)
+                            applyRestore.run()
+                        }
+                    }
+                )
+            }
         }
+    }
+
+    /**
+     * 按需续载直到 [index] 已渲染；返回是否真正渲染到位。
+     * 上限 [maxChunks] 用于兜住超长文档，避免一次性铺满整本书。
+     */
+    private fun ensureRenderedUpTo(index: Int, maxChunks: Int): Boolean {
+        val total = docBlocks?.size ?: return false
+        if (pdfRenderer != null || total <= 0 || index < 0) return false
+        var guard = 0
+        while (renderedUpTo <= index && renderedUpTo < total && guard++ < maxChunks) {
+            appendChunk(CHUNK)
+        }
+        return renderedUpTo > index
+    }
+
+    /**
+     * 当前可见块索引：块高差异很大，用滚动比例反推会指错章节，统一按真实布局位置查找。
+     * 子 View 的 bottom 随索引单调不减，二分查找即可，避免每帧遍历上万个子 View。
+     */
+    private fun visibleBlockIndex(): Int {
+        val box = boxRef ?: return -1
+        val sv = sc ?: return -1
+        if (box.height <= 0 || renderedUpTo <= 0) return -1
+        val last = min(renderedUpTo, box.childCount) - 1
+        if (last < 0) return -1
+        val y = sv.scrollY
+        var lo = 0
+        var hi = last
+        var ans = last
+        while (lo <= hi) {
+            val mid = (lo + hi) ushr 1
+            if ((box.getChildAt(mid)?.bottom ?: 0) > y) {
+                ans = mid
+                hi = mid - 1
+            } else {
+                lo = mid + 1
+            }
+        }
+        return ans
+    }
+
+    /** 布局尚未完成时的兜底：按滚动比例估算块索引 */
+    private fun estimatedBlockIndex(): Int {
+        val box = boxRef ?: return -1
+        val sv = sc ?: return -1
+        val total = docBlocks?.size ?: return -1
+        val range = box.height - sv.height
+        if (range <= 0 || total <= 0) return -1
+        return (sv.scrollY.toFloat() / range * (total - 1)).toInt().coerceIn(0, total - 1)
+    }
+
+    /** 当前阅读位置所在块：优先真实可见块，布局未就绪时退回比例估算 */
+    private fun currentBlockIndex(): Int {
+        val real = visibleBlockIndex()
+        return if (real >= 0) real else estimatedBlockIndex()
     }
 
     private fun makeBlockView(b: Block): TextView {
@@ -732,22 +848,43 @@ class ReaderView(
     /** 就地调整字号：不重建界面、不丢滚动位置 */
     private fun applyFontSp(newSp: Float) {
         if (bookFormat == "pdf" || pdfRenderer != null) return
-        styleSp = newSp.coerceIn(12f, 26f)
-        db.setSetting("reader_font_sp", styleSp.toString())
+        val clamped = newSp.coerceIn(12f, 26f)
+        if (clamped == styleSp) return
         val box = boxRef ?: return
+        // 记住当前可见块及其在视口内的像素偏移：字号变化会重排，不重新锚定就会甩走几百行
+        val anchorIdx = visibleBlockIndex()
+        val anchorOffset = if (anchorIdx >= 0) {
+            (box.getChildAt(anchorIdx)?.top ?: 0) - (sc?.scrollY ?: 0)
+        } else 0
+        styleSp = clamped
+        db.setSetting("reader_font_sp", styleSp.toString())
         for (i in 0 until box.childCount) {
             val v = box.getChildAt(i)
             if (v is TextView && v.tag != "head") v.textSize = styleSp
             if (v is TextView && v.tag == "head") v.textSize = styleSp + 4f
+        }
+        if (anchorIdx >= 0) {
+            // 重排是一次 requestLayout，必须等布局完成后再按锚点还原滚动位置
+            box.viewTreeObserver.addOnGlobalLayoutListener(
+                object : android.view.ViewTreeObserver.OnGlobalLayoutListener {
+                    override fun onGlobalLayout() {
+                        val observer = box.viewTreeObserver
+                        if (observer.isAlive) observer.removeOnGlobalLayoutListener(this)
+                        val sv = sc ?: return
+                        val v = box.getChildAt(anchorIdx) ?: return
+                        sv.scrollTo(0, (v.top - anchorOffset).coerceAtLeast(0))
+                    }
+                }
+            )
         }
     }
 
     /** 三套主题即时切换：正文背景、正文文字和标题同时刷新。 */
     private fun applyReaderTheme(theme: ReaderTheme) {
         readerTheme = theme
+        // 只记住阅读器自己的主题键：night_mode / night_follow_sys 属于全局外观设置，
+        // 在这里回写会静默覆盖设置页里的全局主题（Compose 侧走 DataStore）。
         db.setSetting("reader_theme", theme.key)
-        db.setSetting("night_mode", if (theme == ReaderTheme.DARK) "1" else "0")
-        db.setSetting("night_follow_sys", "0")
         refreshThemeCell()
 
         val textBox = boxRef
@@ -911,6 +1048,7 @@ class ReaderView(
             setImageBitmap(bitmap)
             setOnClickListener { toggleBars() }
         }
+        imageView = image
         sv.setBackgroundColor(themeStage())
         sv.addView(image, LayoutParams(-1, -2))
         restoreScroll(sv)
@@ -924,7 +1062,7 @@ class ReaderView(
             try { fd.close() } catch (_: Exception) {}
             throw t
         }
-        val session = PdfSession(renderer)
+        val session = PdfSession(renderer, fd)
         pdfRenderer = renderer
         pdfSession = session
         val n = renderer.pageCount
@@ -976,19 +1114,15 @@ class ReaderView(
         val viewH = sv.height
         if (viewH <= 0) return
 
-        var firstVis = -1
-        var lastVis = -1
-        var acc = 0
-        for (i in pageViews.indices) {
-            val v = pageViews[i] ?: continue
-            val top = acc + (v.layoutParams as MarginLayoutParams).topMargin
-            val h = if (v.height > 0) v.height else v.estimatedHeight(sv.width)
-            val bottom = top + h
-            acc = bottom + (v.layoutParams as MarginLayoutParams).bottomMargin
-            if (bottom >= scrollY && firstVis == -1) firstVis = i
-            if (top <= scrollY + viewH) lastVis = i
+        // 页面偏移缓存：宽度变化或页高变化后重建一次，之后滚动只做二分查找
+        val tops = if (pdfTopsDirty || pdfTopsWidth != sv.width || pdfTops.size != pageViews.size + 1) {
+            if (!buildPdfTops(sv)) return
+            pdfTops
+        } else {
+            pdfTops
         }
-        if (firstVis == -1) return
+        val firstVis = pageIndexAt(tops, scrollY)
+        val lastVis = pageIndexAt(tops, scrollY + viewH)
 
         for (i in max(0, firstVis - 1)..min(pageViews.size - 1, lastVis + 1)) {
             if (pageBitmaps.get(i) == null && !pageRenderPending[i]) {
@@ -999,11 +1133,74 @@ class ReaderView(
         for (i in pageBitmaps.size() - 1 downTo 0) {
             val key = pageBitmaps.keyAt(i)
             if (key < firstVis - 8 || key > lastVis + 8) {
-                pageViews[key]?.setImageDrawable(null)
-                pageBitmaps.valueAt(i)?.recycle()
-                pageBitmaps.removeAt(i)
+                evictPdfBitmap(key)
             }
         }
+        // 再按字节预算回收：靠近窗口但总量超预算时，从最远的页开始淘汰（可见窗口 ±1 永不回收）
+        if (pdfBitmapBytes > PDF_BITMAP_CACHE_BYTES) {
+            val keepFrom = max(0, firstVis - 1)
+            val keepTo = min(pageViews.size - 1, lastVis + 1)
+            val candidates = ArrayList<Int>(pageBitmaps.size())
+            for (i in 0 until pageBitmaps.size()) {
+                val key = pageBitmaps.keyAt(i)
+                if (key in keepFrom..keepTo) continue
+                candidates.add(key)
+            }
+            candidates.sortByDescending { key -> max(keepFrom - key, key - keepTo) }
+            for (key in candidates) {
+                if (pdfBitmapBytes <= PDF_BITMAP_CACHE_BYTES) break
+                evictPdfBitmap(key)
+            }
+        }
+    }
+
+    /** 重建 PDF 页面累计偏移表（pdfTops[i] = 第 i 页 top，末尾一项为内容总高） */
+    private fun buildPdfTops(sv: ScrollView): Boolean {
+        val n = pageViews.size
+        if (n == 0) return false
+        val out = IntArray(n + 1)
+        var acc = 0
+        for (i in 0 until n) {
+            val v = pageViews[i]
+            val lp = v?.layoutParams as? MarginLayoutParams
+            acc += lp?.topMargin ?: 0
+            out[i] = acc
+            acc += if (v != null && v.height > 0) v.height else (v?.estimatedHeight(sv.width) ?: 0)
+            acc += lp?.bottomMargin ?: 0
+        }
+        out[n] = acc
+        pdfTops = out
+        pdfTopsWidth = sv.width
+        pdfTopsDirty = false
+        return true
+    }
+
+    /** 二分查找：返回最后一个 tops[i] <= y 的页下标（i 最大为页数-1） */
+    private fun pageIndexAt(tops: IntArray, y: Int): Int {
+        val n = tops.size - 1
+        if (n <= 0) return 0
+        var lo = 0
+        var hi = n - 1
+        var ans = 0
+        while (lo <= hi) {
+            val mid = (lo + hi) ushr 1
+            if (tops[mid] <= y) {
+                ans = mid
+                lo = mid + 1
+            } else {
+                hi = mid - 1
+            }
+        }
+        return ans
+    }
+
+    /** 回收单页位图并同步字节预算 */
+    private fun evictPdfBitmap(key: Int) {
+        val bmp = pageBitmaps.get(key) ?: return
+        pageViews.getOrNull(key)?.setImageDrawable(null)
+        pdfBitmapBytes -= bmp.byteCount.toLong()
+        pageBitmaps.remove(key)
+        bmp.recycle()
     }
 
     private fun renderPage(session: PdfSession, index: Int, containerW: Int) {
@@ -1044,12 +1241,16 @@ class ReaderView(
                     return@runOnUiThread
                 }
                 targetView.setPageSize(pageWidth, pageHeight)
+                // 真实页高到位后偏移表失效，需重建
+                pdfTopsDirty = true
                 val old = pageBitmaps.get(index)
                 if (old != null && old !== result) {
                     targetView.setImageDrawable(null)
+                    pdfBitmapBytes -= old.byteCount.toLong()
                     old.recycle()
                 }
                 pageBitmaps.put(index, result)
+                pdfBitmapBytes += result.byteCount.toLong()
                 targetView.setImageBitmap(result)
             }
         }
@@ -1096,6 +1297,7 @@ class ReaderView(
             val size = sizes[index] ?: continue
             pageViews.getOrNull(index)?.setPageSize(size.first, size.second)
         }
+        pdfTopsDirty = true
         body.post {
             if (pdfSession !== session || session.isClosed() || !isAttachedToWindow) return@post
             restoreScrollNow(sv, progress)
@@ -1117,6 +1319,10 @@ class ReaderView(
         pageRenderPending = BooleanArray(0)
         pageViews = emptyArray()
         pdfBody = null
+        pdfBitmapBytes = 0L
+        pdfTops = IntArray(0)
+        pdfTopsDirty = true
+        pdfTopsWidth = -1
         session?.close()
     }
 
@@ -1189,7 +1395,7 @@ class ReaderView(
 
     private fun generateTextStudyPack(item: Book, file: File, cfg: AiClient.Config) {
         val service = DocumentAiService(db)
-        runAiStream(null, "文档理解包") { onDelta, onReason ->
+        runAiStream(null, "文档理解包") { onDelta, onReason, onRestart ->
             when (val prepared = service.prepare(item, file, cfg)) {
                 is DocumentAiService.Preparation.Cached -> {
                     onDelta(prepared.artifact.content)
@@ -1202,9 +1408,11 @@ class ReaderView(
                         request.systemPrompt,
                         request.userPrompt,
                         onDelta,
-                        onReason = onReason
+                        onReason = onReason,
+                        onRestart = onRestart
                     )
                     service.saveCompleted(request, output)
+                    persistStudyPack(output)
                     output
                 }
             }
@@ -1223,7 +1431,7 @@ class ReaderView(
             return
         }
         val service = DocumentAiService(db)
-        runAiStream(null, if (singleImage) "图片理解包" else "PDF 理解包") { onDelta, onReason ->
+        runAiStream(null, if (singleImage) "图片理解包" else "PDF 理解包") { onDelta, onReason, onRestart ->
             val pages = if (singleImage) {
                 listOfNotNull(imageBitmap?.copy(Bitmap.Config.ARGB_8888, false))
             } else {
@@ -1274,14 +1482,28 @@ class ReaderView(
                     request.userPrompt,
                     pages,
                     onDelta,
-                    onReason = onReason
+                    onReason = onReason,
+                    onRestart = onRestart
                 )
                 service.saveCompleted(request, output)
+                persistStudyPack(output)
                 output
             } finally {
                 pages.forEach { it.recycle() }
             }
         }
+    }
+
+    /**
+     * 理解包同时落一条笔记：ai_artifacts 只有 AI 内部缓存会读，对话框关闭后用户再无入口查看。
+     * 只在真正生成（saveCompleted）后写，命中缓存时不重复落库，避免同一内容堆积多条笔记。
+     */
+    private fun persistStudyPack(content: String) {
+        if (content.isBlank()) return
+        try {
+            // kind 与 ai_artifacts 的 kind 保持一致，笔记列表按 kind 过滤时也认得出
+            db.addNote(bookId, DocumentAiService.KIND_STUDY_PACK, content)
+        } catch (_: Exception) {}
     }
 
     /** 前情提要：当前章之前的内容浓缩，追长篇防忘剧情 */
@@ -1292,11 +1514,8 @@ class ReaderView(
             showResult("提示", "本书没有章节结构，无法定位「当前章之前」的内容。\n可以改用「内容问答」。")
             return
         }
-        val sv = sc ?: return
-        val bx = sv.getChildAt(0) as? LinearLayout ?: return
-        val range = (bx.height) - sv.height
-        val frac = if (range > 0) sv.scrollY.toFloat() / range else 0f
-        val curIdx = (frac * (blocks.size - 1)).toInt()
+        // 块高差异大：当前块按真实可见位置取，不能用比例反推
+        val curIdx = currentBlockIndex().coerceAtLeast(0)
         var start = 0
         for (h in tocHeads) { if (h.first <= curIdx) start = h.first else break }
         if (start == 0) {
@@ -1305,11 +1524,11 @@ class ReaderView(
         }
         val before = blocks.drop((start - 60).coerceAtLeast(0)).take(60)
             .joinToString("\n") { it.text }
-        runAiStream("recap", "前情提要") { onDelta, onReason ->
+        runAiStream("recap", "前情提要") { onDelta, onReason, onRestart ->
             AiClient.chat(cfg, SYS_PROMPT,
                 "读者正在读长篇/资料，下面是当前章节之前的内容节选。请用约 200 字梳理「到目前为止发生了什么」：" +
                     "关键事件、出场人物及其动机、留下的悬念。只输出提要正文。\n\n【前文开始】\n${before.take(18000)}\n【前文结束】",
-                onDelta, onReason = onReason)
+                onDelta, onReason = onReason, onRestart = onRestart)
         }
     }
 
@@ -1318,11 +1537,11 @@ class ReaderView(
         val cfg = aiReady() ?: return
         val chapter = currentChapterText()
         if (chapter.isBlank()) { showResult("提示", "当前章节没有可分析文本"); return }
-        runAiStream("cast", "人物速查") { onDelta, onReason ->
+        runAiStream("cast", "人物速查") { onDelta, onReason, onRestart ->
             AiClient.chat(cfg, SYS_PROMPT,
                 "从下面的章节内容中提取出场人物（最多 6 个）。每个人物一行：「名字 —— 身份/角色 + 当前状态或动机」，" +
                     "按重要性排序。若为非小说类文档，则提取核心概念/术语代替人物。\n\n${chapter.take(12000)}",
-                onDelta, onReason = onReason)
+                onDelta, onReason = onReason, onRestart = onRestart)
         }
     }
 
@@ -1334,12 +1553,8 @@ class ReaderView(
     /** 当前可见章节的纯文本（供聊天 system 上下文） */
     private fun currentChapterText(): String {
         val blocks = docBlocks ?: return ""
-        val sv = sc ?: return ""
-        // 找当前章起点：最后一个 tocHead <= 当前块
-        val bx = sv.getChildAt(0) as? LinearLayout ?: return ""
-        val range = (bx.height) - sv.height
-        val frac = if (range > 0) sv.scrollY.toFloat() / range else 0f
-        val curIdx = (frac * (blocks.size - 1)).toInt()
+        // 找当前章起点：最后一个 tocHead <= 当前块（当前块按真实可见位置取）
+        val curIdx = currentBlockIndex().coerceAtLeast(0)
         var start = 0
         for (h in tocHeads) { if (h.first <= curIdx) start = h.first else break }
         // 取起点后 ~40 块
@@ -1382,7 +1597,12 @@ class ReaderView(
     }
 
     /** 流式 AI 任务：对话框内打字机输出 + 推理模型思考区，成功自动存笔记（kind=null 不存） */
-    private fun runAiStream(kind: String?, title: String, onDone: ((String) -> Unit)? = null, call: (onDelta: (String) -> Unit, onReason: (String) -> Unit) -> String) {
+    private fun runAiStream(
+        kind: String?,
+        title: String,
+        onDone: ((String) -> Unit)? = null,
+        call: (onDelta: (String) -> Unit, onReason: (String) -> Unit, onRestart: () -> Unit) -> String
+    ) {
         val d = density(act)
         aiCancelled.set(false)
         val cancelToken = AiClient.CancelToken().also { aiCancelToken = it }
@@ -1419,9 +1639,17 @@ class ReaderView(
         }
         dlgBuilder.setPositiveButton("关闭", null)
         val dlg = dlgBuilder.create()
+        // 任何关闭方式（返回键、点外部、代码 dismiss）都要取消请求，否则「已取消」的生成仍会写进笔记
+        dlg.setOnDismissListener {
+            aiCancelled.set(true)
+            cancelToken.cancel()
+            if (aiDialog === dlg) aiDialog = null
+        }
+        aiDialog = dlg
         dlg.show()
         Glass.styleDialog(dlg, density(act))
         val lastUi = longArrayOf(0L)
+        // 工作线程必须是 daemon：否则对话框已关、界面已 detach，进程仍被这条线程吊住
         val worker = Thread {
             var err: String? = null
             var reply = ""
@@ -1450,6 +1678,12 @@ class ReaderView(
                             thinkTv.text = "💭 思考中… ${rAcc.takeLast(80)}"
                             scroll.post { scroll.fullScroll(View.FOCUS_DOWN) }
                         }
+                    }, {
+                        // 服务端断流后重发：丢弃已上屏的半截内容，避免「半截 + 全文」重复
+                        acc.setLength(0)
+                        rAcc.setLength(0)
+                        lastUi[0] = 0L
+                        act.runOnUiThread { thinkTv.visibility = View.GONE }
                     })
                 }
                 if (reply.isBlank()) throw RuntimeException("模型返回为空")
@@ -1457,16 +1691,22 @@ class ReaderView(
                 if (!aiCancelled.get()) err = t.message ?: t.toString()
             }
             val e = err
+            // 取消状态在这里取一次快照：笔记落库已移到工作线程，UI 分支必须与它判断一致
+            val cancelled = aiCancelled.get()
+            // 笔记写库放到工作线程（Room 允许主线程查询，但写库会卡住同一帧的界面刷新）；
+            // 仍然先落库、再上屏，保证用户看到 ✓ 时笔记一定已经存好。
+            if (e == null && !cancelled && kind != null) {
+                try { db.addNote(bookId, kind, reply) } catch (_: Exception) {}
+            }
             act.runOnUiThread {
                 if (aiCancelToken === cancelToken) aiCancelToken = null
                 when {
-                    aiCancelled.get() -> {
+                    cancelled -> {
                         dlg.setTitle("$title · 已停止")
                         tv.text = acc.toString() + "\n\n（已停止，未保存到笔记）"
                     }
                     e != null -> dlg.setTitle("$title · 失败").also { tv.text = "调用失败：\n$e" }
                     else -> {
-                        if (kind != null) db.addNote(bookId, kind, reply)
                         dlg.setTitle("$title ✓")
                         applyCitationLinks(tv, reply)
                         scroll.post { scroll.fullScroll(View.FOCUS_DOWN) }
@@ -1474,7 +1714,7 @@ class ReaderView(
                     }
                 }
             }
-        }
+        }.apply { isDaemon = true }
         worker.start()
     }
 
@@ -1523,18 +1763,19 @@ class ReaderView(
                 if (block < (docBlocks?.size ?: 0)) jumpToBlock(block, flash = true)
                 else showResult("无法定位", "当前结果引用的段落超出文档范围。")
             }
+            else -> showResult("无法定位", "无法识别引用类型「$type」，请手动定位。")
         }
     }
 
     private fun aiSummary() {
         val cfg = aiReady() ?: return
         if (bookFormat == "pdf") {
-            runAiStream("summary", "AI 摘要") { onDelta, onReason ->
+            runAiStream("summary", "AI 摘要") { onDelta, onReason, onRestart ->
                 val pages = collectPdfPages(6)
                 try {
                     AiClient.chatVision(cfg, SYS_PROMPT,
                         "这是一份课件/文档的前几页截图。请生成摘要：先一句话概括主题，再用要点列出核心内容。",
-                        pages, onDelta, onReason = onReason)
+                        pages, onDelta, onReason = onReason, onRestart = onRestart)
                 } finally {
                     pages.forEach { it.recycle() }
                 }
@@ -1542,10 +1783,10 @@ class ReaderView(
         } else {
             val text = docFullText
             if (text.isBlank()) { showResult("提示", "本文档没有可提取文本"); return }
-            runAiStream("summary", "AI 摘要") { onDelta, onReason ->
+            runAiStream("summary", "AI 摘要") { onDelta, onReason, onRestart ->
                 AiClient.chat(cfg, SYS_PROMPT,
                     "请为下面的内容生成摘要：先一句话概括，再用 3-6 个要点列出核心内容。\n\n【内容开始】\n${text.take(24000)}\n【内容结束】",
-                    onDelta, onReason = onReason)
+                    onDelta, onReason = onReason, onRestart = onRestart)
             }
         }
     }
@@ -1564,21 +1805,21 @@ class ReaderView(
                 val q = input.text.toString().trim()
                 if (q.isEmpty()) return@setPositiveButton
                 if (bookFormat == "pdf") {
-                    runAiStream("ask", "问答 · $q") { onDelta, onReason ->
+                    runAiStream("ask", "问答 · $q") { onDelta, onReason, onRestart ->
                         val pages = collectPdfPages(6)
                         try {
                             AiClient.chatVision(cfg, SYS_PROMPT,
-                                "根据这些页面截图回答问题：$q\n若图中没有答案请直说。", pages, onDelta, onReason = onReason)
+                                "根据这些页面截图回答问题：$q\n若图中没有答案请直说。", pages, onDelta, onReason = onReason, onRestart = onRestart)
                         } finally {
                             pages.forEach { it.recycle() }
                         }
                     }
                 } else {
                     val text = docFullText
-                    runAiStream("ask", "问答 · $q") { onDelta, onReason ->
+                    runAiStream("ask", "问答 · $q") { onDelta, onReason, onRestart ->
                         AiClient.chat(cfg, SYS_PROMPT,
                             "根据以下资料回答问题。若资料中没有答案请直说。\n\n问题：$q\n\n【资料开始】\n${text.take(24000)}\n【资料结束】",
-                            onDelta, onReason = onReason)
+                            onDelta, onReason = onReason, onRestart = onRestart)
                     }
                 }
             }
@@ -1588,13 +1829,13 @@ class ReaderView(
 
     private fun quizAction() {
         val cfg = aiReady() ?: return
-        val build = { onDelta: (String) -> Unit, onReason: (String) -> Unit ->
+        val build = { onDelta: (String) -> Unit, onReason: (String) -> Unit, onRestart: () -> Unit ->
             if (bookFormat == "pdf") {
                 val pages = collectPdfPages(8)
                 try {
                     AiClient.chatVision(cfg, SYS_PROMPT,
                         "根据这些页面截图出 5 道自测题（选择/简答混合）。只输出题目本身，不要给答案——用户作答后你会批改。",
-                        pages, onDelta, onReason = onReason)
+                        pages, onDelta, onReason = onReason, onRestart = onRestart)
                 } finally {
                     pages.forEach { it.recycle() }
                 }
@@ -1603,7 +1844,7 @@ class ReaderView(
                 if (text.isBlank()) throw RuntimeException("本文档没有可提取文本")
                 AiClient.chat(cfg, SYS_PROMPT,
                     "根据以下内容出 5 道自测题（选择/简答混合）。只输出题目本身，不要给出答案——用户稍后作答，你会批改。\n\n${text.take(20000)}",
-                    onDelta, onReason = onReason)
+                    onDelta, onReason = onReason, onRestart = onRestart)
             }
         }
         runAiStream("quiz", "自测题", onDone = { questions ->
@@ -1631,14 +1872,14 @@ class ReaderView(
                 val ans = input.text.toString().trim()
                 if (ans.isEmpty()) return@setPositiveButton
                 val refText = if (bookFormat == "pdf") "(PDF 文档)" else docFullText.take(12000)
-                runAiStream(null, "批改结果") { onDelta, onReason ->
+                // 批改记录入笔记：kind 必须非空，否则用户答案与判分结果都会被丢弃
+                runAiStream("quiz_grade", "批改结果") { onDelta, onReason, onRestart ->
                     AiClient.chat(cfg, SYS_PROMPT,
                         "你是阅卷老师。下面是原文、题目和学生的答案。请逐题判定对错并简要讲解，" +
                             "最后给总分（每题 20 分，满分 100）和一句鼓励。\n\n" +
                             "【题目】\n$questions\n\n【学生答案】\n$ans\n\n【原文参考】\n$refText",
-                        onDelta, onReason = onReason)
+                        onDelta, onReason = onReason, onRestart = onRestart)
                 }
-                // 批改记录入笔记
             }
             .setNegativeButton("取消", null)
             .show().also { Glass.styleDialog(it, density(act)) }
@@ -1652,29 +1893,37 @@ class ReaderView(
             .setItems(options) { _, which ->
                 val clip = blockText.take(3000)
                 when (which) {
-                    0 -> runAiStream(null, "段落解释") { onDelta, onReason ->
+                    0 -> runAiStream(null, "段落解释") { onDelta, onReason, onRestart ->
                         AiClient.chat(cfg, SYS_PROMPT,
                             "请解释下面这段话的含义（是什么意思、为什么重要），简洁作答：\n\n「$clip」",
-                            onDelta, onReason = onReason)
+                            onDelta, onReason = onReason, onRestart = onRestart)
                     }
-                    1 -> runAiStream(null, "翻译") { onDelta, onReason ->
+                    1 -> runAiStream(null, "翻译") { onDelta, onReason, onRestart ->
                         AiClient.chat(cfg, SYS_PROMPT,
                             "把下面的文字翻译成流畅的中文，只输出译文：\n\n「$clip」",
-                            onDelta, onReason = onReason)
+                            onDelta, onReason = onReason, onRestart = onRestart)
                     }
-                    2 -> runAiStream(null, "大白话讲解") { onDelta, onReason ->
+                    2 -> runAiStream(null, "大白话讲解") { onDelta, onReason, onRestart ->
                         AiClient.chat(cfg, SYS_PROMPT,
                             "用大白话给中学生讲解下面这段话，可以打比方，通俗但不失准确：\n\n「$clip」",
-                            onDelta, onReason = onReason)
+                            onDelta, onReason = onReason, onRestart = onRestart)
                     }
-                    3 -> runAiStream(null, "续写") { onDelta, onReason ->
+                    3 -> runAiStream(null, "续写") { onDelta, onReason, onRestart ->
                         AiClient.chat(cfg, SYS_PROMPT,
                             "顺着下面的文字风格与情节，自然续写一段（150-250字）：\n\n「$clip」",
-                            onDelta, onReason = onReason)
+                            onDelta, onReason = onReason, onRestart = onRestart)
                     }
                     4 -> {
-                        db.addNote(bookId, "quote", blockText.trim())
-                        android.widget.Toast.makeText(act, "已收藏金句 ⭐", android.widget.Toast.LENGTH_SHORT).show()
+                        // 收藏金句落到后台线程：Room 允许主线程查询，但写库不应占用点击帧
+                        val quote = blockText.trim()
+                        Thread {
+                            try { db.addNote(bookId, "quote", quote) } catch (_: Exception) {}
+                            act.runOnUiThread {
+                                android.widget.Toast.makeText(
+                                    act, "已收藏金句 ⭐", android.widget.Toast.LENGTH_SHORT
+                                ).show()
+                            }
+                        }.apply { isDaemon = true }.start()
                     }
                 }
             }
@@ -1735,12 +1984,13 @@ class ReaderView(
 
     private fun doSearch(q: String) {
         val blocks = docBlocks ?: return
-        val ql = q.lowercase()
         data class Hit(val blockIndex: Int, val snippet: String)
         val hits = mutableListOf<Hit>()
         for ((i, b) in blocks.withIndex()) {
             if (hits.size >= 30) break
-            val idx = b.text.lowercase().indexOf(ql)
+            // 大小写不敏感查找直接用原串：lowercase() 可能改变长度（如 'İ'），
+            // 用它的下标去切原串会指向错位甚至越界。
+            val idx = b.text.indexOf(q, ignoreCase = true)
             if (idx < 0) continue
             val s = max(0, idx - 15)
             val e = min(b.text.length, idx + q.length + 25)
@@ -1768,35 +2018,34 @@ class ReaderView(
             return
         }
         val blocks = docBlocks ?: return
-        val heads = if (tocHeads.isNotEmpty()) {
-            tocHeads.filter { it.second.isNotBlank() }.take(200)
+        val allHeads = if (tocHeads.isNotEmpty()) {
+            tocHeads.filter { it.second.isNotBlank() }
         } else {
             blocks.mapIndexedNotNull { i, b ->
-                if (b.type == Block.HEADING && i < 200) i to b.text else null
-            }.take(200)
+                if (b.type == Block.HEADING) i to b.text else null
+            }
         }
+        val heads = allHeads.take(200)
         if (heads.isEmpty()) {
             showResult("目录", "本文档没有识别到章节标题")
             return
         }
-        // 计算当前阅读位置所在章节，在目录中标注
-        val sv = sc
-        val curIdx = if (sv != null) {
-            val box = sv.getChildAt(0) as? LinearLayout
-            val range = (box?.height ?: 0) - sv.height
-            if (box != null && range > 0 && blocks.isNotEmpty()) {
-                val frac = (sv.scrollY.toFloat() / range).coerceIn(0f, 1f)
-                (frac * (blocks.size - 1)).toInt()
-            } else -1
-        } else -1
+        // 计算当前阅读位置所在章节，在目录中标注（按真实可见块，而非滚动比例）
+        val curIdx = currentBlockIndex()
         var curHead = -1
         if (curIdx >= 0) heads.forEachIndexed { w, h -> if (h.first <= curIdx) curHead = w }
         val labels = heads.mapIndexed { w, h ->
             val mark = if (w == curHead) " ◀" else ""
             h.second.take(38) + mark
         }.toTypedArray()
+        // 截断时把总数写清楚，避免"目录 · 200 章"让人以为书只有 200 章
+        val tocTitle = if (allHeads.size > heads.size) {
+            "目录 · 前 ${heads.size} 章（共 ${allHeads.size} 章）"
+        } else {
+            "目录 · ${heads.size} 章"
+        }
         android.app.AlertDialog.Builder(act)
-            .setTitle("目录 · ${heads.size} 章")
+            .setTitle(tocTitle)
             .setItems(labels) { _, w -> jumpToBlock(heads[w].first) }
             .setNegativeButton("关闭", null)
             .show().also { Glass.styleDialog(it, density(act)) }
@@ -1836,10 +2085,18 @@ class ReaderView(
             gravity = Gravity.CENTER
             setPadding(0, Glass.dp(8, d), 0, Glass.dp(16, d))
         }
+        // 音量键翻页此前只有读取方、没有写入方，开关常驻在这里最省入口
+        val flip = android.widget.CheckBox(act).apply {
+            text = "音量键翻页（单手阅读）"
+            textSize = 14f
+            isChecked = db.getSetting("reader_volume_flip") != "0"
+            setPadding(Glass.dp(20, d), Glass.dp(6, d), Glass.dp(20, d), Glass.dp(10, d))
+        }
         val box = LinearLayout(act).apply {
             orientation = LinearLayout.VERTICAL
             addView(label)
             addView(seek)
+            addView(flip)
         }
         seek.setOnSeekBarChangeListener(object : android.widget.SeekBar.OnSeekBarChangeListener {
             override fun onProgressChanged(sb: android.widget.SeekBar?, progress: Int, fromUser: Boolean) {
@@ -1854,10 +2111,12 @@ class ReaderView(
             override fun onStopTrackingTouch(sb: android.widget.SeekBar?) {}
         })
         android.app.AlertDialog.Builder(act)
-            .setTitle("亮度")
+            .setTitle("亮度与翻页")
             .setView(box)
             .setPositiveButton("保存") { _, _ ->
                 db.setSetting("reader_brightness", (seek.progress + 10).toString())
+                db.setSetting("reader_volume_flip", if (flip.isChecked) "1" else "0")
+                volumeFlipCached = null
                 db.deleteSetting("screen_bright")
             }
             .setNegativeButton("恢复默认") { _, _ ->
@@ -1873,16 +2132,36 @@ class ReaderView(
     /** 跳转到指定段落（docBlocks 顺序与正文子 View 一致）；目标未渲染时先续载 */
     private fun jumpToBlock(index: Int, flash: Boolean = false) {
         val sv = sc ?: return
-        if (pdfRenderer == null) {
-            val total = docBlocks?.size ?: 0
-            var guard = 0
-            while (index >= renderedUpTo && renderedUpTo < total && guard++ < 60) {
-                appendChunk(CHUNK)
-            }
-        }
         val box = sv.getChildAt(0) as? LinearLayout ?: return
-        val v = box.getChildAt(index) ?: return
-        sv.post { sv.smoothScrollTo(0, max(0, v.top - Glass.dp(56, density(act)))) }
+        val needsAppend = pdfRenderer == null && index >= renderedUpTo
+        if (pdfRenderer == null && !ensureRenderedUpTo(index, PRELOAD_MAX_CHUNKS)) {
+            // 超长文档可能一次补载不完：必须给出反馈，不能点了没反应
+            showResult("提示", "目标位置较远，正在加载，请稍后再试")
+            return
+        }
+        val v = box.getChildAt(index)
+        if (v == null) {
+            showResult("提示", "目标位置较远，正在加载，请稍后再试")
+            return
+        }
+        val scrollToTarget = Runnable {
+            val target = box.getChildAt(index) ?: return@Runnable
+            sv.smoothScrollTo(0, max(0, target.top - Glass.dp(56, density(act))))
+        }
+        if (needsAppend) {
+            // 刚追加的块还没测量，top 仍是 0，必须等这次布局完成再滚，否则会跳到文首
+            sv.viewTreeObserver.addOnGlobalLayoutListener(
+                object : android.view.ViewTreeObserver.OnGlobalLayoutListener {
+                    override fun onGlobalLayout() {
+                        val observer = sv.viewTreeObserver
+                        if (observer.isAlive) observer.removeOnGlobalLayoutListener(this)
+                        scrollToTarget.run()
+                    }
+                }
+            )
+        } else {
+            sv.post(scrollToTarget)
+        }
         if (flash) {
             // 命中段高亮：金黄停留后渐隐回底色
             v.post {
@@ -1927,25 +2206,56 @@ class ReaderView(
     private fun saveProgress() {
         val sv = sc ?: return
         val child = sv.getChildAt(0) ?: return
-        val range = child.height
         val extent = sv.height
+        if (extent <= 0) return
+        val range = child.height
         val offset = sv.scrollY
-        if (range > extent) {
-            val pr = offset.toFloat() / (range - extent).toFloat()
-            db.updateProgress(bookId, pr.coerceIn(0f, 1f))
+        // 分块渲染的文档：child.height 只是「已渲染前缀」的高度。
+        // 直接按它算比例，会把「刚滚到已加载的末尾」当成 100%（>=0.99 即 done），
+        // 于是长书被标记读完、重开时既不预载也不恢复位置。
+        val total = docBlocks?.size ?: 0
+        val fullyLoaded = pdfRenderer != null || total <= 0 || renderedUpTo >= total
+        val pr = if (range > extent) {
+            val raw = (offset.toFloat() / (range - extent).toFloat()).coerceIn(0f, 1f)
+            if (fullyLoaded) raw
+            // 未加载完时上限压到 0.98，保证 statusFor 不会把没读完的书判成 done
+            else (raw * (renderedUpTo.toFloat() / total.toFloat())).coerceIn(0f, 0.98f)
+        } else {
+            // 内容不足一屏：滚动不到底，只要整篇已渲染就按读完计，否则保留 0
+            if (fullyLoaded) 1f else 0f
         }
+        db.updateProgress(bookId, pr)
     }
 
-    /** 音量键翻页：单手阅读（设置 reader_volume_flip=0 可关）；由 MainActivity.dispatchKeyEvent 调用 */
+    /** 音量键翻页：单手阅读（设置 reader_volume_flip=0 可关）；由 MainActivity 的按键分发调用 */
     fun handleVolumeKey(event: android.view.KeyEvent): Boolean {
-        if (event.action != android.view.KeyEvent.ACTION_DOWN) return false
         val vk = event.keyCode
         if (vk != android.view.KeyEvent.KEYCODE_VOLUME_UP && vk != android.view.KeyEvent.KEYCODE_VOLUME_DOWN) return false
-        if (db.getSetting("reader_volume_flip") == "0") return false
+        // 只消费 DOWN 是不够的：UP 会漏给系统，音量面板和提示音照样弹出来。
+        // 所以 DOWN 时记下已消费，UP 时同样消费掉。
+        if (event.action == android.view.KeyEvent.ACTION_UP) {
+            val consumed = volumeKeyConsumed
+            volumeKeyConsumed = false
+            return consumed
+        }
+        if (event.action != android.view.KeyEvent.ACTION_DOWN) return false
+        if (!volumeFlipEnabled()) return false
         val sv = sc ?: return false
         val page = (sv.height * 0.85).toInt()
         sv.smoothScrollBy(0, if (vk == android.view.KeyEvent.KEYCODE_VOLUME_DOWN) page else -page)
+        volumeKeyConsumed = true
         return true
+    }
+
+    private var volumeKeyConsumed = false
+    private var volumeFlipCached: Boolean? = null
+
+    /** 按键是高频路径，不能每次都去查 settings 表（主线程 Room 读）。 */
+    private fun volumeFlipEnabled(): Boolean {
+        volumeFlipCached?.let { return it }
+        val enabled = db.getSetting("reader_volume_flip") != "0"
+        volumeFlipCached = enabled
+        return enabled
     }
 
     private var readSessionStart = 0L
@@ -1955,25 +2265,47 @@ class ReaderView(
         readSessionStart = System.currentTimeMillis()
     }
 
-    /** 累计阅读时长：离开阅读器时落库 */
+    /** 累计阅读时长：离开/暂停阅读器时落库 */
     private fun flushReadTime() {
         if (readSessionStart > 0) {
             val delta = System.currentTimeMillis() - readSessionStart
             readSessionStart = 0L
-            if (delta in 1000..(6 * 3600_000L)) {  // 忽略<1s噪声与异常超时
-                try { db.addReadTime(bookId, delta) } catch (e: Exception) {}
+            if (delta >= 1000) {  // 忽略 <1s 噪声
+                // 异常超长会话（进程被冻结/时钟跳变）按上限计入，不再整段丢弃
+                try { db.addReadTime(bookId, min(delta, READ_SESSION_CAP_MS)) } catch (e: Exception) {}
             }
         }
+    }
+
+    /** 由宿主在 onStop 调用：退到后台时暂停计时并落库，避免用户在别处仍被计入阅读时长 */
+    fun pauseReadSession() {
+        saveProgress()
+        flushReadTime()
+    }
+
+    /** 由宿主在 onStart 调用：回到前台重新开始计时 */
+    fun resumeReadSession() {
+        if (readSessionStart == 0L) readSessionStart = System.currentTimeMillis()
     }
 
     override fun onDetachedFromWindow() {
         aiCancelled.set(true)
         aiCancelToken?.cancel()
         aiCancelToken = null
+        // 对话框不会被系统随视图一起销毁，必须主动关闭，否则工作线程仍持有已 detach 的视图树
+        aiDialog?.let { d ->
+            aiDialog = null
+            try { d.dismiss() } catch (_: Exception) {}
+        }
+        repeatHandler?.let { h -> repeatLoops.forEach { h.removeCallbacks(it) } }
+        repeatLoops.clear()
         saveProgress()
         flushReadTime()
         super.onDetachedFromWindow()
         closePdf()
+        // 先解除 ImageView 对位图的引用，再回收，避免 detach 后重绘使用已回收位图
+        imageView?.setImageDrawable(null)
+        imageView = null
         imageBitmap?.recycle()
         imageBitmap = null
     }

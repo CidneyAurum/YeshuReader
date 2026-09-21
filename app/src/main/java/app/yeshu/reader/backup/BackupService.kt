@@ -34,11 +34,29 @@ object BackupService {
     private const val MAX_COMPRESSION_RATIO = 100L
     private const val MAX_DETECTION_BYTES = 64 * 1024
     private val backupSettingKeys = setOf(
-        "reader_font_sp", "reader_brightness", "night_mode",
+        "reader_font_sp", "reader_brightness", "night_mode", "reader_volume_flip",
         "shelf_sort", "shelf_filter", "shelf_view",
         "ai_base_url", "ai_model", "ai_vision_model", "ai_allow_private_http",
         "ai_chat_path", "ai_models_path", "ai_auth_header", "ai_auth_prefix",
         "ai_profiles_json", "ai_active_profile_id"
+    )
+
+    /** 恢复结果分类：新增、与本地已有条目合并，以及跳过时各自的真实原因。 */
+    private class RestoreCounts {
+        var added = 0
+        var merged = 0
+        var existing = 0
+        var missingFiles = 0
+        var unrecognized = 0
+        val skipped: Int get() = existing + missingFiles + unrecognized
+    }
+
+    /** 本地已有条目的合并基准；内容哈希命中与标题/大小回退命中都要用它。 */
+    private data class LocalBookState(
+        val id: Long,
+        val progress: Float,
+        val totalReadMs: Long,
+        val folderId: Long
     )
 
     fun export(context: Context, uri: Uri): String = runCatching {
@@ -103,7 +121,9 @@ object BackupService {
             .put("themeMode", appearance.themeMode)
             .put("showIllustrations", appearance.showIllustrations))
 
-        context.contentResolver.openOutputStream(uri, "w")!!.use { raw ->
+        val output = context.contentResolver.openOutputStream(uri, "w")
+            ?: error("无法写入所选位置，请重新选择备份保存位置")
+        output.use { raw ->
             ZipOutputStream(raw.buffered()).use { zip ->
                 zip.putNextEntry(ZipEntry(LIBRARY_JSON))
                 zip.write(root.toString().toByteArray(Charsets.UTF_8))
@@ -179,6 +199,9 @@ object BackupService {
                 }
                 require(metadata.optString("app") in setOf("yeshu", "shuge")) { "不是页枢备份文件" }
 
+                // 中央目录声明的 size 可以被伪造，因此总量上限必须按实际写出的字节数累计，
+                // 而不是只看 entry.size，否则伪造 0 字节的条目仍可向 cacheDir 灌入大量数据。
+                var extractedBytes = 0L
                 entries.forEach { entry ->
                     val name = safeEntryName(entry.name)
                     if (entry.isDirectory || name == LIBRARY_JSON || !isRestorableFile(name)) return@forEach
@@ -189,8 +212,14 @@ object BackupService {
                     destination.parentFile?.mkdirs()
                     zip.getInputStream(entry).use { source ->
                         destination.outputStream().use { target ->
-                            val copied = copyLimited(source, target, MAX_ENTRY_UNCOMPRESSED_BYTES)
+                            val copied = copyLimited(
+                                source,
+                                target,
+                                MAX_ENTRY_UNCOMPRESSED_BYTES,
+                                priorBytes = extractedBytes
+                            )
                             require(copied == entry.size) { "备份条目损坏" }
+                            extractedBytes += copied
                         }
                     }
                 }
@@ -206,6 +235,8 @@ object BackupService {
         val room = YeshuDatabase.get(context)
         val dao = room.dao()
         val createdFiles = mutableListOf<File>()
+        // 合并路径可能覆盖本地已有的封面，先留一份回滚副本，事务失败时不会让用户丢掉本机封面。
+        val coverRollback = mutableMapOf<Long, File>()
         val background = File(context.filesDir, "bg.img")
         val backgroundBackup = File(staging, "rollback/bg.img")
         var backgroundChanged = false
@@ -214,7 +245,21 @@ object BackupService {
         val previousAppearance = appearanceJson?.let { runBlocking { userPreferences.snapshot() } }
         var appearanceChanged = false
         return try {
-            val counts = room.runInTransaction<Pair<Int, Int>> {
+            // DataStore 的 edit 是挂起操作，放在 Room 事务之外执行，避免持锁期间等待磁盘 IO。
+            // 顺序上先恢复偏好再跑数据库事务：任一步失败都会在 catch 中回滚已改动的偏好，
+            // 因此不会出现偏好已恢复而数据库未提交的半恢复状态。
+            appearanceJson?.let { appearance ->
+                runBlocking {
+                    userPreferences.restore(
+                        UserPreferences.Snapshot(
+                            themeMode = appearance.optString("themeMode", "system"),
+                            showIllustrations = appearance.optBoolean("showIllustrations", true)
+                        )
+                    )
+                }
+                appearanceChanged = true
+            }
+            val restored = room.runInTransaction<RestoreCounts> {
                 val folderMap = mutableMapOf<Long, Long>(0L to 0L)
                 val pending = mutableListOf<JSONObject>()
                 val folders = root.optJSONArray("folders") ?: JSONArray()
@@ -241,8 +286,7 @@ object BackupService {
                 }
 
                 val bookMap = mutableMapOf(0L to 0L)
-                var added = 0
-                var skipped = 0
+                val counts = RestoreCounts()
                 val books = root.optJSONArray("books") ?: JSONArray()
                 for (index in 0 until books.length()) {
                     val item = books.getJSONObject(index)
@@ -253,21 +297,49 @@ object BackupService {
                     val totalReadMs = item.optLong("totalReadMs", 0L).coerceAtLeast(0L)
                     // A supplied hash is authoritative. Falling back to title/size after a
                     // hash miss can incorrectly merge two different documents.
-                    val existingId = if (contentHash.isNotBlank()) {
-                        dao.findBookByContentHash(contentHash)?.id
+                    val local = if (contentHash.isNotBlank()) {
+                        dao.findBookByContentHash(contentHash)?.let {
+                            LocalBookState(it.id, it.progress, it.totalReadMs, it.folderId)
+                        }
                     } else {
-                        db.findBook(title, size)?.id
+                        db.findBook(title, size)?.let {
+                            LocalBookState(it.id, it.progress, it.totalReadMs, it.folderId)
+                        }
                     }
-                    if (existingId != null) {
-                        bookMap[oldId] = existingId
-                        dao.mergeTotalReadMs(existingId, totalReadMs)
-                        skipped++
+                    if (local != null) {
+                        // 本地已有同一条目时不再简单跳过：进度、时长、文件夹与封面都要按“取更完整的一方”合并，
+                        // 否则在已有书库的设备上恢复备份会退回旧的阅读位置并丢掉备份里的封面与分组。
+                        bookMap[oldId] = local.id
+                        var changed = false
+                        if (totalReadMs > local.totalReadMs) {
+                            dao.mergeTotalReadMs(local.id, totalReadMs)
+                            changed = true
+                        }
+                        val backupProgress = item.optDouble("progress", 0.0).toFloat()
+                        if (backupProgress > local.progress) {
+                            db.updateProgress(local.id, backupProgress)
+                            changed = true
+                        }
+                        val mappedFolder = folderMap[item.optLong("folderId", 0)] ?: 0L
+                        if (mappedFolder != 0L && mappedFolder != local.folderId) {
+                            dao.moveBook(local.id, mappedFolder)
+                            changed = true
+                        }
+                        if (mergeArchivedCover(context, staging, oldId, local.id, item, createdFiles, coverRollback)) {
+                            changed = true
+                        }
+                        if (changed) counts.merged++ else counts.existing++
                         continue
                     }
                     val oldFileName = File(item.optString("fileName")).name
+                    if (oldFileName.isBlank()) {
+                        // 元数据里没有可用的文件名：既无法定位备份内的原文件，也无法安全地新建记录。
+                        counts.unrecognized++
+                        continue
+                    }
                     val staged = File(staging, "library/$oldFileName")
                     if (!staged.isFile) {
-                        skipped++
+                        counts.missingFiles++
                         continue
                     }
                     val newFileName = "restore_${System.currentTimeMillis()}_${System.nanoTime()}_${index}_$oldFileName"
@@ -302,7 +374,7 @@ object BackupService {
                             createdFiles += File(context.filesDir, "cover_$newId.custom")
                         }
                     }
-                    added++
+                    counts.added++
                 }
 
                 val notes = root.optJSONArray("notes") ?: JSONArray()
@@ -356,17 +428,6 @@ object BackupService {
                     val key = setting.optString("key")
                     if (key in backupSettingKeys) dao.setSetting(SettingEntity(key, setting.optString("value")))
                 }
-                appearanceJson?.let { appearance ->
-                    runBlocking {
-                        userPreferences.restore(
-                            UserPreferences.Snapshot(
-                                themeMode = appearance.optString("themeMode", "system"),
-                                showIllustrations = appearance.optBoolean("showIllustrations", true)
-                            )
-                        )
-                    }
-                    appearanceChanged = true
-                }
                 File(staging, "ui/bg.img").takeIf { it.isFile }?.let { stagedBackground ->
                     if (background.isFile) {
                         backgroundBackup.parentFile?.mkdirs()
@@ -375,11 +436,15 @@ object BackupService {
                     backgroundChanged = true
                     stagedBackground.copyTo(background, overwrite = true)
                 }
-                added to skipped
+                counts
             }
-            "恢复完成：新增 ${counts.first} 项，跳过 ${counts.second} 项，API Key 未导入"
+            "恢复完成：${restoreSummary(restored)}，API Key 未导入"
         } catch (error: Throwable) {
             createdFiles.asReversed().forEach { it.delete() }
+            coverRollback.forEach { (bookId, backup) ->
+                val target = CoverStore.file(context, bookId)
+                if (backup.isFile) backup.copyTo(target, overwrite = true) else target.delete()
+            }
             if (backgroundChanged) {
                 if (backgroundBackup.isFile) backgroundBackup.copyTo(background, overwrite = true) else background.delete()
             }
@@ -388,6 +453,56 @@ object BackupService {
             }
             throw error
         }
+    }
+
+    /**
+     * 把备份里的封面合并到本地已存在的书目上，返回是否真的改动了封面。
+     *
+     * 本地已有的自定义封面是用户在本机的选择，备份里的自动封面绝不能覆盖它；只有备份封面
+     * 同样是自定义封面时才替换本地自动封面（或本地没有封面时直接落盘）。
+     */
+    private fun mergeArchivedCover(
+        context: Context,
+        staging: File,
+        oldId: Long,
+        bookId: Long,
+        item: JSONObject,
+        createdFiles: MutableList<File>,
+        coverRollback: MutableMap<Long, File>
+    ): Boolean {
+        val stagedCover = File(staging, "covers/cover_$oldId.img").takeIf { it.isFile } ?: return false
+        val archivedCustom = item.optString("coverSource") == "custom"
+        if (CoverStore.isCustom(context, bookId) && !archivedCustom) return false
+        val cover = CoverStore.file(context, bookId)
+        val marker = File(context.filesDir, "cover_$bookId.custom")
+        val hadCover = cover.isFile
+        val hadMarker = marker.isFile
+        if (hadCover && bookId !in coverRollback) {
+            val backup = File(staging, "rollback/cover_$bookId.img")
+            backup.parentFile?.mkdirs()
+            cover.copyTo(backup, overwrite = true)
+            coverRollback[bookId] = backup
+        }
+        if (!hadCover) createdFiles += cover
+        stagedCover.copyTo(cover, overwrite = true)
+        // 覆盖了磁盘上的封面，内存缓存必须失效，否则界面继续显示旧封面。
+        CoverStore.invalidate(bookId)
+        if (CoverStore.restoreCustomFlag(context, bookId, archivedCustom) && archivedCustom && !hadMarker) {
+            createdFiles += marker
+        }
+        return true
+    }
+
+    /** 恢复结果文案：跳过时按“已存在 / 文件缺失 / 无法识别”分别给出数量，零项不显示。 */
+    private fun restoreSummary(counts: RestoreCounts): String {
+        val reasons = mutableListOf<String>()
+        if (counts.existing > 0) reasons += "已存在 ${counts.existing}"
+        if (counts.missingFiles > 0) reasons += "文件缺失 ${counts.missingFiles}"
+        if (counts.unrecognized > 0) reasons += "无法识别 ${counts.unrecognized}"
+        val skipped = if (reasons.isEmpty()) "" else {
+            "，跳过 ${counts.skipped} 项（${reasons.joinToString(" / ")}）"
+        }
+        return "新增 ${counts.added} 项，合并 ${counts.merged} 项$skipped"
     }
 
     private fun restoreLegacyJson(context: Context, root: JSONObject): String {

@@ -3,6 +3,6 @@
     <application>
         <activity
             android:name=".DebugActivity"
-            android:exported="true" />
+            android:exported="false" />
     </application>
 </manifest>

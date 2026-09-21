@@ -96,6 +96,10 @@ interface YeshuDao {
     @Query("SELECT * FROM books WHERE deleted_at=0 AND lower(content_hash)=lower(:contentHash) LIMIT 1")
     fun findBookByContentHash(contentHash: String): LibraryItemEntity?
 
+    /** 导入去重专用：不过滤 deleted_at，未删除的条目优先（deleted_at=0 排在最前）。 */
+    @Query("SELECT * FROM books WHERE lower(content_hash)=lower(:contentHash) ORDER BY deleted_at ASC, id DESC LIMIT 1")
+    fun findAnyBookByContentHash(contentHash: String): LibraryItemEntity?
+
     @Query("UPDATE books SET last_read_at=:openedAt WHERE id=:id")
     fun markOpened(id: Long, openedAt: Long)
 
@@ -130,7 +134,7 @@ interface YeshuDao {
     fun deleteArtifactsForBook(bookId: Long)
 
     @Query("UPDATE books SET total_read_ms=total_read_ms+:delta WHERE id=:id")
-    fun addReadTime(id: Long, delta: Long)
+    fun addReadTime(id: Long, delta: Long): Int
 
     @Query("SELECT total_read_ms FROM books WHERE id=:id")
     fun totalReadMs(id: Long): Long?
@@ -256,7 +260,7 @@ data class TopBookRow(
         AiArtifactEntity::class
     ],
     version = 7,
-    exportSchema = false
+    exportSchema = true
 )
 abstract class YeshuDatabase : RoomDatabase() {
     abstract fun dao(): YeshuDao
@@ -270,97 +274,183 @@ abstract class YeshuDatabase : RoomDatabase() {
                 YeshuDatabase::class.java,
                 "bookshelf.db"
             )
-                .addMigrations(MIGRATION_6_7)
+                .addMigrations(
+                    MIGRATION_1_7,
+                    MIGRATION_2_7,
+                    MIGRATION_3_7,
+                    MIGRATION_4_7,
+                    MIGRATION_5_7,
+                    MIGRATION_6_7
+                )
                 .allowMainThreadQueries()
                 .build()
                 .also { instance = it }
         }
 
-        val MIGRATION_6_7 = object : Migration(6, 7) {
-            override fun migrate(db: SupportSQLiteDatabase) {
-                // Rebuild all legacy SQLiteOpenHelper tables. Room validates nullability and
-                // default expressions strictly, while SQLite reports legacy INTEGER PRIMARY KEY
-                // columns as nullable even though they are effectively non-null.
-                db.execSQL(
-                    """CREATE TABLE books_new(
-                        id INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL,
-                        title TEXT NOT NULL,
-                        file_name TEXT NOT NULL,
-                        format TEXT NOT NULL,
-                        size_bytes INTEGER NOT NULL,
-                        progress REAL NOT NULL,
-                        added_at INTEGER NOT NULL,
-                        last_read_at INTEGER NOT NULL,
-                        folder_id INTEGER NOT NULL,
-                        total_read_ms INTEGER NOT NULL,
-                        author TEXT NOT NULL,
-                        item_type TEXT NOT NULL,
-                        status TEXT NOT NULL,
-                        favorite INTEGER NOT NULL,
-                        tags TEXT NOT NULL,
-                        content_hash TEXT NOT NULL,
-                        deleted_at INTEGER NOT NULL)"""
-                )
+        // 旧版 SQLiteOpenHelper 的表结构按版本逐步 ALTER 而来，任何 1~6 的旧库都统一重建为
+        // Room v7 结构，避免停留在 v1~v5 的安装在启动时抛 "migration was required but not found"。
+        val MIGRATION_1_7 = legacyMigration(1)
+        val MIGRATION_2_7 = legacyMigration(2)
+        val MIGRATION_3_7 = legacyMigration(3)
+        val MIGRATION_4_7 = legacyMigration(4)
+        val MIGRATION_5_7 = legacyMigration(5)
+        val MIGRATION_6_7 = legacyMigration(6)
+
+        private fun legacyMigration(from: Int) = object : Migration(from, 7) {
+            override fun migrate(db: SupportSQLiteDatabase) = rebuildLegacySchema(db)
+        }
+
+        /**
+         * 把 legacy 表整体重建为 Room v7 结构。Room 对可空性与默认值校验很严，而 SQLite 会把
+         * legacy 的 INTEGER PRIMARY KEY 报告为可空；旧库各版本列集合也不一致，因此这里按
+         * PRAGMA table_info 实际存在的列拷贝，缺失列用等价值补齐，既不会因结构差异崩溃，
+         * 也不会丢弃用户已有的书目、笔记、文件夹、设置与阅读记录。
+         */
+        private fun rebuildLegacySchema(db: SupportSQLiteDatabase) {
+            val booksColumns = legacyColumns(db, "books")
+            db.execSQL("DROP TABLE IF EXISTS books_new")
+            db.execSQL(
+                """CREATE TABLE books_new(
+                    id INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL,
+                    title TEXT NOT NULL,
+                    file_name TEXT NOT NULL,
+                    format TEXT NOT NULL,
+                    size_bytes INTEGER NOT NULL,
+                    progress REAL NOT NULL,
+                    added_at INTEGER NOT NULL,
+                    last_read_at INTEGER NOT NULL,
+                    folder_id INTEGER NOT NULL,
+                    total_read_ms INTEGER NOT NULL,
+                    author TEXT NOT NULL,
+                    item_type TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    favorite INTEGER NOT NULL,
+                    tags TEXT NOT NULL,
+                    content_hash TEXT NOT NULL,
+                    deleted_at INTEGER NOT NULL)"""
+            )
+            if (booksColumns.isNotEmpty()) {
+                val format = booksColumns.valueOrDefault("format", "'txt'")
+                val progress = booksColumns.valueOrDefault("progress", "0")
                 db.execSQL(
                     """INSERT INTO books_new(
                         id,title,file_name,format,size_bytes,progress,added_at,last_read_at,folder_id,total_read_ms,
                         author,item_type,status,favorite,tags,content_hash,deleted_at)
-                        SELECT id,title,file_name,format,size_bytes,progress,added_at,last_read_at,folder_id,total_read_ms,
-                        '',CASE WHEN lower(format) IN ('txt','md','markdown','epub') THEN 'book' ELSE 'document' END,
-                        CASE WHEN progress>=0.99 THEN 'done' WHEN progress>0.005 THEN 'reading' ELSE 'unread' END,
+                        SELECT ${booksColumns.valueOrDefault("id", "NULL")},
+                        ${booksColumns.valueOrDefault("title", "''")},
+                        ${booksColumns.valueOrDefault("file_name", "''")},
+                        $format,${booksColumns.valueOrDefault("size_bytes", "0")},$progress,
+                        ${booksColumns.valueOrDefault("added_at", "0")},
+                        ${booksColumns.valueOrDefault("last_read_at", booksColumns.valueOrDefault("added_at", "0"))},
+                        ${booksColumns.valueOrDefault("folder_id", "0")},
+                        ${booksColumns.valueOrDefault("total_read_ms", "0")},
+                        '',CASE WHEN lower($format) IN ('txt','md','markdown','epub') THEN 'book' ELSE 'document' END,
+                        CASE WHEN $progress>=0.99 THEN 'done' WHEN $progress>0.005 THEN 'reading' ELSE 'unread' END,
                         0,'','',0 FROM books"""
                 )
-                db.execSQL("DROP TABLE books")
-                db.execSQL("ALTER TABLE books_new RENAME TO books")
-                db.execSQL("CREATE UNIQUE INDEX IF NOT EXISTS index_books_file_name ON books(file_name)")
+            }
+            db.execSQL("DROP TABLE IF EXISTS books")
+            db.execSQL("ALTER TABLE books_new RENAME TO books")
+            db.execSQL("CREATE UNIQUE INDEX IF NOT EXISTS index_books_file_name ON books(file_name)")
 
+            val notesColumns = legacyColumns(db, "notes")
+            db.execSQL("DROP TABLE IF EXISTS notes_new")
+            db.execSQL(
+                """CREATE TABLE notes_new(
+                    id INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL,
+                    book_id INTEGER NOT NULL,
+                    kind TEXT NOT NULL,
+                    content TEXT NOT NULL,
+                    created_at INTEGER NOT NULL)"""
+            )
+            if (notesColumns.isNotEmpty()) {
                 db.execSQL(
-                    """CREATE TABLE notes_new(
-                        id INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL,
-                        book_id INTEGER NOT NULL,
-                        kind TEXT NOT NULL,
-                        content TEXT NOT NULL,
-                        created_at INTEGER NOT NULL)"""
-                )
-                db.execSQL("INSERT INTO notes_new(id,book_id,kind,content,created_at) SELECT id,book_id,kind,content,created_at FROM notes")
-                db.execSQL("DROP TABLE notes")
-                db.execSQL("ALTER TABLE notes_new RENAME TO notes")
-
-                db.execSQL(
-                    """CREATE TABLE folders_new(
-                        id INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL,
-                        name TEXT NOT NULL,
-                        parent_id INTEGER NOT NULL)"""
-                )
-                db.execSQL("INSERT INTO folders_new(id,name,parent_id) SELECT id,name,parent_id FROM folders")
-                db.execSQL("DROP TABLE folders")
-                db.execSQL("ALTER TABLE folders_new RENAME TO folders")
-
-                db.execSQL("CREATE TABLE settings_new(key TEXT NOT NULL PRIMARY KEY, value TEXT NOT NULL)")
-                db.execSQL("INSERT INTO settings_new(key,value) SELECT key,value FROM settings")
-                db.execSQL("DROP TABLE settings")
-                db.execSQL("ALTER TABLE settings_new RENAME TO settings")
-
-                db.execSQL("CREATE TABLE read_log_new(day TEXT NOT NULL PRIMARY KEY, ms INTEGER NOT NULL)")
-                db.execSQL("INSERT INTO read_log_new(day,ms) SELECT day,ms FROM read_log")
-                db.execSQL("DROP TABLE read_log")
-                db.execSQL("ALTER TABLE read_log_new RENAME TO read_log")
-
-                db.execSQL(
-                    """CREATE TABLE IF NOT EXISTS ai_artifacts(
-                        id INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL,
-                        book_id INTEGER NOT NULL,
-                        kind TEXT NOT NULL,
-                        status TEXT NOT NULL,
-                        content TEXT NOT NULL,
-                        citations_json TEXT NOT NULL,
-                        document_hash TEXT NOT NULL,
-                        model TEXT NOT NULL,
-                        prompt_version INTEGER NOT NULL,
-                        created_at INTEGER NOT NULL,
-                        updated_at INTEGER NOT NULL)"""
+                    """INSERT INTO notes_new(id,book_id,kind,content,created_at) SELECT
+                        ${notesColumns.valueOrDefault("id", "NULL")},
+                        ${notesColumns.valueOrDefault("book_id", "0")},
+                        ${notesColumns.valueOrDefault("kind", "'note'")},
+                        ${notesColumns.valueOrDefault("content", "''")},
+                        ${notesColumns.valueOrDefault("created_at", "0")} FROM notes"""
                 )
             }
+            db.execSQL("DROP TABLE IF EXISTS notes")
+            db.execSQL("ALTER TABLE notes_new RENAME TO notes")
+
+            val folderColumns = legacyColumns(db, "folders")
+            db.execSQL("DROP TABLE IF EXISTS folders_new")
+            db.execSQL(
+                """CREATE TABLE folders_new(
+                    id INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL,
+                    name TEXT NOT NULL,
+                    parent_id INTEGER NOT NULL)"""
+            )
+            if (folderColumns.isNotEmpty()) {
+                db.execSQL(
+                    """INSERT INTO folders_new(id,name,parent_id) SELECT
+                        ${folderColumns.valueOrDefault("id", "NULL")},
+                        ${folderColumns.valueOrDefault("name", "''")},
+                        ${folderColumns.valueOrDefault("parent_id", "0")} FROM folders"""
+                )
+            }
+            db.execSQL("DROP TABLE IF EXISTS folders")
+            db.execSQL("ALTER TABLE folders_new RENAME TO folders")
+
+            val settingColumns = legacyColumns(db, "settings")
+            db.execSQL("DROP TABLE IF EXISTS settings_new")
+            db.execSQL("CREATE TABLE settings_new(key TEXT NOT NULL PRIMARY KEY, value TEXT NOT NULL)")
+            if (settingColumns.isNotEmpty()) {
+                db.execSQL(
+                    """INSERT INTO settings_new(key,value) SELECT
+                        ${settingColumns.valueOrDefault("key", "''")},
+                        ${settingColumns.valueOrDefault("value", "''")} FROM settings"""
+                )
+            }
+            db.execSQL("DROP TABLE IF EXISTS settings")
+            db.execSQL("ALTER TABLE settings_new RENAME TO settings")
+
+            val readLogColumns = legacyColumns(db, "read_log")
+            db.execSQL("DROP TABLE IF EXISTS read_log_new")
+            db.execSQL("CREATE TABLE read_log_new(day TEXT NOT NULL PRIMARY KEY, ms INTEGER NOT NULL)")
+            if (readLogColumns.isNotEmpty()) {
+                db.execSQL(
+                    """INSERT INTO read_log_new(day,ms) SELECT
+                        ${readLogColumns.valueOrDefault("day", "''")},
+                        ${readLogColumns.valueOrDefault("ms", "0")} FROM read_log"""
+                )
+            }
+            db.execSQL("DROP TABLE IF EXISTS read_log")
+            db.execSQL("ALTER TABLE read_log_new RENAME TO read_log")
+
+            db.execSQL(
+                """CREATE TABLE IF NOT EXISTS ai_artifacts(
+                    id INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL,
+                    book_id INTEGER NOT NULL,
+                    kind TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    content TEXT NOT NULL,
+                    citations_json TEXT NOT NULL,
+                    document_hash TEXT NOT NULL,
+                    model TEXT NOT NULL,
+                    prompt_version INTEGER NOT NULL,
+                    created_at INTEGER NOT NULL,
+                    updated_at INTEGER NOT NULL)"""
+            )
         }
+
+        /** 返回 legacy 表实际存在的列名；表不存在时返回空集合。 */
+        private fun legacyColumns(db: SupportSQLiteDatabase, table: String): Set<String> {
+            val columns = mutableSetOf<String>()
+            db.query("PRAGMA table_info($table)").use { cursor ->
+                val nameIndex = cursor.getColumnIndex("name")
+                while (cursor.moveToNext()) {
+                    if (nameIndex >= 0) columns += cursor.getString(nameIndex).orEmpty()
+                }
+            }
+            return columns
+        }
+
+        /** 列存在时直接引用，缺失时用等价的默认表达式补齐，保证 INSERT ... SELECT 始终可执行。 */
+        private fun Set<String>.valueOrDefault(column: String, fallback: String): String =
+            if (column in this) column else fallback
     }
 }

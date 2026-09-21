@@ -38,7 +38,6 @@ object T {
     // ---- 动画时长(ms) ----
     const val durFast = 180
     const val durNorm = 220
-    const val durSlow = 280
 
     // ---- 常用尺寸(dp) ----
     const val pagePad = 20        // 页面左右边距

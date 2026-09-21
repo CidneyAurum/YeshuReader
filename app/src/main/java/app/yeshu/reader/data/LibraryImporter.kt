@@ -30,16 +30,18 @@ object LibraryImporter {
         "image/png" to "png"
     )
 
-    val mimeTypes = arrayOf(
-        "application/pdf",
-        "application/epub+zip",
-        "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-        "application/vnd.openxmlformats-officedocument.presentationml.presentation",
-        "text/plain",
-        "text/markdown",
-        "image/jpeg",
-        "image/png"
-    )
+    /** 与 [mimeFormats] 保持一致，避免选择器把应用已支持（如 DOCM/PPSX/text/x-markdown）的文件置灰。 */
+    val mimeTypes: Array<String> = mimeFormats.keys.toTypedArray()
+
+    private const val MAX_CONSECUTIVE_ZERO_READS = 64
+    private const val TEMP_FILE_PREFIX = ".import_"
+    private const val TEMP_FILE_SUFFIX = ".tmp"
+
+    /**
+     * 导入临时文件的保留窗口。超过这个时长仍然存在的 `.import_*.tmp` 只可能来自被系统杀死
+     * 的上一次导入，可以安全清理；窗口内的文件视为可能仍在写入，扫描时不动。
+     */
+    private const val STALE_TEMP_MAX_AGE_MS = 6L * 60L * 60L * 1000L
 
     @Synchronized
     fun import(context: Context, uri: Uri): ImportResult {
@@ -53,18 +55,24 @@ object LibraryImporter {
         val nameFormat = DocParser.detect(safeName)
         val hintedFormat = nameFormat.ifBlank { mimeFormat }
         val title = safeName.substringBeforeLast('.', safeName).ifBlank { "未命名文档" }
-        val temporary = File(context.filesDir, ".import_${UUID.randomUUID()}.tmp")
+        val temporary = File(context.filesDir, "$TEMP_FILE_PREFIX${UUID.randomUUID()}$TEMP_FILE_SUFFIX")
         var destination: File? = null
-        return runCatching {
+        return try {
             val digest = MessageDigest.getInstance("SHA-256")
             var size = 0L
             context.contentResolver.openInputStream(uri)?.use { input ->
                 temporary.outputStream().use { output ->
                     val buffer = ByteArray(DEFAULT_BUFFER_SIZE)
+                    var zeroReads = 0
                     while (true) {
                         val read = input.read(buffer)
                         if (read < 0) break
-                        if (read == 0) continue
+                        if (read == 0) {
+                            // 部分 provider 会返回 0 而不是阻塞；限制连续空读，避免导入任务永久空转。
+                            if (++zeroReads >= MAX_CONSECUTIVE_ZERO_READS) error("读取文件失败：数据源无响应")
+                            continue
+                        }
+                        zeroReads = 0
                         output.write(buffer, 0, read)
                         digest.update(buffer, 0, read)
                         size += read
@@ -79,10 +87,22 @@ object LibraryImporter {
                 else "无法识别文件格式，仅支持 PDF、EPUB、DOCX、PPTX、TXT、Markdown、JPG 和 PNG"
             }
             val db = Db(context)
-            val existing = db.listBooks().firstOrNull { it.contentHash.isNotBlank() && it.contentHash == hash }
-            if (existing != null) {
-                temporary.delete()
-                return ImportResult(existing.id, existing.title, existing.format, "该文件已在书架中")
+            val match = db.findImportMatch(hash)
+            if (match != null) {
+                val record = match.book
+                val message = if (match.fromRecycleBin) {
+                    // 回收站里已有同一份文档：优先恢复原记录（进度、笔记与 AI 结果都挂在原 id 上），
+                    // 而不是再插一条记录并在磁盘上多存一份同样的文件。
+                    val source = File(context.filesDir, record.fileName)
+                    if (record.fileName.isNotBlank() && !source.isFile) {
+                        if (!temporary.renameTo(source)) temporary.copyTo(source, overwrite = false)
+                    }
+                    db.restoreDeletedBook(record.id)
+                    "该文件此前已删除，已从回收站恢复"
+                } else {
+                    "该文件已在书架中"
+                }
+                return ImportResult(record.id, record.title, record.format, message)
             }
             val fileBase = title.replace(Regex("[^\\p{L}\\p{N}._ -]"), "_").trim().take(80)
                 .ifBlank { "document" }
@@ -99,11 +119,32 @@ object LibraryImporter {
             require(id > 0) { "写入书库失败" }
             CoverStore.generateAsync(context, id, finalFile, format)
             ImportResult(id, title, format)
-        }.getOrElse {
-            temporary.delete()
+        } catch (t: Throwable) {
             destination?.delete()
-            ImportResult(-1, title, hintedFormat, it.message ?: "导入失败")
+            ImportResult(-1, title, hintedFormat, t.message ?: "导入失败")
+        } finally {
+            // 成功时临时文件已被 rename 成正式文件，这里的 delete 是空操作；失败、Worker 被停止
+            // 或进程被杀之外的所有异常路径都必须清掉它，否则 filesDir 会永久留下一份完整文档副本。
+            temporary.delete()
         }
+    }
+
+    /**
+     * 清理上一次导入被进程杀死后残留的 `.import_*.tmp` 文件，返回删除的数量。
+     * 比 [maxAgeMs] 新的文件视为可能仍在写入的导入任务，不会被删除。
+     *
+     * 建议由应用启动路径调用（MainActivity.onCreate 里已有的 IO 协程，
+     * 即 `lifecycleScope.launch(Dispatchers.IO)` 那一段）。
+     */
+    fun sweepStaleTemporaryFiles(context: Context, maxAgeMs: Long = STALE_TEMP_MAX_AGE_MS): Int {
+        val cutoff = System.currentTimeMillis() - maxAgeMs.coerceAtLeast(0L)
+        val stale = context.filesDir.listFiles { file ->
+            file.isFile &&
+                file.name.startsWith(TEMP_FILE_PREFIX) &&
+                file.name.endsWith(TEMP_FILE_SUFFIX) &&
+                file.lastModified() < cutoff
+        } ?: return 0
+        return stale.count { it.delete() }
     }
 
     internal fun formatForMime(mimeType: String?): String = mimeFormats[mimeType?.lowercase()].orEmpty()

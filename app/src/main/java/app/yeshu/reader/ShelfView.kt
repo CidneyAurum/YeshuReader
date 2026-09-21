@@ -2,6 +2,7 @@ package app.yeshu.reader
 
 import android.app.Activity
 import android.app.AlertDialog
+import android.content.Context
 import android.content.Intent
 import android.graphics.BitmapFactory
 import android.graphics.Color
@@ -16,15 +17,25 @@ import android.widget.ImageView
 import android.widget.LinearLayout
 import android.widget.ScrollView
 import android.widget.TextView
-import app.yeshu.reader.data.LibraryImporter
+import androidx.activity.ComponentActivity
+import androidx.activity.OnBackPressedCallback
 import app.yeshu.reader.parse.DocParser
+import app.yeshu.reader.preferences.UserPreferences
 import java.io.File
+import java.util.concurrent.Executors
+import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.runBlocking
 
 class ShelfView(private val act: Activity) : FrameLayout(act) {
 
     private val db = Db(act)
+    // 旧版 View 页面跟随主题偏好，避免与 Compose 页面之间明暗跳变
+    private val pal by lazy { LegacyPalette.of(act) }
     private lateinit var listBox: LinearLayout
     private var bgHost: FrameLayout? = null
+    private var bgImage: ImageView? = null
+    private var aiProgress: TextView? = null
+    private var aiBusy = false
     private lateinit var etSearch: android.widget.EditText
     private lateinit var statTv: TextView
     private lateinit var sortBtn: TextView
@@ -42,6 +53,14 @@ class ShelfView(private val act: Activity) : FrameLayout(act) {
     private var multiBar: LinearLayout? = null
     private var multiCountTv: TextView? = null
     private var pendingCoverBookId = -1L
+    // 搜索输入防抖：避免每个字符都触发一次整树重建
+    private val searchHandler = android.os.Handler(android.os.Looper.getMainLooper())
+    private var searchDebounce: Runnable? = null
+    // 当前显示的底部弹层：用于返回键先关弹层，以及页面销毁时清理浮层
+    private var activeSheet: BottomSheet? = null
+    private var sheetBackCallback: OnBackPressedCallback? = null
+    // 待写入文件的笔记导出内容（超过 Binder 事务上限时改走 ACTION_CREATE_DOCUMENT）
+    private var pendingExportMarkdown: String? = null
 
     init {
         val d = density(act)
@@ -50,7 +69,7 @@ class ShelfView(private val act: Activity) : FrameLayout(act) {
         val root = FrameLayout(act).apply {
             background = GradientDrawable(
                 GradientDrawable.Orientation.TL_BR,
-                intArrayOf(Color.parseColor("#10131C"), T.bg, T.bg)
+                intArrayOf(pal.bgGradientTop, pal.bg, pal.bg)
             )
         }
         bgHost = root
@@ -70,14 +89,14 @@ class ShelfView(private val act: Activity) : FrameLayout(act) {
         titleCol.addView(TextView(act).apply {
             text = "页枢"
             textSize = 30f
-            setTextColor(T.textP)
+            setTextColor(pal.textP)
             setTypeface(null, Typeface.BOLD)
             letterSpacing = 0.02f
         })
         titleCol.addView(TextView(act).apply {
             text = "YESHU READER"
             textSize = 8.5f
-            setTextColor(T.textT)
+            setTextColor(pal.textT)
             setTypeface(null, Typeface.BOLD)
             letterSpacing = 0.24f
             val lp = LinearLayout.LayoutParams(-2, -2)
@@ -86,21 +105,26 @@ class ShelfView(private val act: Activity) : FrameLayout(act) {
         })
         top.addView(titleCol, LinearLayout.LayoutParams(0, -2, 1f))
 
-        fun topBtn(icon: String, filled: Boolean, onClick: () -> Unit): FrameLayout = FrameLayout(act).apply {
+        fun topBtn(icon: String, filled: Boolean, desc: String, onClick: () -> Unit): FrameLayout = FrameLayout(act).apply {
             background = if (filled) GradientDrawable().apply {
                 shape = GradientDrawable.OVAL
                 setColor(T.accent)
             } else Glass.iconBg()
             foreground = Glass.pressFx()
-            val lp = LinearLayout.LayoutParams(Glass.dp(44, d), Glass.dp(44, d))
+            // 触控目标 48dp（图标视觉尺寸保持 22dp）
+            val lp = LinearLayout.LayoutParams(Glass.dp(48, d), Glass.dp(48, d))
             lp.marginStart = Glass.dp(12, d)
             layoutParams = lp
-            addView(IconView(act, icon, 21), FrameLayout.LayoutParams(Glass.dp(22, d), Glass.dp(22, d), Gravity.CENTER))
+            contentDescription = desc
+            addView(
+                IconView(act, icon, 21, if (filled) Color.WHITE else pal.icon),
+                FrameLayout.LayoutParams(Glass.dp(22, d), Glass.dp(22, d), Gravity.CENTER)
+            )
             setOnClickListener { onClick() }
         }
         // 主操作：添加（导入/新建 bottom sheet）；次操作：更多（文件夹/批量/背景/设置）
-        top.addView(topBtn("plus", true) { showAddSheet() })
-        top.addView(topBtn("more", false) { showMoreSheet() })
+        top.addView(topBtn("plus", true, "添加") { showAddSheet() })
+        top.addView(topBtn("more", false, "更多") { showMoreSheet() })
         content.addView(top)
 
         // ---- 搜索框：48dp、#1C1C1E 实底、圆角16、内置放大镜与清除/取消 ----
@@ -109,19 +133,19 @@ class ShelfView(private val act: Activity) : FrameLayout(act) {
             gravity = Gravity.CENTER_VERTICAL
             background = GradientDrawable().apply {
                 cornerRadius = Glass.dp(T.rCard, d).toFloat()
-                setColor(T.surface)
+                setColor(pal.surface)
             }
             setPadding(Glass.dp(14, d), 0, Glass.dp(6, d), 0)
         }
         val swp = LinearLayout.LayoutParams(-1, Glass.dp(48, d))
         swp.setMargins(Glass.dp(T.pagePad, d), Glass.dp(10, d), Glass.dp(T.pagePad, d), 0)
         searchWrap.layoutParams = swp
-        searchWrap.addView(IconView(act, "search", 18))
+        searchWrap.addView(IconView(act, "search", 18, pal.icon))
         etSearch = android.widget.EditText(act).apply {
             hint = "搜索书名、作者或文件夹"
             textSize = 15f
-            setTextColor(T.textP)
-            setHintTextColor(T.textT)
+            setTextColor(pal.textP)
+            setHintTextColor(pal.textT)
             setBackgroundColor(Color.TRANSPARENT)
             setPadding(Glass.dp(10, d), 0, Glass.dp(4, d), 0)
             setSingleLine(true)
@@ -129,7 +153,7 @@ class ShelfView(private val act: Activity) : FrameLayout(act) {
         searchWrap.addView(etSearch, LinearLayout.LayoutParams(0, -2, 1f))
         val btnClear = FrameLayout(act).apply {
             visibility = View.GONE
-            addView(IconView(act, "close", 14), FrameLayout.LayoutParams(Glass.dp(16, d), Glass.dp(16, d), Gravity.CENTER))
+            addView(IconView(act, "close", 14, pal.icon), FrameLayout.LayoutParams(Glass.dp(16, d), Glass.dp(16, d), Gravity.CENTER))
             layoutParams = LinearLayout.LayoutParams(Glass.dp(36, d), Glass.dp(36, d))
             foreground = Glass.pressFx()
             setOnClickListener {
@@ -161,7 +185,7 @@ class ShelfView(private val act: Activity) : FrameLayout(act) {
             override fun onTextChanged(s: CharSequence?, a: Int, b: Int, c: Int) {}
             override fun afterTextChanged(s: android.text.Editable?) {
                 btnClear.visibility = if (s.isNullOrBlank()) View.GONE else View.VISIBLE
-                refresh(s?.toString()?.trim()?.takeIf { it.isNotEmpty() })
+                scheduleSearchRefresh()
             }
         })
         content.addView(searchWrap)
@@ -173,13 +197,13 @@ class ShelfView(private val act: Activity) : FrameLayout(act) {
         }
         statTv = TextView(act).apply {
             textSize = 12f
-            setTextColor(T.textS)
+            setTextColor(pal.textS)
             layoutParams = LinearLayout.LayoutParams(0, -2, 1f)
         }
         metaRow.addView(statTv)
         sortBtn = TextView(act).apply {
             textSize = 12f
-            setTextColor(T.textS)
+            setTextColor(pal.textS)
             background = Glass.pillBg(Color.argb(36, 255, 255, 255))
             setPadding(Glass.dp(10, d), Glass.dp(5, d), Glass.dp(10, d), Glass.dp(5, d))
             setOnClickListener {
@@ -195,7 +219,7 @@ class ShelfView(private val act: Activity) : FrameLayout(act) {
         segWrap = FrameLayout(act).apply {
             background = GradientDrawable().apply {
                 cornerRadius = Glass.dp(12, d).toFloat()
-                setColor(T.surface2)
+                setColor(pal.surface2)
             }
         }
         val segInner = LinearLayout(act).apply { orientation = LinearLayout.HORIZONTAL }
@@ -212,11 +236,11 @@ class ShelfView(private val act: Activity) : FrameLayout(act) {
         fun styleSeg() {
             val gridOn = (db.getSetting("shelf_view") ?: "list") == "grid"
             for ((tv, on) in listOf(segList to !gridOn, segGrid to gridOn)) {
-                tv.setTextColor(if (on) T.textP else T.textS)
+                tv.setTextColor(if (on) pal.textP else pal.textS)
                 tv.setTypeface(null, if (on) Typeface.BOLD else Typeface.NORMAL)
                 tv.background = if (on) GradientDrawable().apply {
                     cornerRadius = Glass.dp(9, d).toFloat()
-                    setColor(T.surface3)
+                    setColor(pal.surface3)
                 } else null
             }
         }
@@ -307,33 +331,36 @@ class ShelfView(private val act: Activity) : FrameLayout(act) {
 
     /** 添加 sheet：导入本地文件 / 新建文件夹 */
     private fun showAddSheet() {
-        BottomSheet(act, "添加到页枢")
-            .item("book", "导入本地文件") {
-                val i = Intent(Intent.ACTION_GET_CONTENT)
-                i.type = "*/*"
-                act.startActivityForResult(i, Glass.REQ_BOOK)
-            }
-            .item("folder", "新建分类") { newFolderDialog() }
-            .show()
+        showSheet("添加到页枢") {
+            // 走 Activity 的持久化导入通道（takePersistableUriPermission + WorkManager），
+            // 旧的一次性 GET_CONTENT + 匿名 Thread 会在进程被回收时丢掉导入。
+            shelfItem("book", "导入本地文件") { (act as MainActivity).importDocuments() }
+            shelfItem("folder", "新建分类") { newFolderDialog() }
+        }
     }
 
     /** 更多 sheet：AI 推荐 / 阅读统计 / 批量管理 / 更换背景 / 设置 */
     private fun showMoreSheet() {
-        BottomSheet(act, "更多")
-            .item("bulb", "✨ AI 推荐下一本") { aiRecommend() }
-            .item("sort", "阅读统计") { (act as MainActivity).showStats() }
-            .item("check", "批量管理") { toggleMultiMode() }
-            .item("book", "回收站 (${db.listDeletedBooks().size})") { showRecycleBin() }
-            .item("palette", "更换背景") {
+        showSheet("更多") {
+            shelfItem("bulb", "✨ AI 推荐下一本") { aiRecommend() }
+            shelfItem("sort", "阅读统计") { (act as MainActivity).showStats() }
+            shelfItem("check", "批量管理") { toggleMultiMode() }
+            shelfItem("book", "回收站 (${db.listDeletedBooks().size})") { showRecycleBin() }
+            shelfItem("palette", "更换背景") {
                 val i = Intent(Intent.ACTION_GET_CONTENT)
                 i.type = "image/*"
+                @Suppress("DEPRECATION")
                 act.startActivityForResult(i, Glass.REQ_BG)
             }
-            .item("sliders", "设置") { (act as MainActivity).showSettings() }
-            .show()
+            shelfItem("sliders", "设置") { (act as MainActivity).showSettings() }
+        }
     }
 
-    /** 通用 AI 任务执行：配置检查 + 进度框 + 子线程 + UI 回调 */
+    /**
+     * 通用 AI 任务执行：配置检查 + 视图内进度提示 + 子线程 + UI 回调。
+     * 不使用 ProgressDialog：它持有 Activity 窗口且无法取消；进度浮层随本视图分离自动消失，
+     * 回调前校验 isAttachedToWindow，避免向已销毁的界面写数据。
+     */
     private fun aiTask(loading: String, promptSys: String, buildPrompt: () -> String, onDone: (String) -> Unit) {
         val cfg = AiClient.config(db)
         if (!AiClient.isReady(cfg)) {
@@ -345,17 +372,115 @@ class ShelfView(private val act: Activity) : FrameLayout(act) {
                 .show().also { Glass.styleDialog(it, density(act)) }
             return
         }
-        val pd = android.app.ProgressDialog.show(act, "AI", loading, true, false)
-        Thread {
+        if (aiBusy) return
+        aiBusy = true
+        showAiProgress(loading)
+        Thread({
             var err: String? = null
             var reply = ""
             try { reply = AiClient.chat(cfg, promptSys, buildPrompt()) } catch (t: Throwable) { err = t.message ?: t.toString() }
             val e = err
             act.runOnUiThread {
-                try { pd.dismiss() } catch (ex: Exception) {}
+                aiBusy = false
+                if (!isAttachedToWindow) return@runOnUiThread
+                dismissAiProgress()
                 if (e != null) showResult("AI 调用失败", e) else onDone(reply)
             }
-        }.start()
+        }, "yeshu-ai-shelf").start()
+    }
+
+    /** 视图内进度提示：不持有 Activity 窗口，随 ShelfView 分离自然消失。 */
+    private fun showAiProgress(message: String) {
+        dismissAiProgress()
+        val d = density(act)
+        val tv = TextView(act).apply {
+            text = "✨ $message"
+            textSize = 14f
+            setTextColor(Color.WHITE)
+            gravity = Gravity.CENTER
+            background = GradientDrawable().apply {
+                cornerRadius = Glass.dp(14, d).toFloat()
+                setColor(Color.argb(232, 26, 32, 52))
+            }
+            setPadding(Glass.dp(20, d), Glass.dp(14, d), Glass.dp(20, d), Glass.dp(14, d))
+            elevation = Glass.dp(12, d).toFloat()
+            contentDescription = message
+        }
+        val lp = LayoutParams(-2, -2, Gravity.BOTTOM or Gravity.CENTER_HORIZONTAL).apply {
+            bottomMargin = Glass.dp(112, d)
+        }
+        addView(tv, lp)
+        aiProgress = tv
+    }
+
+    private fun dismissAiProgress() {
+        aiProgress?.let { if (it.parent === this) removeView(it) }
+        aiProgress = null
+    }
+
+    /** 搜索输入防抖：停止输入后再刷新一次，避免逐字符重建整棵列表。 */
+    private fun scheduleSearchRefresh() {
+        searchDebounce?.let(searchHandler::removeCallbacks)
+        val task = Runnable {
+            searchDebounce = null
+            if (!isAttachedToWindow) return@Runnable
+            refresh(etSearch.text?.toString()?.trim()?.takeIf { it.isNotEmpty() })
+        }
+        searchDebounce = task
+        searchHandler.postDelayed(task, SEARCH_DEBOUNCE_MS)
+    }
+
+    /**
+     * 显示底部弹层：弹层直接挂在 decorView 上，导航返回键默认不会关闭它，
+     * 因此显示期间注册一个优先消费返回键的回调，先关弹层再退出页面。
+     */
+    private fun showSheet(title: String, configure: BottomSheet.() -> Unit) {
+        activeSheet?.dismiss()
+        val sheet = BottomSheet(act, title)
+        sheet.configure()
+        activeSheet = sheet
+        ensureSheetBackCallback().isEnabled = true
+        sheet.show()
+    }
+
+    /** 弹层菜单项：点击后弹层自行关闭，这里同步清理返回键状态。 */
+    private fun BottomSheet.shelfItem(icon: String, label: String, onClick: () -> Unit) =
+        item(icon, label) {
+            activeSheet = null
+            sheetBackCallback?.isEnabled = false
+            onClick()
+        }
+
+    private fun ensureSheetBackCallback(): OnBackPressedCallback {
+        sheetBackCallback?.let { return it }
+        val callback = object : OnBackPressedCallback(false) {
+            override fun handleOnBackPressed() {
+                activeSheet?.dismiss()
+                activeSheet = null
+                isEnabled = false
+            }
+        }
+        val host = act as? ComponentActivity
+        if (host != null) host.onBackPressedDispatcher.addCallback(callback)
+        sheetBackCallback = callback
+        return callback
+    }
+
+    override fun onDetachedFromWindow() {
+        // 进度浮层随视图分离移除；后台任务在回调前会再次校验附着状态
+        dismissAiProgress()
+        aiBusy = false
+        // 弹层挂在 decorView 上，页面销毁时必须一并清理，否则会浮在下一个页面之上
+        activeSheet?.dismiss()
+        activeSheet = null
+        sheetBackCallback?.let {
+            it.isEnabled = false
+            it.remove()
+        }
+        sheetBackCallback = null
+        searchDebounce?.let(searchHandler::removeCallbacks)
+        searchDebounce = null
+        super.onDetachedFromWindow()
     }
 
     /** ✨ AI 推荐下一本：书单+进度上下文 → 推荐与理由，可直接开读 */
@@ -497,21 +622,37 @@ class ShelfView(private val act: Activity) : FrameLayout(act) {
             .show().also { Glass.styleDialog(it, density(act)) }
     }
 
+    /**
+     * 背景图复用同一个 ImageView：避免每次更换背景都叠加一层全屏视图（泄漏位图与 GPU 层）。
+     * 解码时按屏幕上限降采样，兼容历史遗留的全尺寸 bg.img。
+     */
     private fun loadBg() {
         val f = File(act.filesDir, "bg.img")
-        if (f.exists()) {
-            val bm = BitmapFactory.decodeFile(f.absolutePath)
-            if (bm != null) {
-                bgHost?.let { host ->
-                    val iv = ImageView(act).apply {
-                        scaleType = ImageView.ScaleType.CENTER_CROP
-                        setImageBitmap(bm)
-                    }
-                    Glass.blur(iv)
-                    host.addView(iv, 0, LayoutParams(-1, -1))
-                }
-            }
+        if (!f.exists()) return
+        val host = bgHost ?: return
+        val bm = decodeSampledFile(f, BG_MAX_DIMENSION) ?: return
+        val iv = bgImage ?: ImageView(act).apply {
+            scaleType = ImageView.ScaleType.CENTER_CROP
+            Glass.blur(this)
+            host.addView(this, 0, LayoutParams(-1, -1))
+            bgImage = this
         }
+        val previous = (iv.drawable as? android.graphics.drawable.BitmapDrawable)?.bitmap
+        iv.setImageBitmap(bm)
+        if (previous != null && previous !== bm && !previous.isRecycled) previous.recycle()
+    }
+
+    /** 按最大边长降采样读取本地图片，避免全尺寸解码导致 OOM。 */
+    private fun decodeSampledFile(file: File, maxDimension: Int): android.graphics.Bitmap? {
+        val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
+        BitmapFactory.decodeFile(file.absolutePath, bounds)
+        if (bounds.outWidth <= 0 || bounds.outHeight <= 0) return null
+        var sample = 1
+        while (maxOf(bounds.outWidth, bounds.outHeight) / sample > maxDimension) sample *= 2
+        return BitmapFactory.decodeFile(
+            file.absolutePath,
+            BitmapFactory.Options().apply { inSampleSize = sample }
+        )
     }
 
     private fun enterFolder(folderId: Long) {
@@ -535,7 +676,7 @@ class ShelfView(private val act: Activity) : FrameLayout(act) {
             gravity = Gravity.CENTER_VERTICAL
             background = GradientDrawable().apply {
                 cornerRadius = Glass.dp(T.rCard, d).toFloat()
-                setColor(T.surface)
+                setColor(pal.surface)
             }
             setPadding(Glass.dp(8, d), Glass.dp(7, d), Glass.dp(8, d), Glass.dp(7, d))
         }
@@ -545,7 +686,7 @@ class ShelfView(private val act: Activity) : FrameLayout(act) {
                 text = "‹"
                 textSize = 25f
                 gravity = Gravity.CENTER
-                setTextColor(T.textP)
+                setTextColor(pal.textP)
                 background = Glass.pressFx()
                 contentDescription = "返回上一级"
                 setOnClickListener { enterFolder(db.getFolder(curFolder)?.parentId ?: 0L) }
@@ -561,7 +702,7 @@ class ShelfView(private val act: Activity) : FrameLayout(act) {
                 pathRow.addView(TextView(act).apply {
                     text = "›"
                     textSize = 16f
-                    setTextColor(T.textT)
+                    setTextColor(pal.textT)
                     gravity = Gravity.CENTER
                 }, LinearLayout.LayoutParams(Glass.dp(22, d), Glass.dp(34, d)))
             }
@@ -571,7 +712,7 @@ class ShelfView(private val act: Activity) : FrameLayout(act) {
                 maxLines = 1
                 ellipsize = android.text.TextUtils.TruncateAt.END
                 gravity = Gravity.CENTER
-                setTextColor(if (active) Color.WHITE else T.textS)
+                setTextColor(if (active) Color.WHITE else pal.textS)
                 setTypeface(null, if (active) Typeface.BOLD else Typeface.NORMAL)
                 background = GradientDrawable().apply {
                     cornerRadius = Glass.dp(11, d).toFloat()
@@ -623,6 +764,22 @@ class ShelfView(private val act: Activity) : FrameLayout(act) {
         }
     }
 
+    /**
+     * 封面异步加载：主线程先显示程序化占位，后台线程解码真实封面后再回填。
+     * 用 tag 记录目标 bookId，回填前校验附着状态与 tag，避免复用的行显示过期封面。
+     */
+    private fun loadCoverAsync(iv: ImageView, bookId: Long, title: String, format: String, w: Int, h: Int) {
+        iv.tag = bookId
+        iv.setImageBitmap(BookCover.placeholder(title, format, w, h))
+        coverExecutor.execute {
+            val bm = CoverStore.load(act.applicationContext, bookId)
+            if (bm == null || bm.isRecycled) return@execute
+            act.runOnUiThread {
+                if (iv.tag == bookId && iv.isAttachedToWindow && !bm.isRecycled) iv.setImageBitmap(bm)
+            }
+        }
+    }
+
     fun refresh(query: String? = null) {
         val d = density(act)
         listBox.removeAllViews()
@@ -631,11 +788,23 @@ class ShelfView(private val act: Activity) : FrameLayout(act) {
         if (curFolder != 0L && db.getFolder(curFolder) == null) curFolder = 0L
         val searching = !query.isNullOrBlank()
         val rawBooks = if (searching) db.searchBooks(query) else db.listBooks(curFolder)
+        // 全部书目/分类各只取一次并缓存：文件夹计数与搜索结果所属分类都在内存里查表，
+        // 避免每个分类再各查两次、每本书再查一次（N+1 查询会让每次搜索输入都明显卡顿）。
+        var allBooksCache: List<Book>? = null
+        var allFoldersCache: List<Folder>? = null
+        fun allBooksOnce(): List<Book> = allBooksCache ?: db.listBooks().also { allBooksCache = it }
+        fun allFoldersOnce(): List<Folder> = allFoldersCache ?: db.allFolders().also { allFoldersCache = it }
         val subs = if (searching) {
-            db.allFolders().filter { it.name.contains(query.orEmpty(), ignoreCase = true) }
+            allFoldersOnce().filter { it.name.contains(query.orEmpty(), ignoreCase = true) }
         } else {
             db.listFolders(curFolder)
         }
+        val childBookCounts: Map<Long, Int> =
+            if (subs.isEmpty()) emptyMap() else allBooksOnce().groupingBy { it.folderId }.eachCount()
+        val childFolderCounts: Map<Long, Int> =
+            if (subs.isEmpty()) emptyMap() else allFoldersOnce().groupingBy { it.parentId }.eachCount()
+        val folderNames: Map<Long, String> =
+            if (searching) allFoldersOnce().associate { it.id to it.name } else emptyMap()
 
         // 排序：最近阅读(默认) / 标题 / 加入时间
         val sortMode = db.getSetting("shelf_sort") ?: "recent"
@@ -662,11 +831,11 @@ class ShelfView(private val act: Activity) : FrameLayout(act) {
                 val active = filter == key
                 val c = TextView(act).apply {
                     text = label; textSize = 12f
-                    setTextColor(if (active) Color.WHITE else T.textS)
+                    setTextColor(if (active) Color.WHITE else pal.textS)
                     setTypeface(null, if (active) Typeface.BOLD else Typeface.NORMAL)
                     background = GradientDrawable().apply {
                         cornerRadius = Glass.dp(999, d).toFloat()
-                        setColor(if (active) T.accent else T.surface2)
+                        setColor(if (active) T.accent else pal.surface2)
                     }
                     setPadding(Glass.dp(14, d), Glass.dp(6, d), Glass.dp(14, d), Glass.dp(6, d))
                     val lp = LinearLayout.LayoutParams(-2, -2)
@@ -706,7 +875,7 @@ class ShelfView(private val act: Activity) : FrameLayout(act) {
 
         // 「最近在读」横滑条：仅根目录非搜索时展示
         if (curFolder == 0L && !searching) {
-            val recent = db.listBooks().filter { it.progress > 0.005f }
+            val recent = allBooksOnce().filter { it.progress > 0.005f }
                 .sortedByDescending { it.lastReadAt }
                 .take(6)
             recent.forEach(::ensureAutomaticCover)
@@ -719,7 +888,7 @@ class ShelfView(private val act: Activity) : FrameLayout(act) {
                     addView(TextView(act).apply {
                         text = "最近在读"
                         textSize = 13f
-                        setTextColor(Color.WHITE)
+                        setTextColor(pal.textP)
                         setTypeface(null, Typeface.BOLD)
                         alpha = 0.85f
                     })
@@ -746,9 +915,7 @@ class ShelfView(private val act: Activity) : FrameLayout(act) {
                                         val cover: android.view.View =
                                             if (CoverStore.file(act, rb.id).exists()) ImageView(act).apply {
                                                 scaleType = ImageView.ScaleType.CENTER_CROP
-                                                val bm = CoverStore.load(act, rb.id)
-                                                if (bm != null) setImageBitmap(bm)
-                                                else setImageBitmap(BookCover.placeholder(rb.title, rb.format, 160, 220))
+                                                loadCoverAsync(this, rb.id, rb.title, rb.format, 160, 220)
                                             } else ImageView(act).apply {
                                                 scaleType = ImageView.ScaleType.FIT_CENTER
                                                 setImageBitmap(BookCover.placeholder(rb.title, rb.format, 160, 220))
@@ -786,7 +953,7 @@ class ShelfView(private val act: Activity) : FrameLayout(act) {
                                     addView(TextView(act).apply {
                                         text = rb.title
                                         textSize = 11f
-                                        setTextColor(Color.WHITE)
+                                        setTextColor(pal.textP)
                                         maxLines = 1
                                         ellipsize = android.text.TextUtils.TruncateAt.END
                                         setPadding(0, Glass.dp(5, d), 0, 0)
@@ -803,14 +970,14 @@ class ShelfView(private val act: Activity) : FrameLayout(act) {
 
         // 文件夹行：紧凑横卡 68-76dp，实底 surface、统一图标、chevron
         for ((fi, f) in subs.withIndex()) {
-            val childBooks = db.listBooks(f.id).size
-            val childFolders = db.listFolders(f.id).size
+            val childBooks = childBookCounts[f.id] ?: 0
+            val childFolders = childFolderCounts[f.id] ?: 0
             val card = LinearLayout(act).apply {
                 orientation = LinearLayout.HORIZONTAL
                 gravity = Gravity.CENTER_VERTICAL
                 background = GradientDrawable().apply {
                     cornerRadius = Glass.dp(T.rCard, d).toFloat()
-                    setColor(T.surface)
+                    setColor(pal.surface)
                 }
                 setPadding(Glass.dp(16, d), Glass.dp(12, d), Glass.dp(16, d), Glass.dp(12, d))
                 addView(FrameLayout(act).apply {
@@ -819,7 +986,7 @@ class ShelfView(private val act: Activity) : FrameLayout(act) {
                         setColor(Color.argb(26, 255, 255, 255))
                     }
                     foreground = null
-                    addView(IconView(act, "folder", 20), FrameLayout.LayoutParams(
+                    addView(IconView(act, "folder", 20, pal.icon), FrameLayout.LayoutParams(
                         Glass.dp(22, d), Glass.dp(22, d), Gravity.CENTER))
                 }, LinearLayout.LayoutParams(Glass.dp(40, d), Glass.dp(40, d)))
                 addView(LinearLayout(act).apply {
@@ -830,7 +997,7 @@ class ShelfView(private val act: Activity) : FrameLayout(act) {
                     addView(TextView(act).apply {
                         text = f.name
                         textSize = 15f
-                        setTextColor(T.textP)
+                        setTextColor(pal.textP)
                         setTypeface(null, Typeface.BOLD)
                         maxLines = 1
                     })
@@ -840,10 +1007,10 @@ class ShelfView(private val act: Activity) : FrameLayout(act) {
                             if (childFolders > 0) append(" · $childFolders 个子分类")
                         }
                         textSize = 12f
-                        setTextColor(T.textS)
+                        setTextColor(pal.textS)
                     }, LinearLayout.LayoutParams(-2, -2).also { it.topMargin = Glass.dp(3, d) })
                 })
-                addView(IconView(act, "chevron", 16))
+                addView(IconView(act, "chevron", 16, pal.icon))
                 // 按压：轻微缩放反馈
                 setOnTouchListener { v, ev ->
                     when (ev.actionMasked) {
@@ -946,9 +1113,7 @@ class ShelfView(private val act: Activity) : FrameLayout(act) {
             val thumb: android.view.View = if (CoverStore.file(act, b.id).exists()) {
                 ImageView(act).apply {
                     scaleType = ImageView.ScaleType.CENTER_CROP
-                    val bm = CoverStore.load(act, b.id)
-                    if (bm != null) setImageBitmap(bm)
-                    else setImageBitmap(BookCover.placeholder(b.title, b.format, 160, 240))
+                    loadCoverAsync(this, b.id, b.title, b.format, 160, 240)
                 }
             } else {
                 ImageView(act).apply {
@@ -971,7 +1136,7 @@ class ShelfView(private val act: Activity) : FrameLayout(act) {
                 gravity = Gravity.CENTER_VERTICAL
                 background = GradientDrawable().apply {
                     cornerRadius = Glass.dp(T.rCard, d).toFloat()
-                    setColor(T.surface)
+                    setColor(pal.surface)
                 }
                 setPadding(Glass.dp(12, d), Glass.dp(12, d), Glass.dp(12, d), Glass.dp(12, d))
                 val texts = LinearLayout(act).apply {
@@ -994,7 +1159,7 @@ class ShelfView(private val act: Activity) : FrameLayout(act) {
                             } else text = b.title
                         } else text = b.title
                         textSize = 15f
-                        setTextColor(T.textP)
+                        setTextColor(pal.textP)
                         setTypeface(null, Typeface.BOLD)
                         maxLines = 2
                     }
@@ -1004,7 +1169,7 @@ class ShelfView(private val act: Activity) : FrameLayout(act) {
                     meta.addView(TextView(context).apply {
                         text = b.format.uppercase().ifEmpty { "TXT" }
                         textSize = 9f
-                        setTextColor(T.textS)
+                        setTextColor(pal.textS)
                         setTypeface(null, Typeface.BOLD)
                         letterSpacing = 0.06f
                         background = GradientDrawable().apply {
@@ -1015,10 +1180,10 @@ class ShelfView(private val act: Activity) : FrameLayout(act) {
                     })
                     meta.addView(TextView(context).apply {
                         text = "  " + kb + if (searching) {
-                            if (b.folderId == 0L) "" else " · " + (db.getFolder(b.folderId)?.name ?: "")
+                            if (b.folderId == 0L) "" else " · " + (folderNames[b.folderId] ?: "")
                         } else ""
                         textSize = 11f
-                        setTextColor(T.textT)
+                        setTextColor(pal.textT)
                     })
                     addView(meta, LinearLayout.LayoutParams(-2, -2).also {
                         it.topMargin = Glass.dp(6, d)
@@ -1060,7 +1225,7 @@ class ShelfView(private val act: Activity) : FrameLayout(act) {
                 }
                 addView(thumbWrap)
                 addView(texts)
-                addView(IconView(act, "chevron", 14), LinearLayout.LayoutParams(-2, -2).also {
+                addView(IconView(act, "chevron", 14, pal.icon), LinearLayout.LayoutParams(-2, -2).also {
                     it.marginStart = Glass.dp(6, d)
                 })
                 // 按压：轻微缩放
@@ -1133,9 +1298,7 @@ class ShelfView(private val act: Activity) : FrameLayout(act) {
         val thumb: android.view.View = if (CoverStore.file(act, b.id).exists()) {
             ImageView(act).apply {
                 scaleType = ImageView.ScaleType.CENTER_CROP
-                val bm = CoverStore.load(act, b.id)
-                if (bm != null) setImageBitmap(bm)
-                else setImageBitmap(BookCover.placeholder(b.title, b.format, 320, 480))
+                loadCoverAsync(this, b.id, b.title, b.format, 320, 480)
             }
         } else {
             ImageView(act).apply {
@@ -1171,7 +1334,7 @@ class ShelfView(private val act: Activity) : FrameLayout(act) {
             addView(TextView(act).apply {
                 text = b.title
                 textSize = 13f
-                setTextColor(T.textP)
+                setTextColor(pal.textP)
                 setTypeface(null, Typeface.BOLD)
                 maxLines = 2
                 ellipsize = android.text.TextUtils.TruncateAt.END
@@ -1180,7 +1343,7 @@ class ShelfView(private val act: Activity) : FrameLayout(act) {
             addView(TextView(act).apply {
                 text = b.format.uppercase().ifEmpty { "TXT" } + " · " + pct
                 textSize = 11f
-                setTextColor(T.textS)
+                setTextColor(pal.textS)
             }, LinearLayout.LayoutParams(-2, -2).also { it.topMargin = Glass.dp(3, d) })
             // 按压：轻微缩放
             setOnTouchListener { v, ev ->
@@ -1213,8 +1376,8 @@ class ShelfView(private val act: Activity) : FrameLayout(act) {
             readMs < 60_000 -> if (readMs <= 0) "暂无记录" else "不足 1 分钟"
             else -> "${readMs / 3600000} 小时 ${(readMs % 3600000) / 60000} 分钟".trim().let { if (it.startsWith("0 ")) it.substringAfter(" ") else it }
         }
-        // 已有 AI 简介则展示
-        val intro = db.listNotes(b.id, "intro").lastOrNull()?.content
+        // 已有 AI 简介则展示：listNotes 按 id DESC 返回，最新一条在最前面
+        val intro = db.listNotes(b.id, "intro").firstOrNull()?.content
         val introText = intro ?: "还没有简介，点「AI 简介」一键生成"
         val body = TextView(act).apply {
             textSize = 14f
@@ -1284,6 +1447,9 @@ class ShelfView(private val act: Activity) : FrameLayout(act) {
                     "书名：《${b.title}》\n【开头内容】\n$head"
             },
             onDone = { reply ->
+                // 简介只保留最新一条：先清掉旧的 intro 行再写入，
+                // 否则每次重新生成都会追加一行，notes 表无限增长且详情页取不到新内容。
+                db.listNotes(b.id, "intro").forEach { db.deleteNote(it.id) }
                 db.addNote(b.id, "intro", reply)
                 android.widget.Toast.makeText(act, "简介已生成 ✓", android.widget.Toast.LENGTH_SHORT).show()
                 refresh()
@@ -1482,7 +1648,7 @@ class ShelfView(private val act: Activity) : FrameLayout(act) {
         var browsing = sourceParent.takeIf { it == 0L || db.getFolder(it) != null } ?: 0L
         val destinationText = TextView(act).apply {
             textSize = 13f
-            setTextColor(T.textS)
+            setTextColor(pal.textS)
             setPadding(Glass.dp(4, d), 0, Glass.dp(4, d), Glass.dp(8, d))
         }
         val pathScroller = android.widget.HorizontalScrollView(act).apply {
@@ -1518,11 +1684,11 @@ class ShelfView(private val act: Activity) : FrameLayout(act) {
                 text = label
                 textSize = 13f
                 gravity = Gravity.CENTER
-                setTextColor(if (active) Color.WHITE else T.textS)
+                setTextColor(if (active) Color.WHITE else pal.textS)
                 setTypeface(null, if (active) Typeface.BOLD else Typeface.NORMAL)
                 background = GradientDrawable().apply {
                     cornerRadius = Glass.dp(10, d).toFloat()
-                    setColor(if (active) T.accent else T.surface2)
+                    setColor(if (active) T.accent else pal.surface2)
                 }
                 setPadding(Glass.dp(12, d), 0, Glass.dp(12, d), 0)
                 setOnClickListener {
@@ -1536,7 +1702,7 @@ class ShelfView(private val act: Activity) : FrameLayout(act) {
                 pathRow.addView(TextView(act).apply {
                     text = "›"
                     textSize = 16f
-                    setTextColor(T.textT)
+                    setTextColor(pal.textT)
                     gravity = Gravity.CENTER
                 }, LinearLayout.LayoutParams(Glass.dp(24, d), Glass.dp(34, d)))
                 pathRow.addView(pathButton(folder.name, folder.id, index == path.lastIndex),
@@ -1568,18 +1734,18 @@ class ShelfView(private val act: Activity) : FrameLayout(act) {
                     gravity = Gravity.CENTER_VERTICAL
                     background = Glass.pressFx()
                     setPadding(Glass.dp(12, d), 0, Glass.dp(8, d), 0)
-                    addView(IconView(act, "folder", 18), LinearLayout.LayoutParams(
+                    addView(IconView(act, "folder", 18, pal.icon), LinearLayout.LayoutParams(
                         Glass.dp(24, d), Glass.dp(24, d)))
                     addView(TextView(act).apply {
                         text = folder.name
                         textSize = 15f
-                        setTextColor(T.textP)
+                        setTextColor(pal.textP)
                         maxLines = 1
                         ellipsize = android.text.TextUtils.TruncateAt.END
                     }, LinearLayout.LayoutParams(0, -2, 1f).also {
                         it.marginStart = Glass.dp(10, d)
                     })
-                    addView(IconView(act, "chevron", 15))
+                    addView(IconView(act, "chevron", 15, pal.icon))
                     setOnClickListener {
                         browsing = folder.id
                         renderLevel()
@@ -1590,7 +1756,7 @@ class ShelfView(private val act: Activity) : FrameLayout(act) {
                 folderList.addView(TextView(act).apply {
                     text = "没有子分类，可直接移到当前位置"
                     textSize = 13f
-                    setTextColor(T.textT)
+                    setTextColor(pal.textT)
                     gravity = Gravity.CENTER
                 }, LinearLayout.LayoutParams(-1, Glass.dp(72, d)))
             }
@@ -1628,9 +1794,13 @@ class ShelfView(private val act: Activity) : FrameLayout(act) {
             if (bookId > 0 && selected != null) importCustomCover(bookId, selected)
             return
         }
+        if (req == REQ_EXPORT_NOTES) {
+            val target = data?.data
+            if (target != null) writeExportDocument(target) else pendingExportMarkdown = null
+            return
+        }
         val uri: Uri = data?.data ?: return
         if (req == Glass.REQ_BG) importBackground(uri)
-        else if (req == Glass.REQ_BOOK) importBook(uri)
     }
 
     private fun importCustomCover(bookId: Long, uri: Uri) {
@@ -1653,36 +1823,60 @@ class ShelfView(private val act: Activity) : FrameLayout(act) {
         }, "yeshu-cover-custom-$bookId").start()
     }
 
+    /** 自定义背景：后台降采样解码 → 有损压缩写回 bg.img（避免备份膨胀与全屏大图 OOM）。 */
     private fun importBackground(uri: Uri) {
-        val f = File(act.filesDir, "bg.img")
-        try {
-            val input = act.contentResolver.openInputStream(uri)
-            if (input != null) {
-                val output = f.outputStream()
-                input.copyTo(output)
-                output.close()
-                input.close()
-                loadBg()
+        Thread({
+            val saved = try {
+                saveBackground(uri)
+            } catch (_: Exception) {
+                false
+            } catch (_: OutOfMemoryError) {
+                false
             }
-        } catch (_: Exception) {
-            android.widget.Toast.makeText(act, "背景导入失败", android.widget.Toast.LENGTH_SHORT).show()
-        }
+            act.runOnUiThread {
+                if (!isAttachedToWindow) return@runOnUiThread
+                if (saved) loadBg()
+                else android.widget.Toast.makeText(act, "背景导入失败", android.widget.Toast.LENGTH_SHORT).show()
+            }
+        }, "yeshu-bg-import").start()
     }
 
-    private fun importBook(uri: Uri) {
-        // 旧 View 入口也统一走 LibraryImporter，避免绕过 MIME/魔数复核和内容哈希去重。
-        Thread {
-            val result = LibraryImporter.import(act, uri)
-            act.runOnUiThread {
-                val message = when {
-                    result.id <= 0 -> result.error ?: "导入失败"
-                    result.error != null -> result.error
-                    else -> "已导入《${result.title}》"
-                }
-                android.widget.Toast.makeText(act, message, android.widget.Toast.LENGTH_SHORT).show()
-                if (result.id > 0) refresh()
+    /**
+     * 保存背景：先只读图片头计算 inSampleSize，再降采样解码并转 JPEG 落盘。
+     * 旧格式的 bg.img 由 loadBg() 继续兼容读取。
+     */
+    private fun saveBackground(uri: Uri): Boolean {
+        val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
+        act.contentResolver.openInputStream(uri)?.use { BitmapFactory.decodeStream(it, null, bounds) }
+        if (bounds.outWidth <= 0 || bounds.outHeight <= 0) return false
+        var sample = 1
+        while (maxOf(bounds.outWidth, bounds.outHeight) / sample > BG_MAX_DIMENSION) sample *= 2
+        val bm = act.contentResolver.openInputStream(uri)?.use {
+            BitmapFactory.decodeStream(it, null, BitmapFactory.Options().apply { inSampleSize = sample })
+        } ?: return false
+        val f = File(act.filesDir, "bg.img")
+        val tmp = File(act.filesDir, "bg.img.tmp")
+        tmp.delete()
+        val compressed = try {
+            tmp.outputStream().buffered().use {
+                bm.compress(android.graphics.Bitmap.CompressFormat.JPEG, 88, it)
             }
-        }.start()
+        } finally {
+            bm.recycle()
+        }
+        if (!compressed || tmp.length() <= 0L) {
+            tmp.delete()
+            return false
+        }
+        if (f.exists() && !f.delete()) {
+            tmp.delete()
+            return false
+        }
+        if (!tmp.renameTo(f)) {
+            tmp.delete()
+            return false
+        }
+        return true
     }
 
     /** AI 全文摘要：子线程调用，结果存 notes 表并弹出展示 */
@@ -1697,7 +1891,9 @@ class ShelfView(private val act: Activity) : FrameLayout(act) {
                 .show().also { Glass.styleDialog(it, density(act)) }
             return
         }
-        val pd = android.app.ProgressDialog.show(act, "AI 摘要", "正在生成，请稍候…", true, false)
+        if (aiBusy) return
+        aiBusy = true
+        showAiProgress("正在生成，请稍候…")
         Thread {
             var err: String? = null
             var reply = ""
@@ -1718,7 +1914,9 @@ class ShelfView(private val act: Activity) : FrameLayout(act) {
             }
             val e = err
             act.runOnUiThread {
-                try { pd.dismiss() } catch (ex: Exception) {}
+                aiBusy = false
+                if (!isAttachedToWindow) return@runOnUiThread
+                dismissAiProgress()
                 if (e != null) showResult("AI 调用失败", e)
                 else showResult("《${b.title}》· AI 摘要", reply)
             }
@@ -1751,17 +1949,63 @@ class ShelfView(private val act: Activity) : FrameLayout(act) {
                 .setPositiveButton("知道了", null).show()
             return
         }
-        val label = mapOf("summary" to "摘要", "ask" to "问答", "quiz" to "自测")
         val md = StringBuilder("# 《${b.title}》 笔记导出\n\n")
         for (n in notes) {
-            md.append("## 【${label[n.kind] ?: n.kind}】\n\n").append(n.content).append("\n\n---\n\n")
+            md.append("## 【${NoteKindLabels.label(n.kind)}】\n\n").append(n.content).append("\n\n---\n\n")
         }
-        val intent = Intent(Intent.ACTION_SEND).apply {
-            type = "text/plain"
-            putExtra(Intent.EXTRA_SUBJECT, "《${b.title}》笔记导出")
-            putExtra(Intent.EXTRA_TEXT, md.toString())
+        exportMarkdown("《${b.title}》笔记导出", "《${b.title}》笔记导出.md", md.toString())
+    }
+
+    /**
+     * 分享 Markdown：文本走 ACTION_SEND，超过 [MAX_SHARE_TEXT_CHARS] 时改走
+     * ACTION_CREATE_DOCUMENT 落盘。Intent extra 过大会触发 TransactionTooLargeException，
+     * 这里既给出可见提示，也不再直接崩溃。
+     */
+    private fun exportMarkdown(subject: String, suggestedName: String, markdown: String) {
+        if (markdown.length <= MAX_SHARE_TEXT_CHARS) {
+            val intent = Intent(Intent.ACTION_SEND).apply {
+                type = "text/plain"
+                putExtra(Intent.EXTRA_SUBJECT, subject)
+                putExtra(Intent.EXTRA_TEXT, markdown)
+            }
+            val started = runCatching { act.startActivity(Intent.createChooser(intent, "导出笔记")) }.isSuccess
+            if (!started) {
+                android.widget.Toast.makeText(act, "无法打开分享面板，请稍后重试", android.widget.Toast.LENGTH_LONG).show()
+            }
+            return
         }
-        act.startActivity(Intent.createChooser(intent, "导出笔记"))
+        pendingExportMarkdown = markdown
+        android.widget.Toast.makeText(act, "笔记内容较多，请选择保存位置", android.widget.Toast.LENGTH_SHORT).show()
+        val intent = Intent(Intent.ACTION_CREATE_DOCUMENT).apply {
+            addCategory(Intent.CATEGORY_OPENABLE)
+            type = "text/markdown"
+            putExtra(Intent.EXTRA_TITLE, suggestedName)
+        }
+        val started = try {
+            @Suppress("DEPRECATION")
+            act.startActivityForResult(intent, REQ_EXPORT_NOTES)
+            true
+        } catch (_: Exception) {
+            false
+        }
+        if (!started) {
+            pendingExportMarkdown = null
+            android.widget.Toast.makeText(act, "无法打开文件保存面板", android.widget.Toast.LENGTH_LONG).show()
+        }
+    }
+
+    /** 把待导出的 Markdown 写入用户选定的文档 URI。 */
+    private fun writeExportDocument(uri: Uri) {
+        val markdown = pendingExportMarkdown ?: return
+        pendingExportMarkdown = null
+        val written = runCatching {
+            act.contentResolver.openOutputStream(uri, "wt")?.use { it.write(markdown.toByteArray(Charsets.UTF_8)) } != null
+        }.getOrDefault(false)
+        android.widget.Toast.makeText(
+            act,
+            if (written) "笔记已导出" else "导出失败：无法写入所选位置",
+            android.widget.Toast.LENGTH_SHORT
+        ).show()
     }
 
     private fun openReader(id: Long) {
@@ -1769,7 +2013,115 @@ class ShelfView(private val act: Activity) : FrameLayout(act) {
     }
 
     private companion object {
-        // Must not collide with Glass.REQ_SETTINGS (103), which MainActivity intercepts first.
         const val REQ_CUSTOM_COVER = 104
+        const val REQ_EXPORT_NOTES = 105
+        // 背景图最大边长：全屏展示足够，同时限制备份体积与解码内存
+        const val BG_MAX_DIMENSION = 1600
+        // 搜索输入防抖时长（毫秒）
+        const val SEARCH_DEBOUNCE_MS = 200L
+        // 走 ACTION_SEND 的文本上限（UTF-16 下约 400 KB），超过则改为写入文件，
+        // 避免 Intent extra 撞上 Binder 事务上限抛 TransactionTooLargeException
+        const val MAX_SHARE_TEXT_CHARS = 200_000
+        // 封面解码线程池：避免在 refresh() 主线程解码大图造成掉帧/ANR
+        val coverExecutor: java.util.concurrent.ExecutorService = Executors.newFixedThreadPool(2) { r ->
+            Thread(r, "yeshu-shelf-cover").apply { isDaemon = true }
+        }
+    }
+}
+
+/**
+ * 旧版 View 页面的主题快照。
+ * Compose 侧通过 DataStore 异步读取主题偏好，View 层需要同步取值；
+ * 这里缓存最近一次读到的值（默认跟随系统），并在每次取值时后台刷新一次，
+ * 让新建页面在下一次导航就能拿到最新偏好，无需改造 MainActivity/YeshuApp。
+ */
+object LegacyTheme {
+    @Volatile private var cached: String? = null
+    @Volatile private var refreshing = false
+
+    private fun isDarkMode(context: Context, mode: String): Boolean = when (mode) {
+        "dark" -> true
+        "light" -> false
+        else -> (context.resources.configuration.uiMode and
+            android.content.res.Configuration.UI_MODE_NIGHT_MASK) ==
+            android.content.res.Configuration.UI_MODE_NIGHT_YES
+    }
+
+    /** 同步返回当前是否深色；同时触发一次后台刷新，让后续页面取到最新偏好。 */
+    fun isDark(context: Context): Boolean {
+        val mode = cached
+        refresh(context)
+        return isDarkMode(context, mode ?: "system")
+    }
+
+    private fun refresh(context: Context) {
+        if (refreshing) return
+        refreshing = true
+        val app = context.applicationContext
+        Thread({
+            cached = runCatching {
+                runBlocking { UserPreferences(app).themeMode.first() }
+            }.getOrDefault("system")
+            refreshing = false
+        }, "yeshu-theme").start()
+    }
+}
+
+/**
+ * 旧版 View 页面的浅色/深色调色板，与 Compose 主题偏好保持一致，
+ * 避免在 Compose 与 View 页面之间导航时明暗表面来回跳变。
+ */
+class LegacyPalette private constructor(
+    val dark: Boolean,
+    val bg: Int,
+    val bgGradientTop: Int,
+    val surface: Int,
+    val surface2: Int,
+    val surface3: Int,
+    val textP: Int,
+    val textS: Int,
+    val textT: Int,
+    val icon: Int,
+    val bar: Int,
+    val bubble: Int,
+    val bubbleText: Int,
+    /** 底部弹层等遮罩色：深浅主题下都要压暗背景，不能共用同一个常量。 */
+    val scrim: Int
+) {
+    companion object {
+        private val DARK = LegacyPalette(
+            dark = true,
+            bg = T.bg,
+            bgGradientTop = Color.parseColor("#10131C"),
+            surface = T.surface,
+            surface2 = T.surface2,
+            surface3 = T.surface3,
+            textP = T.textP,
+            textS = T.textS,
+            textT = T.textT,
+            icon = Color.WHITE,
+            bar = Color.parseColor("#161B26"),
+            bubble = Color.argb(150, 34, 38, 48),
+            bubbleText = Color.parseColor("#E8EAEE"),
+            scrim = Color.argb(140, 0, 0, 0)
+        )
+        private val LIGHT = LegacyPalette(
+            dark = false,
+            bg = Color.parseColor("#F7F8FC"),
+            bgGradientTop = Color.parseColor("#EEF1F8"),
+            surface = Color.WHITE,
+            surface2 = Color.parseColor("#EEF0FA"),
+            surface3 = Color.parseColor("#DDE1F0"),
+            textP = Color.parseColor("#171A2B"),
+            textS = Color.argb(180, 23, 26, 43),
+            textT = Color.argb(130, 23, 26, 43),
+            icon = Color.parseColor("#171A2B"),
+            bar = Color.WHITE,
+            bubble = Color.parseColor("#EEF0FA"),
+            bubbleText = Color.parseColor("#171A2B"),
+            scrim = Color.argb(90, 0, 0, 0)
+        )
+
+        fun of(context: Context): LegacyPalette = if (LegacyTheme.isDark(context)) DARK else LIGHT
     }
 }

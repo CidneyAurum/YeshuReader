@@ -164,29 +164,69 @@ object AiClient {
             value.endsWith(".local")
     }
 
+    /**
+     * 判断主机是否为「本机/局域网」字面量。
+     * 只接受 IP 字面量（IPv4、IPv6、IPv4 映射形式、带 zone-id 的链路本地地址），
+     * 不做域名解析，避免 DNS 超时与「域名指向内网」造成的判定歧义。
+     * 安全意图保持不变：只有环回、链路本地、私有网段可用明文 HTTP，公网地址必须 HTTPS。
+     */
     private fun isPrivateNetworkHost(host: String): Boolean {
-        val value = host.lowercase().removePrefix("[").removeSuffix("]")
+        val value = host.trim().removePrefix("[").removeSuffix("]").substringBefore('%').trim()
+        if (value.isEmpty()) return false
+        parseIpv4(value)?.let { return isPrivateIpv4(it) }
+        if (':' !in value) return false
+        // 冒号形式只可能是 IPv6 字面量（可能内嵌 IPv4）；字符集不合法则直接否决，避免走解析器
+        if (!value.all { it.isDigit() || it in 'a'..'f' || it in 'A'..'F' || it == ':' || it == '.' }) {
+            return false
+        }
+        val bytes = runCatching { java.net.InetAddress.getByName(value).address }.getOrNull() ?: return false
+        if (bytes.size == 4) return isPrivateIpv4(bytes)
+        if (bytes.size != 16) return false
+        // IPv4 映射/兼容地址（::ffff:192.168.1.1）：按内嵌的 IPv4 判定
+        if (bytes.copyOfRange(0, 10).all { it == 0.toByte() } &&
+            bytes[10] == 0xFF.toByte() && bytes[11] == 0xFF.toByte()
+        ) {
+            return isPrivateIpv4(bytes.copyOfRange(12, 16))
+        }
+        val first = bytes[0].toInt() and 0xFF
+        val second = bytes[1].toInt() and 0xFF
+        return when {
+            bytes.copyOfRange(0, 15).all { it == 0.toByte() } && bytes[15] == 1.toByte() -> true  // ::1 环回
+            first == 0xFE && (second and 0xC0) == 0x80 -> true                                     // fe80::/10 链路本地
+            first == 0xFE && (second and 0xC0) == 0xC0 -> true                                     // fec0::/10 站点本地
+            (first and 0xFE) == 0xFC -> true                                                       // fc00::/7 唯一本地
+            else -> false
+        }
+    }
+
+    /** 严格解析点分十进制 IPv4；非四段/越界/前导零一律返回 null（避免八进制歧义绕过内网判定） */
+    private fun parseIpv4(value: String): ByteArray? {
         val parts = value.split('.')
-        if (parts.size == 4) {
-            val octets = parts.map { it.toIntOrNull() ?: return false }
-            if (octets.any { it !in 0..255 }) return false
-            return when {
-                octets[0] == 127 -> true
-                octets[0] == 10 -> true
-                octets[0] == 192 && octets[1] == 168 -> true
-                octets[0] == 169 && octets[1] == 254 -> true
-                octets[0] == 172 && octets[1] in 16..31 -> true
-                else -> false
-            }
+        if (parts.size != 4) return null
+        val octets = ByteArray(4)
+        for (index in parts.indices) {
+            val part = parts[index]
+            if (part.isEmpty() || part.length > 3 || !part.all { it.isDigit() }) return null
+            if (part.length > 1 && part[0] == '0') return null
+            val octet = part.toIntOrNull() ?: return null
+            if (octet !in 0..255) return null
+            octets[index] = octet.toByte()
         }
-        if (':' in value && value.all { it.isDigit() || it.lowercaseChar() in 'a'..'f' || it == ':' || it == '%' }) {
-            return runCatching {
-                java.net.InetAddress.getByName(value).let {
-                    it.isLoopbackAddress || it.isLinkLocalAddress || it.isSiteLocalAddress
-                }
-            }.getOrDefault(false)
+        return octets
+    }
+
+    private fun isPrivateIpv4(bytes: ByteArray): Boolean {
+        if (bytes.size != 4) return false
+        val a = bytes[0].toInt() and 0xFF
+        val b = bytes[1].toInt() and 0xFF
+        return when {
+            a == 127 -> true
+            a == 10 -> true
+            a == 192 && b == 168 -> true
+            a == 169 && b == 254 -> true
+            a == 172 && b in 16..31 -> true
+            else -> false
         }
-        return false
     }
 
     /**
@@ -338,6 +378,7 @@ object AiClient {
     /**
      * 同步调用（调用方负责放子线程）。返回 assistant 回复文本。
      * onDelta 非空时走流式请求并逐段回调（打字机效果）；服务端不支持时自动回退一次性解析。
+     * onRestart 用于告知调用方「已上屏的增量作废，需清空后重新接收」（断流重发时回调一次）。
      * 失败抛 RuntimeException；HTTP 错误仅暴露状态码，不回显服务端响应正文。
      */
     fun chat(
@@ -346,19 +387,20 @@ object AiClient {
         user: String,
         onDelta: ((String) -> Unit)? = null,
         timeoutMs: Int = 180_000,
-        onReason: ((String) -> Unit)? = null
+        onReason: ((String) -> Unit)? = null,
+        onRestart: (() -> Unit)? = null
     ): String {
         val msgs = JSONArray()
         if (!system.isNullOrBlank()) {
             msgs.put(JSONObject().put("role", "system").put("content", system))
         }
         msgs.put(JSONObject().put("role", "user").put("content", user))
-        return withFallback(cfg, msgs, timeoutMs, onDelta, onReason)
+        return withFallback(cfg, msgs, timeoutMs, onDelta, onReason, onRestart)
     }
 
     /**
      * 多轮对话（与书聊天气）：history 为 (role, content) 列表，role 是 "user"/"assistant"。
-     * system 由调用方拼好书上下文。
+     * system 由调用方拼好书上下文。onRestart 语义同 [chat]。
      */
     fun chatHistory(
         cfg: Config,
@@ -366,7 +408,8 @@ object AiClient {
         history: List<Pair<String, String>>,
         onDelta: ((String) -> Unit)? = null,
         timeoutMs: Int = 180_000,
-        onReason: ((String) -> Unit)? = null
+        onReason: ((String) -> Unit)? = null,
+        onRestart: (() -> Unit)? = null
     ): String {
         val msgs = JSONArray()
         if (!system.isNullOrBlank()) {
@@ -376,29 +419,33 @@ object AiClient {
             if (content.isBlank()) continue
             msgs.put(JSONObject().put("role", if (role == "assistant") "assistant" else "user").put("content", content))
         }
-        return withFallback(cfg, msgs, timeoutMs, onDelta, onReason)
+        return withFallback(cfg, msgs, timeoutMs, onDelta, onReason, onRestart)
     }
 
     /**
      * 流式断流自动降级：SSE 中途 IOException（弱网/代理断流）时，
      * 静默重发一次非流式请求保证结果可用，全文通过 onDelta 补发。
+     *
+     * 重发前会先回调 onRestart，调用方据此丢弃已累积/已上屏的部分输出，避免「半截 + 全文」重复。
+     * 调用方未提供 onRestart 时无法纠正已上屏内容，此时不再重发，直接抛出原始异常。
      */
     private fun withFallback(
         cfg: Config,
         msgs: JSONArray,
         timeoutMs: Int,
         onDelta: ((String) -> Unit)?,
-        onReason: ((String) -> Unit)? = null
+        onReason: ((String) -> Unit)? = null,
+        onRestart: (() -> Unit)? = null
     ): String {
         return try {
             postChat(cfg, msgs, timeoutMs, onDelta, onReason)
         } catch (e: java.io.IOException) {
             if (cancellation.get()?.isCancelled() == true) throw CancellationException("AI 请求已取消")
-            if (onDelta != null) {
-                val r = postChat(cfg, msgs, timeoutMs, null, null)
-                onDelta(r)
-                r
-            } else throw e
+            if (onDelta == null || onRestart == null) throw e
+            onRestart()
+            val r = postChat(cfg, msgs, timeoutMs, null, null)
+            onDelta(r)
+            r
         }
     }
 
@@ -479,7 +526,7 @@ object AiClient {
     /**
      * 视觉多模态请求：文本 + 页面图片（PDF 走此通道）。
      * 图片压缩为 JPEG（质量 70，宽度压到 ~900px），base64 内嵌 data URI。
-     * 需要服务端支持 image_url 内容块（GPT-4o/qwen-vl/glm-4v 等）。
+     * 需要服务端支持 image_url 内容块（GPT-4o/qwen-vl/glm-4v 等）。onRestart 语义同 [chat]。
      */
     fun chatVision(
         cfg: Config,
@@ -488,7 +535,8 @@ object AiClient {
         pages: List<Bitmap>,
         onDelta: ((String) -> Unit)? = null,
         timeoutMs: Int = 180_000,
-        onReason: ((String) -> Unit)? = null
+        onReason: ((String) -> Unit)? = null,
+        onRestart: (() -> Unit)? = null
     ): String {
         val visionModel = cfg.visionModel.ifBlank {
             throw IllegalStateException("未配置视觉模型，无法识别扫描页或图片")
@@ -497,7 +545,8 @@ object AiClient {
         content.put(JSONObject().put("type", "text").put("text", userText))
         for (bmp in pages) {
             val scaled = if (bmp.width > 900) {
-                val h = bmp.height * 900 / bmp.width
+                // 极宽极扁的页面按比例算高会得到 0，createScaledBitmap 会抛异常，必须夹到 1 以上
+                val h = (bmp.height * 900 / bmp.width).coerceAtLeast(1)
                 Bitmap.createScaledBitmap(bmp, 900, h, true)
             } else bmp
             val bo = ByteArrayOutputStream()
@@ -516,7 +565,7 @@ object AiClient {
             msgs.put(JSONObject().put("role", "system").put("content", system))
         }
         msgs.put(userMsg)
-        return withFallback(cfg.copy(model = visionModel), msgs, timeoutMs, onDelta, onReason)
+        return withFallback(cfg.copy(model = visionModel), msgs, timeoutMs, onDelta, onReason, onRestart)
     }
 
     /** 统一发送实现：onDelta 非空 → stream:true 并解析 SSE；否则普通请求 */
@@ -559,9 +608,7 @@ object AiClient {
 
             val code = conn.responseCode
             if (code !in 200..299) {
-                // Do not surface provider response bodies: proxies sometimes echo request
-                // diagnostics, authorization data, or other sensitive material.
-                throw RuntimeException("HTTP $code")
+                throw RuntimeException(httpErrorMessage(code, conn, cfg.key))
             }
 
             if (onDelta == null) {
@@ -573,6 +620,23 @@ object AiClient {
             token?.detach(conn)
             conn.disconnect()
         }
+    }
+
+    /**
+     * 只回传服务商自己的 error.message，并抹掉可能被网关回显的密钥、限制长度。
+     *
+     * 整个响应体不能直接抛给用户（网关有时会回显请求诊断信息甚至鉴权数据），
+     * 但只给一个「HTTP 400」用户又完全无从排查——比如模型名写错时。
+     */
+    private fun httpErrorMessage(code: Int, conn: HttpURLConnection, key: String): String {
+        val body = runCatching {
+            conn.errorStream?.use { it.readBytes().toString(Charsets.UTF_8) }
+        }.getOrNull().orEmpty()
+        val detail = runCatching {
+            JSONObject(body).optJSONObject("error")?.optString("message").orEmpty()
+        }.getOrNull().orEmpty().trim()
+        val safe = (if (key.isNotBlank()) detail.replace(key, "***") else detail).take(200)
+        return if (safe.isEmpty()) "HTTP $code" else "HTTP $code：$safe"
     }
 
     /** 解析 SSE 流：delta.content 正文 / delta.reasoning_content 推理思考（DeepSeek 混合推理模型） */

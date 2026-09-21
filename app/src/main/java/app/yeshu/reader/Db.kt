@@ -109,13 +109,30 @@ class Db(context: Context) {
 
     fun findBook(title: String, sizeBytes: Long): Book? = dao.findBook(title, sizeBytes)?.toModel()
 
+    /** 导入去重的命中结果；[fromRecycleBin] 为真时调用方应先恢复文件再调用 [restoreDeletedBook]。 */
+    data class ImportMatch(val book: Book, val fromRecycleBin: Boolean)
+
+    /**
+     * 导入去重：按内容哈希查找，包含回收站里的条目。[listBooks] / [findBook] 都过滤了
+     * `deleted_at = 0`，所以只看它们会把回收站中的同一份文档重新导入成第二条记录、磁盘上
+     * 再多出一份文件。命中已软删除的记录时应当恢复它（[deleteBook] 只写 deleted_at，
+     * [restoreDeletedBook] 把它清回 0 即可逆），从而复用原有的进度、笔记与 AI 结果。
+     */
+    fun findImportMatch(contentHash: String): ImportMatch? {
+        val existing = dao.findAnyBookByContentHash(contentHash) ?: return null
+        return ImportMatch(existing.toModel(), existing.deletedAt > 0)
+    }
+
     fun addReadTime(id: Long, deltaMs: Long) {
         if (deltaMs <= 0) return
         room.runInTransaction {
-            dao.addReadTime(id, deltaMs)
-            val day = SimpleDateFormat("yyyy-MM-dd", Locale.CHINA).format(Date())
-            dao.insertReadLog(ReadLogEntity(day, 0))
-            dao.incrementReadLog(day, deltaMs)
+            // 书目被删除或清理后 UPDATE 会影响 0 行，此时不能再累加 read_log：
+            // 否则“近 7 天阅读时长”会超过书目累计时长，统计页出现日总量大于总量。
+            if (dao.addReadTime(id, deltaMs) > 0) {
+                val day = SimpleDateFormat("yyyy-MM-dd", Locale.CHINA).format(Date())
+                dao.insertReadLog(ReadLogEntity(day, 0))
+                dao.incrementReadLog(day, deltaMs)
+            }
         }
     }
 
@@ -214,17 +231,31 @@ class Db(context: Context) {
     fun getSetting(key: String): String? = dao.getSetting(key)
     fun deleteSetting(key: String) = dao.deleteSetting(key)
 
-    /** One-time migration from the legacy plaintext settings row into Android Keystore. */
+    /**
+     * One-time migration from the legacy plaintext settings row into Android Keystore.
+     * 只要“当前来源还没有可用密钥”就把明文迁移进 Keystore：先写入、确认写入成功后再删除明文行，
+     * 因此不会因为其他来源已有绑定密钥而丢掉旧密钥，重复调用也是幂等的；返回值取迁移后的结果。
+     */
     fun getAiKey(baseUrl: String = dao.getSetting("ai_base_url").orEmpty()): String {
         val secure = SecureKeyStore(appContext)
         val origin = runCatching { AiClient.endpointOrigin(baseUrl) }.getOrDefault("")
-        val stored = secure.readApiKey(origin)
         val legacy = dao.getSetting("ai_key").orEmpty()
-        if (legacy.isNotBlank()) {
-            // Remove the plaintext row even when the old base URL is missing or invalid. The
-            // migrated value remains encrypted but unbound until the user confirms a provider.
-            if (!secure.hasApiKey()) secure.writeUnboundApiKey(legacy)
-            dao.deleteSetting("ai_key")
+        var stored = secure.readApiKey(origin)
+        if (legacy.isNotBlank() && stored.isBlank()) {
+            val migrated = if (origin.isNotBlank()) {
+                // 旧明文没有记录来源；有可用服务地址时直接绑定，写入成功后即可使用。
+                runCatching { secure.writeApiKey(legacy, origin) }.isSuccess &&
+                    secure.readApiKey(origin).isNotBlank()
+            } else {
+                // 缺少可用服务地址：保留为待绑定密钥。已有绑定密钥时绝不覆盖，也不删除明文。
+                !secure.hasApiKey() &&
+                    runCatching { secure.writeUnboundApiKey(legacy) }.isSuccess &&
+                    secure.hasUnboundApiKey()
+            }
+            if (migrated) {
+                stored = secure.readApiKey(origin)
+                dao.deleteSetting("ai_key")
+            }
         }
         return stored
     }
@@ -258,8 +289,14 @@ class Db(context: Context) {
 
     fun removeAiKey(profileId: String) = SecureKeyStore(appContext).removeProfileApiKey(profileId)
 
-    fun addNote(bookId: Long, kind: String, content: String): Long = dao.addNote(
-        NoteEntity(bookId = bookId, kind = kind, content = content, createdAt = System.currentTimeMillis())
+    fun addNote(
+        bookId: Long,
+        kind: String,
+        content: String,
+        id: Long = 0L,
+        createdAt: Long = System.currentTimeMillis(),
+    ): Long = dao.addNote(
+        NoteEntity(id = id, bookId = bookId, kind = kind, content = content, createdAt = createdAt)
     )
 
     fun listNotes(bookId: Long, kind: String? = null): List<NoteRow> =

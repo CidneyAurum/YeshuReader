@@ -1,9 +1,30 @@
+import java.util.Properties
+
 plugins {
     id("com.android.application")
     id("org.jetbrains.kotlin.android")
     id("org.jetbrains.kotlin.plugin.compose")
     id("org.jetbrains.kotlin.kapt")
 }
+
+// release 签名来自仓库根目录下 gitignored 的 keystore.properties，格式（storeFile 相对仓库根目录）：
+//   storeFile=yeshu-release.jks
+//   storePassword=******
+//   keyAlias=yeshu
+//   keyPassword=******
+// 四项缺任意一项（或整个文件不存在）时跳过签名配置，assembleRelease 仍能产出未签名 APK，不会直接失败。
+val keystorePropertiesFile = rootProject.file("keystore.properties")
+val keystoreProperties = Properties().apply {
+    if (keystorePropertiesFile.exists()) {
+        keystorePropertiesFile.inputStream().use { load(it) }
+    }
+}
+val releaseStoreFile: String? = keystoreProperties.getProperty("storeFile")
+val releaseStorePassword: String? = keystoreProperties.getProperty("storePassword")
+val releaseKeyAlias: String? = keystoreProperties.getProperty("keyAlias")
+val releaseKeyPassword: String? = keystoreProperties.getProperty("keyPassword")
+val hasReleaseSigning = releaseStoreFile != null && releaseStorePassword != null &&
+    releaseKeyAlias != null && releaseKeyPassword != null
 
 android {
     namespace = "app.yeshu.reader"
@@ -13,15 +34,31 @@ android {
         applicationId = "app.yeshu.reader"
         minSdk = 26
         targetSdk = 35
-        versionCode = 1
-        versionName = "1.0"
+        versionCode = 2
+        versionName = "1.1"
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
+    }
+
+    signingConfigs {
+        if (hasReleaseSigning) {
+            create("release") {
+                storeFile = rootProject.file(releaseStoreFile!!)
+                storePassword = releaseStorePassword
+                keyAlias = releaseKeyAlias
+                keyPassword = releaseKeyPassword
+            }
+        }
     }
 
     buildTypes {
         release {
-            isMinifyEnabled = false
+            isMinifyEnabled = true
+            isShrinkResources = true
             proguardFiles(getDefaultProguardFile("proguard-android-optimize.txt"), "proguard-rules.pro")
+            // 仅在提供了完整的 keystore.properties 时才使用 release 签名
+            if (hasReleaseSigning) {
+                signingConfig = signingConfigs.getByName("release")
+            }
         }
     }
 
@@ -51,6 +88,13 @@ android {
 kotlin {
     compilerOptions {
         jvmTarget.set(org.jetbrains.kotlin.gradle.dsl.JvmTarget.JVM_17)
+    }
+}
+
+kapt {
+    arguments {
+        // Room 导出 schema JSON，使手写 Migration 可以被 schema 校验；目录不存在时由编译器创建。
+        arg("room.schemaLocation", "$projectDir/schemas")
     }
 }
 

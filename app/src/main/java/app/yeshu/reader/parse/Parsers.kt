@@ -7,6 +7,9 @@ import java.io.File
 import java.io.InputStream
 import java.io.StringReader
 import java.net.URLDecoder
+import java.nio.ByteBuffer
+import java.nio.charset.Charset
+import java.nio.charset.CodingErrorAction
 import java.util.zip.ZipEntry
 import java.util.zip.ZipFile
 
@@ -401,14 +404,8 @@ object DocParser {
 
     // ---------- 公共工具 ----------
 
-    private fun build(format: String, blocks: List<Block>): ParsedDoc {
-        val ft = StringBuilder()
-        for (b in blocks) {
-            if (ft.length > 400_000) break
-            ft.append(b.text).append('\n')
-        }
-        return ParsedDoc(format, blocks, ft.toString().take(400_000))
-    }
+    private fun build(format: String, blocks: List<Block>): ParsedDoc =
+        ParsedDoc(format, blocks, buildText(blocks))
 
     private fun buildText(blocks: List<Block>): String {
         val ft = StringBuilder()
@@ -434,11 +431,66 @@ object DocParser {
     private fun readTextFile(file: File): String {
         if (file.length() > MAX_TEXT_BYTES) throw ParseException("文本文件过大（上限 32 MB）")
         val bytes = file.inputStream().use { readLimited(it, MAX_TEXT_BYTES, "文本文件") }
-        var value = String(bytes, Charsets.UTF_8)
-        if (value.contains('\uFFFD')) {
-            try { value = String(bytes, charset("GBK")) } catch (_: Exception) { }
+        return decodeText(bytes)
+    }
+
+    /**
+     * 文本解码：BOM 优先（UTF-8 / UTF-16LE / UTF-16BE）；无 BOM 时用 NUL 字节间隔启发式识别 UTF-16；
+     * 其余先做严格 UTF-8 解码，只有真正非法时才回退 GBK（兼容老中文文本文件）。
+     * 不再用「包含 U+FFFD」判断，避免合法包含 U+FFFD 的 UTF-8 文件被误判成 GBK。
+     */
+    private fun decodeText(bytes: ByteArray): String {
+        if (bytes.size >= 3 && bytes[0] == 0xEF.toByte() && bytes[1] == 0xBB.toByte() &&
+            bytes[2] == 0xBF.toByte()
+        ) {
+            return String(bytes, 3, bytes.size - 3, Charsets.UTF_8)
         }
-        return value.removePrefix("\uFEFF")
+        if (bytes.size >= 2 && bytes[0] == 0xFF.toByte() && bytes[1] == 0xFE.toByte()) {
+            return String(bytes, 2, bytes.size - 2, Charsets.UTF_16LE)
+        }
+        if (bytes.size >= 2 && bytes[0] == 0xFE.toByte() && bytes[1] == 0xFF.toByte()) {
+            return String(bytes, 2, bytes.size - 2, Charsets.UTF_16BE)
+        }
+        detectBomlessUtf16(bytes)?.let { return String(bytes, it) }
+        strictUtf8(bytes)?.let { return it }
+        return try {
+            String(bytes, charset("GBK"))
+        } catch (_: Exception) {
+            String(bytes, Charsets.UTF_8)
+        }
+    }
+
+    /** 严格 UTF-8：遇到非法字节返回 null，而不是用 U+FFFD 静默替换后再去猜编码。 */
+    private fun strictUtf8(bytes: ByteArray): String? = try {
+        Charsets.UTF_8.newDecoder()
+            .onMalformedInput(CodingErrorAction.REPORT)
+            .onUnmappableCharacter(CodingErrorAction.REPORT)
+            .decode(ByteBuffer.wrap(bytes))
+            .toString()
+    } catch (_: Exception) {
+        null
+    }
+
+    /**
+     * 无 BOM 的 UTF-16 启发式：ASCII 字符在 UTF-16LE 中表现为奇数位大量 0x00，UTF-16BE 则相反。
+     * 只统计前 4 KB；要求某一位序的 0x00 明显占优，避免把普通二进制误判成文本。
+     * 纯中文且无 ASCII 的无 BOM UTF-16 无法可靠判别，仍按 GBK/UTF-8 处理。
+     */
+    private fun detectBomlessUtf16(bytes: ByteArray): Charset? {
+        val limit = minOf(bytes.size, 4096)
+        if (limit < 16) return null
+        var evenZero = 0
+        var oddZero = 0
+        for (i in 0 until limit) {
+            if (bytes[i].toInt() != 0) continue
+            if (i % 2 == 0) evenZero++ else oddZero++
+        }
+        val minZeros = limit / 8
+        return when {
+            oddZero >= minZeros && oddZero > evenZero * 4 -> Charsets.UTF_16LE
+            evenZero >= minZeros && evenZero > oddZero * 4 -> Charsets.UTF_16BE
+            else -> null
+        }
     }
 
     private fun readLimited(input: InputStream, limit: Int, label: String): ByteArray {
@@ -478,6 +530,8 @@ object DocParser {
 
     private fun looksLikeText(bytes: ByteArray): Boolean {
         if (bytes.isEmpty()) return false
+        // UTF-16 文本含 NUL 字节，先按 BOM/间隔特征放行，交给 decodeText 正确解码
+        if (hasUtf16Bom(bytes) || detectBomlessUtf16(bytes) != null) return true
         var controls = 0
         for (byte in bytes) {
             val value = byte.toInt() and 0xff
@@ -486,6 +540,12 @@ object DocParser {
         }
         return controls * 20 <= bytes.size
     }
+
+    private fun hasUtf16Bom(bytes: ByteArray): Boolean =
+        bytes.size >= 2 && (
+            (bytes[0] == 0xFF.toByte() && bytes[1] == 0xFE.toByte()) ||
+                (bytes[0] == 0xFE.toByte() && bytes[1] == 0xFF.toByte())
+            )
 
     private inline fun xmlPull(xml: String, body: (XmlPullParser) -> Unit) {
         val xp = Xml.newPullParser()
@@ -531,7 +591,6 @@ object DocParser {
         val PARA = setOf("p", "li", "blockquote", "div")
         val SKIP = setOf("script", "style")
         var buf = StringBuilder()
-        var curHeading = false
         var skipDepth = 0
 
         xmlPull(html) { xp ->
@@ -555,17 +614,10 @@ object DocParser {
                             val t = buf.toString().trim()
                             buf = StringBuilder()
                             if (t.isEmpty()) continue@loop
-                            if (curHeading || n in HEADINGS || n == "title") {
-                                out.add(Block(Block.HEADING, t))
-                                curHeading = false
-                            } else if (n != "div") {
-                                out.add(Block(Block.TEXT, t))
-                            } else {
-                                // 裸 div 文本也收进正文
-                                out.add(Block(Block.TEXT, t))
-                            }
+                            // h1-h6/title 记为标题块；p/li/blockquote/裸 div 都收进正文
+                            val type = if (n in HEADINGS || n == "title") Block.HEADING else Block.TEXT
+                            out.add(Block(type, t))
                         }
-                        if (n in HEADINGS) curHeading = false
                     }
                 }
             }

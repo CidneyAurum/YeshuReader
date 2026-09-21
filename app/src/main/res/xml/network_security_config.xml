@@ -1,9 +1,13 @@
 <?xml version="1.0" encoding="utf-8"?>
 <network-security-config>
-    <!-- Dynamic LAN IPs cannot be enumerated in this XML. AiClient is the app's sole outbound
-         network boundary (enforced by AiClientTest), validates every effective Chat/models URL,
-         and only permits cleartext loopback/private hosts after explicit user confirmation.
-         Public HTTP and redirects are rejected before a connection is opened. -->
+    <!-- 平台层允许明文 HTTP，因为用户可能把 AI 接口指向自建的局域网服务
+         （例如 http://192.168.1.2:11434 的 Ollama）。本文件无法枚举动态的私有网段，
+         所以这里的 base-config 只能整体放开，它不构成真正的安全边界。
+
+         真正的限制在 AiClient：它校验每一个生效的 Chat/models URL，只放行回环、
+         10.x、172.16–31.x、192.168.x、链路本地与 .local，并且必须经用户显式二次确认；
+         公网 HTTP、跨源 URL 与重定向都在建立连接之前就被拒绝（见 AiClientTest）。
+         下面的 domain-config 只是把这些已知主机显式写出来，便于审阅与将来收紧。 -->
     <base-config cleartextTrafficPermitted="true" />
     <domain-config cleartextTrafficPermitted="true">
         <domain includeSubdomains="true">localhost</domain>

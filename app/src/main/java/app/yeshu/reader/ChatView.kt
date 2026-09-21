@@ -26,6 +26,8 @@ class ChatView(
 ) : FrameLayout(act) {
 
     private val db = Db(act)
+    // 跟随主题偏好，避免与 Compose 页面之间明暗跳变
+    private val pal by lazy { LegacyPalette.of(act) }
     private val history = mutableListOf<Pair<String, String>>()  // role to content
     private lateinit var listBox: LinearLayout
     private lateinit var sc: ScrollView
@@ -33,6 +35,7 @@ class ChatView(
     private lateinit var btnSend: TextView
     private lateinit var modelChip: TextView
     private var busy = false
+    private var chatToken: AiClient.CancelToken? = null
     private val scrollToBottomAction = Runnable {
         if (::sc.isInitialized) sc.fullScroll(ScrollView.FOCUS_DOWN)
     }
@@ -43,7 +46,7 @@ class ChatView(
     }
 
     init {
-        setBackgroundColor(Color.parseColor("#10141C"))
+        setBackgroundColor(pal.bg)
         val col = LinearLayout(act).apply { orientation = LinearLayout.VERTICAL }
         addView(col, LayoutParams(-1, -1))
 
@@ -53,19 +56,23 @@ class ChatView(
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER_VERTICAL
             setPadding(Glass.dp(16, d), Glass.dp(14, d), Glass.dp(16, d), Glass.dp(10, d))
-            setBackgroundColor(Color.parseColor("#161B26"))
+            setBackgroundColor(pal.bar)
         }
         top.addView(FrameLayout(act).apply {
             background = Glass.iconBg()
             foreground = Glass.pressFx()
-            layoutParams = LinearLayout.LayoutParams(Glass.dp(40, d), Glass.dp(40, d))
-            addView(IconView(act, "back", 20), LayoutParams(Glass.dp(22, d), Glass.dp(22, d), Gravity.CENTER))
+            // 触控目标 ≥48dp；自绘图标无自身语义，标签挂在容器上
+            layoutParams = LinearLayout.LayoutParams(Glass.dp(48, d), Glass.dp(48, d))
+            contentDescription = "返回阅读"
+            addView(IconView(act, "back", 22, pal.icon).apply {
+                importantForAccessibility = android.view.View.IMPORTANT_FOR_ACCESSIBILITY_NO
+            }, LayoutParams(Glass.dp(22, d), Glass.dp(22, d), Gravity.CENTER))
             setOnClickListener { (act as MainActivity).openReader(bookId) }
         })
         top.addView(TextView(act).apply {
             text = "与书聊聊"
             textSize = 17f
-            setTextColor(Color.WHITE)
+            setTextColor(pal.textP)
             setTypeface(null, Typeface.BOLD)
             val lp = LinearLayout.LayoutParams(0, -2, 1f)
             lp.marginStart = Glass.dp(12, d)
@@ -73,7 +80,7 @@ class ChatView(
         })
         modelChip = TextView(act).apply {
             textSize = 10f
-            setTextColor(Color.parseColor("#B8C6FF"))
+            setTextColor(if (pal.dark) Color.parseColor("#B8C6FF") else Color.parseColor("#3B3F9E"))
             gravity = Gravity.CENTER
             maxLines = 1
             ellipsize = TextUtils.TruncateAt.END
@@ -101,14 +108,14 @@ class ChatView(
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER_VERTICAL
             setPadding(Glass.dp(12, d), Glass.dp(8, d), Glass.dp(12, d), Glass.dp(8, d))
-            setBackgroundColor(Color.parseColor("#161B26"))
+            setBackgroundColor(pal.bar)
         }
         etInput = EditText(act).apply {
             hint = "问点什么…"
             textSize = 15f
-            setTextColor(Color.WHITE)
-            setHintTextColor(Color.argb(120, 255, 255, 255))
-            background = Glass.pillBg(Color.argb(50, 255, 255, 255))
+            setTextColor(pal.textP)
+            setHintTextColor(pal.textT)
+            background = Glass.pillBg(if (pal.dark) Color.argb(50, 255, 255, 255) else Color.argb(26, 23, 26, 43))
             setPadding(Glass.dp(16, d), Glass.dp(11, d), Glass.dp(16, d), Glass.dp(11, d))
             maxLines = 4
         }
@@ -120,8 +127,9 @@ class ChatView(
             setTextColor(Color.WHITE)
             setTypeface(null, Typeface.BOLD)
             gravity = Gravity.CENTER
+            contentDescription = "发送消息"
             background = Glass.pillBg(ACCENT)
-            val lp = LinearLayout.LayoutParams(Glass.dp(64, d), Glass.dp(42, d))
+            val lp = LinearLayout.LayoutParams(Glass.dp(64, d), Glass.dp(48, d))
             lp.marginStart = Glass.dp(8, d)
             layoutParams = lp
             setOnClickListener { send() }
@@ -171,30 +179,66 @@ class ChatView(
         val thinking = bubble("assistant", "…")
         scrollToBottom()
 
-        Thread {
+        // 可取消请求：视图分离（离开页面/销毁 Activity）时中断网络 I/O 且不落库
+        val token = AiClient.CancelToken().also { chatToken = it }
+        Thread({
             val cfg = AiClient.config(db)
-            val reply = try {
-                if (AiClient.isReady(cfg)) {
-                    AiClient.chatHistory(
-                        cfg,
-                        system = buildSystem(),
-                        history = history.takeLast(MAX_HISTORY),
-                        timeoutMs = 120_000
-                    )
-                } else "（未配置 AI 服务——去设置页填接口地址和 Key 后再来聊）"
-            } catch (e: Exception) {
-                "出错了：${AiClient.userFacingError(e)}"
+            val ready = AiClient.isReady(cfg)
+            var err: String? = null
+            var reply: String? = null
+            if (ready) {
+                try {
+                    reply = AiClient.withCancellation(token) {
+                        AiClient.chatHistory(
+                            cfg,
+                            system = buildSystem(),
+                            history = history.takeLast(MAX_HISTORY),
+                            timeoutMs = 120_000
+                        )
+                    }
+                } catch (e: Exception) {
+                    if (!token.isCancelled()) err = AiClient.userFacingError(e)
+                }
             }
+            val cancelled = token.isCancelled()
             act.runOnUiThread {
+                if (chatToken === token) chatToken = null
+                // 视图已分离时不再触碰 UI，也不写入数据库
+                if (!isAttachedToWindow) return@runOnUiThread
                 busy = false
                 btnSend.isEnabled = true
                 btnSend.alpha = 1f
-                thinking.findViewById<TextView>(R.id.bubble_text)?.text = reply.trim()
-                history.add("assistant" to reply.trim())
-                db.addNote(bookId, "chat", "A:${reply.trim()}")
+                when {
+                    cancelled -> {
+                        thinking.text = "（已取消，未保存）"
+                        thinking.alpha = 0.6f
+                    }
+                    !ready -> {
+                        // 配置提示只是临时 UI 文案，不能当作模型回复落库/回放给模型
+                        thinking.text = "（未配置 AI 服务——去设置页填接口地址和 Key 后再来聊）"
+                        thinking.alpha = 0.6f
+                    }
+                    err != null -> {
+                        thinking.text = "出错了：$err"
+                        thinking.alpha = 0.6f
+                    }
+                    else -> {
+                        val value = reply.orEmpty().trim()
+                        thinking.text = value
+                        history.add("assistant" to value)
+                        db.addNote(bookId, "chat", "A:$value")
+                    }
+                }
                 scrollToBottom()
             }
-        }.start()
+        }, "yeshu-chat").start()
+    }
+
+    override fun onDetachedFromWindow() {
+        // 离开页面即取消进行中的请求，避免写入半截回复或触碰已分离的视图
+        chatToken?.cancel()
+        chatToken = null
+        super.onDetachedFromWindow()
     }
 
     /** system：书名 + 当前章上下文 + 行为约束 */
@@ -206,16 +250,15 @@ class ChatView(
             "语气友好自然，回答简洁有信息量；用中文回复。"
     }
 
-    /** 气泡：user 右对齐蓝色，assistant 左对齐深灰卡 */
-    private fun bubble(role: String, text: String): FrameLayout {
+    /** 气泡：user 右对齐蓝色，assistant 左对齐深灰卡。返回内部 TextView 供后续更新。 */
+    private fun bubble(role: String, text: String): TextView {
         val d = density(act)
         val row = FrameLayout(act)
         val tv = TextView(act).apply {
-            id = R.id.bubble_text
             setText(text)
             textSize = 15f
             setLineSpacing(Glass.dp(3, d).toFloat(), 1f)
-            setTextColor(if (role == "user") Color.WHITE else Color.parseColor("#E8EAEE"))
+            setTextColor(if (role == "user") Color.WHITE else pal.bubbleText)
             background = if (role == "user") {
                 GradientDrawable().apply {
                     cornerRadius = Glass.dp(18, d).toFloat()
@@ -224,7 +267,7 @@ class ChatView(
             } else {
                 GradientDrawable().apply {
                     cornerRadius = Glass.dp(18, d).toFloat()
-                    setColor(Color.argb(150, 34, 38, 48))
+                    setColor(pal.bubble)
                 }
             }
             setPadding(Glass.dp(14, d), Glass.dp(10, d), Glass.dp(14, d), Glass.dp(10, d))
@@ -241,7 +284,7 @@ class ChatView(
         val lp = LinearLayout.LayoutParams(-1, -2)
         lp.topMargin = Glass.dp(8, d)
         listBox.addView(row, lp)
-        return row
+        return tv
     }
 
     private fun scrollToBottom() {
@@ -257,17 +300,36 @@ class ChatView(
             "${profile.name}  ·  ${profile.textModel.ifBlank { "未填写模型" }}"
         }.toTypedArray()
         val selected = profiles.indexOfFirst { it.id == active.id }
-        android.app.AlertDialog.Builder(act)
+        val dlg = android.app.AlertDialog.Builder(act)
             .setTitle("选择本次调用配置")
             .setSingleChoiceItems(labels, selected) { dialog, which ->
-                AiProfileStore.setActive(db, profiles[which].id)
-                refreshModelChip()
-                Toast.makeText(act, "已切换到 ${labels[which]}", Toast.LENGTH_SHORT).show()
                 dialog.dismiss()
+                val target = profiles[which]
+                if (target.id == active.id) return@setSingleChoiceItems
+                // 中途换供应商会把同一段对话历史发给另一家，先确认一次
+                confirmProfileSwitch(target.id, labels[which])
             }
             .setNeutralButton("管理模型") { _, _ -> (act as MainActivity).showSettings() }
             .setNegativeButton("取消", null)
-            .show()
+            .create()
+        dlg.show()
+        Glass.styleDialog(dlg, density(act))
+    }
+
+    /** 切换生效前的确认：说明后续对话（含历史）会发往新的服务方 */
+    private fun confirmProfileSwitch(profileId: String, label: String) {
+        val dlg = android.app.AlertDialog.Builder(act)
+            .setTitle("切换 AI 配置？")
+            .setMessage("之后的对话（包含已有历史）将发送给 $label")
+            .setPositiveButton("切换") { _, _ ->
+                AiProfileStore.setActive(db, profileId)
+                refreshModelChip()
+                Toast.makeText(act, "已切换到 $label", Toast.LENGTH_SHORT).show()
+            }
+            .setNegativeButton("取消", null)
+            .create()
+        dlg.show()
+        Glass.styleDialog(dlg, density(act))
     }
 
     private fun refreshModelChip() {

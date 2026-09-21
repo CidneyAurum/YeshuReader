@@ -1,6 +1,6 @@
 package app.yeshu.reader
 
-import android.app.Activity
+import android.content.Context
 import android.content.Intent
 import android.os.Bundle
 import android.view.KeyEvent
@@ -50,9 +50,10 @@ class MainActivity : ComponentActivity() {
         private set
 
     private var shelf: ShelfView? = null
-    private var legacySettings: SettingsView? = null
     private var currentLegacy: View? = null
     val userPreferences by lazy { UserPreferences(applicationContext) }
+    // 导入批次结果：进程可能在 WorkManager 完成前被回收，用轻量偏好持久化后下次启动补提示
+    private val importPrefs by lazy { getSharedPreferences("yeshu_import", Context.MODE_PRIVATE) }
 
     private val pickDocuments = registerForActivityResult(ActivityResultContracts.OpenMultipleDocuments()) { uris ->
         if (uris.isEmpty()) return@registerForActivityResult
@@ -68,29 +69,10 @@ class MainActivity : ComponentActivity() {
                 .build()
         }
         manager.enqueue(requests)
+        // 记住批次：进程在导入完成前被回收时，下次启动仍能补上结果提示。
+        rememberImportBatch(batchTag, requests.size)
         Toast.makeText(this, "${requests.size} 项已加入导入队列", Toast.LENGTH_SHORT).show()
-        val live = manager.getWorkInfosByTagLiveData(batchTag)
-        val observer = object : Observer<List<WorkInfo>> {
-            override fun onChanged(infos: List<WorkInfo>) {
-                if (infos.size != requests.size || infos.any { !it.state.isFinished }) return
-                live.removeObserver(this)
-                libraryRevision++
-                destination = Destination.Shelf
-                val success = infos.count { it.state == WorkInfo.State.SUCCEEDED && it.outputData.getString(LibraryImportWorker.KEY_ERROR).isNullOrBlank() }
-                val duplicate = infos.count { it.state == WorkInfo.State.SUCCEEDED && !it.outputData.getString(LibraryImportWorker.KEY_ERROR).isNullOrBlank() }
-                val failed = infos.size - success - duplicate
-                Toast.makeText(
-                    this@MainActivity,
-                    buildString {
-                        append("已导入 $success 项")
-                        if (duplicate > 0) append("，已有 $duplicate 项")
-                        if (failed > 0) append("，失败 $failed 项")
-                    },
-                    Toast.LENGTH_LONG
-                ).show()
-            }
-        }
-        live.observe(this, observer)
+        observeImportBatch(batchTag, requests.size, navigateOnFinish = true)
     }
 
     private val createBackup = registerForActivityResult(ActivityResultContracts.CreateDocument("application/zip")) { uri ->
@@ -118,8 +100,20 @@ class MainActivity : ComponentActivity() {
             runCatching { Db(applicationContext).getAiKey() }
         }
         WindowCompat.setDecorFitsSystemWindows(window, false)
-        val requestedBook = intent.getStringExtra("bookId")?.toLongOrNull() ?: -1L
-        destination = if (requestedBook > 0) Destination.Reader(requestedBook) else Destination.Workbench
+        // 旋转/深色切换等配置变更后恢复导航状态；仅全新启动时回到工作台
+        destination = savedInstanceState?.let(::restoreDestination) ?: Destination.Workbench
+        libraryRevision = savedInstanceState?.getInt(KEY_REVISION) ?: 0
+
+        // 导入批次可能在进程被回收后才完成（WorkManager 没有前台通知），
+        // 启动时补挂一次观察，把结果提示交给用户，避免导入静默结束。
+        val pendingBatchTag = importPrefs.getString(KEY_IMPORT_BATCH_TAG, null)
+        val pendingBatchSize = importPrefs.getInt(KEY_IMPORT_BATCH_SIZE, 0)
+        if (pendingBatchTag != null && pendingBatchSize > 0) {
+            observeImportBatch(pendingBatchTag, pendingBatchSize, navigateOnFinish = false)
+        }
+
+        // 导入中途进程被杀会留下 .import_*.tmp 全尺寸副本，启动时清掉（带时限，不影响正在进行的导入）。
+        lifecycleScope.launch(Dispatchers.IO) { runCatching { LibraryImporter.sweepStaleTemporaryFiles(applicationContext) } }
 
         onBackPressedDispatcher.addCallback(this) {
             destination = when (val current = destination) {
@@ -169,10 +163,59 @@ class MainActivity : ComponentActivity() {
     fun registerLegacy(view: View?) {
         currentLegacy = view
         shelf = view as? ShelfView
-        legacySettings = view as? SettingsView
     }
 
     fun importDocuments() = pickDocuments.launch(LibraryImporter.mimeTypes)
+
+    /** 记录当前导入批次，供进程被杀后的下一次启动补齐结果提示。 */
+    private fun rememberImportBatch(tag: String, size: Int) {
+        importPrefs.edit()
+            .putString(KEY_IMPORT_BATCH_TAG, tag)
+            .putInt(KEY_IMPORT_BATCH_SIZE, size)
+            .apply()
+    }
+
+    private fun forgetImportBatch() {
+        importPrefs.edit()
+            .remove(KEY_IMPORT_BATCH_TAG)
+            .remove(KEY_IMPORT_BATCH_SIZE)
+            .apply()
+    }
+
+    /**
+     * 观察一个导入批次直到全部结束，然后汇总并提示结果。
+     * navigateOnFinish 仅用于应用内发起的导入（完成后跳到书架）；
+     * 启动时补挂的观察不改变当前页面。
+     */
+    private fun observeImportBatch(tag: String, expected: Int, navigateOnFinish: Boolean) {
+        val live = WorkManager.getInstance(this).getWorkInfosByTagLiveData(tag)
+        val observer = object : Observer<List<WorkInfo>> {
+            override fun onChanged(infos: List<WorkInfo>) {
+                if (infos.size < expected || infos.any { !it.state.isFinished }) return
+                live.removeObserver(this)
+                forgetImportBatch()
+                libraryRevision++
+                if (navigateOnFinish) destination = Destination.Shelf
+                Toast.makeText(this@MainActivity, summarizeImportBatch(infos, expected), Toast.LENGTH_LONG).show()
+            }
+        }
+        live.observe(this, observer)
+    }
+
+    private fun summarizeImportBatch(infos: List<WorkInfo>, expected: Int): String {
+        val success = infos.count {
+            it.state == WorkInfo.State.SUCCEEDED && it.outputData.getString(LibraryImportWorker.KEY_ERROR).isNullOrBlank()
+        }
+        val duplicate = infos.count {
+            it.state == WorkInfo.State.SUCCEEDED && !it.outputData.getString(LibraryImportWorker.KEY_ERROR).isNullOrBlank()
+        }
+        val failed = (expected - success - duplicate).coerceAtLeast(0)
+        return buildString {
+            append("已导入 $success 项")
+            if (duplicate > 0) append("，已有 $duplicate 项")
+            if (failed > 0) append("，失败 $failed 项")
+        }
+    }
 
     fun exportBackup() = createBackup.launch("yeshu_backup_${System.currentTimeMillis()}.yeshu.zip")
     fun importBackup() = openBackup.launch(arrayOf("application/zip", "application/json", "*/*"))
@@ -183,25 +226,79 @@ class MainActivity : ComponentActivity() {
     }
 
     override fun onKeyUp(keyCode: Int, event: KeyEvent): Boolean {
+        // ReaderView 会同时消费 DOWN 与配对的 UP，这里只需转发，不必自己记按键。
         (currentLegacy as? ReaderView)?.let { if (it.handleVolumeKey(event)) return true }
         return super.onKeyUp(keyCode, event)
+    }
+
+    override fun onStart() {
+        super.onStart()
+        // 阅读时长只在视图 attached 期间累计，回到前台要显式恢复，
+        // 否则按 Home 后时间会一直往 read_log 里涨。
+        (currentLegacy as? ReaderView)?.resumeReadSession()
+    }
+
+    override fun onStop() {
+        (currentLegacy as? ReaderView)?.pauseReadSession()
+        super.onStop()
+    }
+
+    override fun onSaveInstanceState(outState: Bundle) {
+        super.onSaveInstanceState(outState)
+        outState.putInt(KEY_REVISION, libraryRevision)
+        outState.putString(KEY_DESTINATION, destinationKey(destination))
+        when (val current = destination) {
+            is Destination.Reader -> outState.putLong(KEY_DESTINATION_BOOK, current.bookId)
+            is Destination.BookNotes -> outState.putLong(KEY_DESTINATION_BOOK, current.bookId)
+            is Destination.Chat -> {
+                outState.putLong(KEY_DESTINATION_BOOK, current.bookId)
+                outState.putString(KEY_DESTINATION_CONTEXT, current.chapterContext)
+            }
+            else -> Unit
+        }
+    }
+
+    private fun destinationKey(destination: Destination): String = when (destination) {
+        Destination.Workbench -> "workbench"
+        Destination.Shelf -> "shelf"
+        Destination.Notes -> "notes"
+        Destination.Settings -> "settings"
+        Destination.Stats -> "stats"
+        is Destination.Reader -> "reader"
+        is Destination.BookNotes -> "booknotes"
+        is Destination.Chat -> "chat"
+    }
+
+    private fun restoreDestination(state: Bundle): Destination {
+        val bookId = state.getLong(KEY_DESTINATION_BOOK, -1L)
+        return when (state.getString(KEY_DESTINATION)) {
+            "shelf" -> Destination.Shelf
+            "notes" -> Destination.Notes
+            "settings" -> Destination.Settings
+            "stats" -> Destination.Stats
+            "reader" -> if (bookId > 0) Destination.Reader(bookId) else Destination.Shelf
+            "booknotes" -> if (bookId > 0) Destination.BookNotes(bookId) else Destination.Shelf
+            "chat" -> if (bookId > 0) {
+                Destination.Chat(bookId, state.getString(KEY_DESTINATION_CONTEXT).orEmpty())
+            } else {
+                Destination.Shelf
+            }
+            else -> Destination.Workbench
+        }
     }
 
     @Deprecated("Legacy Views still use startActivityForResult during the migration window")
     override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
         super.onActivityResult(requestCode, resultCode, data)
-        if (requestCode == Glass.REQ_SETTINGS) {
-            shelf?.refresh()
-            return
-        }
-        if (requestCode == SettingsView.REQ_RESTORE) {
-            if (resultCode == Activity.RESULT_OK) legacySettings?.handleRestoreResult(data?.data ?: return)
-            return
-        }
-        if (requestCode == SettingsView.REQ_EXPORT) {
-            if (resultCode == Activity.RESULT_OK) legacySettings?.handleExportResult(data?.data ?: return)
-            return
-        }
         shelf?.handleResult(requestCode, data)
+    }
+
+    private companion object {
+        const val KEY_REVISION = "yeshu_library_revision"
+        const val KEY_DESTINATION = "yeshu_destination"
+        const val KEY_DESTINATION_BOOK = "yeshu_destination_book"
+        const val KEY_DESTINATION_CONTEXT = "yeshu_destination_context"
+        const val KEY_IMPORT_BATCH_TAG = "yeshu_import_batch_tag"
+        const val KEY_IMPORT_BATCH_SIZE = "yeshu_import_batch_size"
     }
 }

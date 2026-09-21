@@ -13,6 +13,7 @@ import android.view.HapticFeedbackConstants
 import android.view.MotionEvent
 import android.view.View
 import android.widget.FrameLayout
+import android.widget.HorizontalScrollView
 import android.widget.LinearLayout
 import android.widget.ScrollView
 import android.widget.TextView
@@ -22,23 +23,21 @@ import androidx.core.view.WindowInsetsCompat
 /** 笔记页：某本书的全部 AI 产物（摘要/问答/自测题），点击查看、长按删除 */
 class NotesView(private val act: Activity, private val bookId: Long) : FrameLayout(act) {
 
+    private var aiProgress: TextView? = null
+    private var digestToken: AiClient.CancelToken? = null
+
     private val db = Db(act)
     private lateinit var listBox: LinearLayout
+    // 跟随主题偏好，避免与 Compose 页面之间明暗跳变
+    private val pal by lazy { LegacyPalette.of(act) }
     private var filterKind: String? = null   // null=全部
     private var chipRow: LinearLayout? = null
     private val mainHandler = Handler(Looper.getMainLooper())
     private var undoBar: View? = null
     private var pendingDismiss: Runnable? = null
 
-    companion object {
-        private val KIND_LABEL = mapOf(
-            "summary" to "摘要", "ask" to "问答", "quiz" to "自测",
-            "chat" to "聊天", "quote" to "金句", "digest" to "精读", "report" to "报告"
-        )
-    }
-
     init {
-        setBackgroundColor(Color.parseColor("#22334A"))
+        setBackgroundColor(pal.bg)
         val col = LinearLayout(act).apply { orientation = LinearLayout.VERTICAL }
         addView(col, LayoutParams(-1, -1))
         applySystemBarInsets(col)
@@ -52,15 +51,19 @@ class NotesView(private val act: Activity, private val bookId: Long) : FrameLayo
         top.addView(FrameLayout(act).apply {
             background = Glass.iconBg()
             foreground = Glass.pressFx()
-            layoutParams = LinearLayout.LayoutParams(Glass.dp(42, d), Glass.dp(42, d))
-            addView(IconView(act, "back", 22), LayoutParams(Glass.dp(24, d), Glass.dp(24, d), Gravity.CENTER))
+            // 触控目标 ≥48dp；自绘图标无自身语义，标签挂在容器上
+            layoutParams = LinearLayout.LayoutParams(Glass.dp(48, d), Glass.dp(48, d))
+            contentDescription = "返回阅读"
+            addView(IconView(act, "back", 22, pal.icon).apply {
+                importantForAccessibility = View.IMPORTANT_FOR_ACCESSIBILITY_NO
+            }, LayoutParams(Glass.dp(24, d), Glass.dp(24, d), Gravity.CENTER))
             setOnClickListener { (act as MainActivity).openReader(bookId) }
         })
         val book = db.getBook(bookId)
         top.addView(TextView(act).apply {
             text = "笔记 · ${book?.title ?: ""}"
             textSize = 18f
-            setTextColor(Color.WHITE)
+            setTextColor(pal.textP)
             setTypeface(null, Typeface.BOLD)
             maxLines = 1
         }, LinearLayout.LayoutParams(0, -2, 1f))
@@ -68,11 +71,12 @@ class NotesView(private val act: Activity, private val bookId: Long) : FrameLayo
         top.addView(TextView(act).apply {
             text = "✨"
             textSize = 15f
-            setTextColor(Color.WHITE)
-            background = Glass.pillBg(Color.argb(60, 255, 255, 255))
+            setTextColor(pal.textP)
+            background = Glass.pillBg(if (pal.dark) Color.argb(60, 255, 255, 255) else Color.argb(26, 23, 26, 43))
             setPadding(Glass.dp(13, d), Glass.dp(7, d), Glass.dp(13, d), Glass.dp(7, d))
             foreground = Glass.pressFx()
             isClickable = true
+            contentDescription = "AI 整理笔记"
             val lp = LinearLayout.LayoutParams(-2, -2)
             lp.marginEnd = Glass.dp(8, d)
             layoutParams = lp
@@ -82,8 +86,8 @@ class NotesView(private val act: Activity, private val bookId: Long) : FrameLayo
         top.addView(TextView(act).apply {
             text = "导出"
             textSize = 14f
-            setTextColor(Color.WHITE)
-            background = Glass.pillBg(Color.argb(60, 255, 255, 255))
+            setTextColor(pal.textP)
+            background = Glass.pillBg(if (pal.dark) Color.argb(60, 255, 255, 255) else Color.argb(26, 23, 26, 43))
             setPadding(Glass.dp(14, d), Glass.dp(7, d), Glass.dp(14, d), Glass.dp(7, d))
             foreground = Glass.pressFx()
             isClickable = true
@@ -91,28 +95,34 @@ class NotesView(private val act: Activity, private val bookId: Long) : FrameLayo
         })
         col.addView(top, LayoutParams(-1, -2))
 
-        // 分类过滤 chips：全部 / 摘要 / 问答 / 自测（d 已在外层 init 定义）
+        // 分类过滤 chips：全部 + NoteKindLabels 的全部 kind（含 AI 书籍简介 intro）。
+        // 条目变多后一行放不下，放进横向滚动容器，保证末尾的 chip 在小屏上也能点到。
         val chips = LinearLayout(act).apply {
             orientation = LinearLayout.HORIZONTAL
             setPadding(Glass.dp(16, d), Glass.dp(6, d), Glass.dp(16, d), Glass.dp(2, d))
         }
         fun buildChips() {
             chips.removeAllViews()
-            val kinds: List<Pair<String, String?>> = listOf(
-                "全部" to null, "摘要" to "summary", "问答" to "ask", "自测" to "quiz",
-                "聊天" to "chat", "金句" to "quote", "精读" to "digest", "报告" to "report"
-            )
+            val kinds: List<Pair<String, String?>> =
+                listOf("全部" to null) + NoteKindLabels.order.map { NoteKindLabels.label(it) to it }
             kinds.forEach { (label, kind) ->
                 val active = filterKind == kind
                 val c = TextView(act).apply {
                     text = label
                     textSize = 12f
-                    setTextColor(if (active) Color.WHITE else Color.argb(200, 255, 255, 255))
+                    setTextColor(if (active) Color.WHITE else pal.textS)
                     setTypeface(null, if (active) Typeface.BOLD else Typeface.NORMAL)
-                    background = Glass.pillBg(if (active) Color.argb(140, 90, 130, 220) else Color.argb(45, 255, 255, 255))
+                    background = Glass.pillBg(
+                        if (active) Color.argb(140, 90, 130, 220)
+                        else if (pal.dark) Color.argb(45, 255, 255, 255) else Color.argb(24, 23, 26, 43)
+                    )
                     setPadding(Glass.dp(14, d), Glass.dp(6, d), Glass.dp(14, d), Glass.dp(6, d))
                     foreground = Glass.pressFx()
                     isClickable = true
+                    // 触控目标补足到 48dp，并给无障碍提供明确语义
+                    minHeight = Glass.dp(48, d)
+                    gravity = Gravity.CENTER
+                    contentDescription = if (active) "筛选：$label（已选中）" else "筛选：$label"
                     val lp = LinearLayout.LayoutParams(-2, -2)
                     lp.marginEnd = Glass.dp(8, d)
                     layoutParams = lp
@@ -123,7 +133,10 @@ class NotesView(private val act: Activity, private val bookId: Long) : FrameLayo
         }
         buildChips()
         chipRow = chips
-        col.addView(chips, LayoutParams(-1, -2))
+        col.addView(HorizontalScrollView(act).apply {
+            isHorizontalScrollBarEnabled = false
+            addView(chips, FrameLayout.LayoutParams(-2, -2))
+        }, LayoutParams(-1, -2))
 
         val sc = ScrollView(act)
         col.addView(sc, LinearLayout.LayoutParams(-1, 0, 1f))
@@ -153,7 +166,7 @@ class NotesView(private val act: Activity, private val bookId: Long) : FrameLayo
             return
         }
         for (row in notes) {
-            val label = KIND_LABEL[row.kind] ?: row.kind
+            val label = NoteKindLabels.label(row.kind)
             val body = when {
                 row.kind == "chat" && row.content.startsWith("U:") -> "🙋 " + row.content.removePrefix("U:")
                 row.kind == "chat" && row.content.startsWith("A:") -> "🤖 " + row.content.removePrefix("A:")
@@ -267,7 +280,9 @@ class NotesView(private val act: Activity, private val bookId: Long) : FrameLayo
             setPadding(Glass.dp(14, d), Glass.dp(7, d), Glass.dp(14, d), Glass.dp(7, d))
             setOnClickListener {
                 pendingDismiss?.let(mainHandler::removeCallbacks)
-                db.addNote(row.bookId, row.kind, row.content)
+                // 带上原 id 与 createdAt，否则撤销后的笔记会拿到新 id 与时间戳，
+                // 在按 id DESC 排序的列表里跳到最前面。
+                db.addNote(row.bookId, row.kind, row.content, row.id, row.createdAt)
                 refresh()
                 dismissUndoBar(bar)
             }
@@ -313,6 +328,10 @@ class NotesView(private val act: Activity, private val bookId: Long) : FrameLayo
     override fun onDetachedFromWindow() {
         pendingDismiss?.let(mainHandler::removeCallbacks)
         pendingDismiss = null
+        // 离开页面即取消进行中的 AI 整理，避免继续占用连接、也不写半截结果
+        digestToken?.cancel()
+        digestToken = null
+        dismissAiProgress()
         super.onDetachedFromWindow()
     }
 
@@ -322,7 +341,8 @@ class NotesView(private val act: Activity, private val bookId: Long) : FrameLayo
         sc.addView(TextView(act).apply {
             text = content
             textSize = 14f
-            setTextColor(Color.parseColor("#222222"))
+            // 对话框底色跟随主题，正文颜色也必须跟着走
+            setTextColor(if (pal.dark) pal.textP else Color.parseColor("#222222"))
             setTextIsSelectable(true)
             setPadding(Glass.dp(20, d), Glass.dp(14, d), Glass.dp(20, d), Glass.dp(20, d))
         })
@@ -345,34 +365,75 @@ class NotesView(private val act: Activity, private val bookId: Long) : FrameLayo
             return
         }
         val book = db.getBook(bookId)
-        val pd = android.app.ProgressDialog.show(act, "AI 整理", "正在归纳 ${notes.size} 条笔记…", true, false)
-        Thread {
+        showAiProgress("正在归纳 ${notes.size} 条笔记…")
+        // 可取消请求：视图分离时中断网络 I/O；已生成好的结果仍会落库，不静默丢弃
+        val token = AiClient.CancelToken().also { digestToken = it }
+        Thread({
             var err: String? = null
             var reply = ""
             try {
                 val body = notes.joinToString("\n\n") { row ->
-                    "【${KIND_LABEL[row.kind] ?: "笔记"}】\n${row.content.take(1500)}"
+                    "【${NoteKindLabels.label(row.kind)}】\n${row.content.take(1500)}"
                 }
-                reply = AiClient.chat(cfg,
-                    "你是专业的读书教练。用简体中文，输出结构化 Markdown 风格的纯文本。",
-                    "以下是读者读《${book?.title ?: "一本书"}》期间积累的全部 AI 笔记。请归纳整理成一页「精读笔记」：" +
-                        "① 核心主题一句话；② 3-5 个关键要点（合并重复内容）；③ 值得记住的金句摘录（如有）；④ 一条行动建议。" +
-                        "只输出整理结果。\n\n【笔记开始】\n${body.take(22000)}\n【笔记结束】")
-                db.addNote(bookId, "digest", reply)
-            } catch (t: Throwable) { err = AiClient.userFacingError(t) }
+                reply = AiClient.withCancellation(token) {
+                    AiClient.chat(cfg,
+                        "你是专业的读书教练。用简体中文，输出结构化 Markdown 风格的纯文本。",
+                        "以下是读者读《${book?.title ?: "一本书"}》期间积累的全部 AI 笔记。请归纳整理成一页「精读笔记」：" +
+                            "① 核心主题一句话；② 3-5 个关键要点（合并重复内容）；③ 值得记住的金句摘录（如有）；④ 一条行动建议。" +
+                            "只输出整理结果。\n\n【笔记开始】\n${body.take(22000)}\n【笔记结束】")
+                }
+                // 先落库再回主线程：视图若已分离，结果也不该丢
+                if (!token.isCancelled()) db.addNote(bookId, "digest", reply)
+            } catch (t: Throwable) {
+                if (!token.isCancelled()) err = AiClient.userFacingError(t)
+            }
             val e = err
+            val cancelled = token.isCancelled()
             act.runOnUiThread {
-                try { pd.dismiss() } catch (ex: Exception) {}
-                if (e != null) {
-                    AlertDialog.Builder(act).setTitle("AI 调用失败").setMessage(e)
+                if (digestToken === token) digestToken = null
+                // 视图已分离：结果已落库，不再触碰 UI
+                if (!isAttachedToWindow) return@runOnUiThread
+                dismissAiProgress()
+                when {
+                    cancelled -> Unit
+                    e != null -> AlertDialog.Builder(act).setTitle("AI 调用失败").setMessage(e)
                         .setPositiveButton("关闭", null).show().also { Glass.styleDialog(it, density(act)) }
-                } else {
-                    filterKind = "digest"
-                    refresh()
-                    showFull(reply)
+                    else -> {
+                        filterKind = "digest"
+                        refresh()
+                        showFull(reply)
+                    }
                 }
             }
-        }.start()
+        }, "yeshu-digest").apply { isDaemon = true }.start()
+    }
+
+    /** 不使用 ProgressDialog：它持有 Activity 窗口且无法取消；浮层随视图分离自动消失。 */
+    private fun showAiProgress(message: String) {
+        dismissAiProgress()
+        val d = density(act)
+        val tv = TextView(act).apply {
+            text = "✨ $message"
+            textSize = 14f
+            setTextColor(Color.WHITE)
+            gravity = Gravity.CENTER
+            background = GradientDrawable().apply {
+                cornerRadius = Glass.dp(14, d).toFloat()
+                setColor(Color.argb(232, 26, 32, 52))
+            }
+            setPadding(Glass.dp(20, d), Glass.dp(14, d), Glass.dp(20, d), Glass.dp(14, d))
+            elevation = Glass.dp(12, d).toFloat()
+            contentDescription = message
+        }
+        addView(tv, LayoutParams(-2, -2, Gravity.BOTTOM or Gravity.CENTER_HORIZONTAL).apply {
+            bottomMargin = Glass.dp(112, d)
+        })
+        aiProgress = tv
+    }
+
+    private fun dismissAiProgress() {
+        aiProgress?.let { if (it.parent === this) removeView(it) }
+        aiProgress = null
     }
 
     /** 全部笔记导出为 Markdown，走系统分享面板 */
@@ -384,14 +445,28 @@ class NotesView(private val act: Activity, private val bookId: Long) : FrameLayo
         }
         val md = StringBuilder("# 《$bookTitle》AI 笔记\n\n")
         notes.forEach { row ->
-            md.append("## ").append(KIND_LABEL[row.kind] ?: "笔记").append("\n\n")
+            md.append("## ").append(NoteKindLabels.label(row.kind)).append("\n\n")
                 .append(row.content.trim()).append("\n\n---\n\n")
         }
         val intent = android.content.Intent(android.content.Intent.ACTION_SEND).apply {
             type = "text/plain"
             putExtra(android.content.Intent.EXTRA_SUBJECT, "《$bookTitle》AI 笔记")
-            putExtra(android.content.Intent.EXTRA_TEXT, md.toString())
+            // 分享走 Binder extra，超限会抛 TransactionTooLargeException 直接崩掉；
+            // 这里截断并明确告知，而不是让用户看到一次崩溃。
+            val full = md.toString()
+            val text = if (full.length <= SHARE_TEXT_LIMIT) {
+                full
+            } else {
+                android.widget.Toast.makeText(act, "笔记内容较多，分享文本已截断", android.widget.Toast.LENGTH_LONG).show()
+                full.take(SHARE_TEXT_LIMIT) + "\n\n…（内容过长，已截断）"
+            }
+            putExtra(android.content.Intent.EXTRA_TEXT, text)
         }
         act.startActivity(android.content.Intent.createChooser(intent, "分享 AI 笔记"))
+    }
+
+    private companion object {
+        /** Binder 事务上限约 1MB，留足余量。 */
+        const val SHARE_TEXT_LIMIT = 200_000
     }
 }

@@ -17,16 +17,13 @@ class StatsView(private val act: Activity) : FrameLayout(act) {
 
     private val db = Db(act)
     private lateinit var listBox: LinearLayout
-
-    companion object {
-        private val KIND_LABEL = mapOf(
-            "summary" to "摘要", "ask" to "问答", "quiz" to "自测",
-            "chat" to "聊天", "quote" to "金句", "digest" to "精读", "report" to "报告"
-        )
-    }
+    private var aiProgress: TextView? = null
+    private var reportToken: AiClient.CancelToken? = null
+    // 旧版 View 页面也需要跟随主题偏好，避免与 Compose 页面明暗跳变
+    private val pal by lazy { LegacyPalette.of(act) }
 
     init {
-        setBackgroundColor(T.bg)
+        setBackgroundColor(pal.bg)
         val col = LinearLayout(act).apply { orientation = LinearLayout.VERTICAL }
         addView(col, LayoutParams(-1, -1))
         applySystemBarInsets(col)
@@ -41,14 +38,18 @@ class StatsView(private val act: Activity) : FrameLayout(act) {
         top.addView(FrameLayout(act).apply {
             background = Glass.iconBg()
             foreground = Glass.pressFx()
-            layoutParams = LinearLayout.LayoutParams(Glass.dp(42, d), Glass.dp(42, d))
-            addView(IconView(act, "back", 22), FrameLayout.LayoutParams(Glass.dp(24, d), Glass.dp(24, d), Gravity.CENTER))
+            layoutParams = LinearLayout.LayoutParams(Glass.dp(48, d), Glass.dp(48, d))
+            contentDescription = "返回书架"
+            addView(IconView(act, "back", 22, pal.icon).apply {
+                // 自绘图标无自身语义，标签已在容器上，避免 TalkBack 重复/空播报
+                importantForAccessibility = View.IMPORTANT_FOR_ACCESSIBILITY_NO
+            }, FrameLayout.LayoutParams(Glass.dp(24, d), Glass.dp(24, d), Gravity.CENTER))
             setOnClickListener { (act as MainActivity).backToShelf() }
         })
         top.addView(TextView(act).apply {
             text = "阅读统计"
             textSize = 20f
-            setTextColor(T.textP)
+            setTextColor(pal.textP)
             setTypeface(null, Typeface.BOLD)
             val lp = LinearLayout.LayoutParams(0, -2, 1f)
             lp.marginStart = Glass.dp(14, d)
@@ -83,7 +84,7 @@ class StatsView(private val act: Activity) : FrameLayout(act) {
             val row = LinearLayout(act).apply {
                 orientation = LinearLayout.HORIZONTAL
                 background = GradientDrawable().apply {
-                    cornerRadius = Glass.dp(T.rCard, d).toFloat(); setColor(T.surface)
+                    cornerRadius = Glass.dp(T.rCard, d).toFloat(); setColor(pal.surface)
                 }
                 setPadding(Glass.dp(8, d), Glass.dp(16, d), Glass.dp(8, d), Glass.dp(16, d))
             }
@@ -100,11 +101,11 @@ class StatsView(private val act: Activity) : FrameLayout(act) {
                     layoutParams = LinearLayout.LayoutParams(0, -2, 1f)
                     addView(TextView(act).apply {
                         text = v; textSize = if (i == 0) 15f else 19f
-                        setTextColor(if (i == 0) T.textP else T.accent)
+                        setTextColor(if (i == 0) pal.textP else T.accent)
                         setTypeface(null, Typeface.BOLD); gravity = Gravity.CENTER
                     })
                     addView(TextView(act).apply {
-                        text = label; textSize = 11f; setTextColor(T.textT)
+                        text = label; textSize = 11f; setTextColor(pal.textT)
                         setPadding(0, Glass.dp(4, d), 0, 0); gravity = Gravity.CENTER
                     })
                 })
@@ -122,7 +123,7 @@ class StatsView(private val act: Activity) : FrameLayout(act) {
         val chart = LinearLayout(act).apply {
             orientation = LinearLayout.VERTICAL
             background = GradientDrawable().apply {
-                cornerRadius = Glass.dp(T.rCard, d).toFloat(); setColor(T.surface)
+                cornerRadius = Glass.dp(T.rCard, d).toFloat(); setColor(pal.surface)
             }
             setPadding(Glass.dp(16, d), Glass.dp(16, d), Glass.dp(16, d), Glass.dp(12, d))
         }
@@ -135,12 +136,12 @@ class StatsView(private val act: Activity) : FrameLayout(act) {
                 layoutParams = LinearLayout.LayoutParams(0, Glass.dp(110, d), 1f)
                 addView(TextView(act).apply {
                     text = if (ms > 0) "${ms / 60000}′" else ""
-                    textSize = 9f; setTextColor(T.textS); gravity = Gravity.CENTER
+                    textSize = 9f; setTextColor(pal.textS); gravity = Gravity.CENTER
                 })
                 addView(View(act).apply {
                     background = GradientDrawable().apply {
                         cornerRadius = Glass.dp(3, d).toFloat()
-                        setColor(if (ms > 0) T.accent else T.surface3)
+                        setColor(if (ms > 0) T.accent else pal.surface3)
                     }
                     layoutParams = LinearLayout.LayoutParams(Glass.dp(14, d),
                         ((Glass.dp(84, d)) * frac).toInt().coerceAtLeast(Glass.dp(3, d))).also {
@@ -148,7 +149,7 @@ class StatsView(private val act: Activity) : FrameLayout(act) {
                     }
                 })
                 addView(TextView(act).apply {
-                    text = day.substring(5); textSize = 9f; setTextColor(T.textT)
+                    text = day.substring(5); textSize = 9f; setTextColor(pal.textT)
                     setPadding(0, Glass.dp(6, d), 0, 0); gravity = Gravity.CENTER
                     layoutParams = LinearLayout.LayoutParams(-1, -2)
                 })
@@ -164,7 +165,7 @@ class StatsView(private val act: Activity) : FrameLayout(act) {
             val card = LinearLayout(act).apply {
                 orientation = LinearLayout.VERTICAL
                 background = GradientDrawable().apply {
-                    cornerRadius = Glass.dp(T.rCard, d).toFloat(); setColor(T.surface)
+                    cornerRadius = Glass.dp(T.rCard, d).toFloat(); setColor(pal.surface)
                 }
                 setPadding(Glass.dp(16, d), Glass.dp(6, d), Glass.dp(16, d), Glass.dp(10, d))
             }
@@ -173,17 +174,17 @@ class StatsView(private val act: Activity) : FrameLayout(act) {
                     orientation = LinearLayout.HORIZONTAL; gravity = Gravity.CENTER_VERTICAL
                     setPadding(0, Glass.dp(10, d), 0, Glass.dp(10, d))
                     addView(TextView(act).apply {
-                        text = "${i + 1}"; textSize = 13f; setTextColor(T.textT)
+                        text = "${i + 1}"; textSize = 13f; setTextColor(pal.textT)
                         setTypeface(null, Typeface.BOLD)
                         layoutParams = LinearLayout.LayoutParams(Glass.dp(22, d), -2)
                     })
                     addView(TextView(act).apply {
-                        text = tb.title; textSize = 14f; setTextColor(T.textP)
+                        text = tb.title; textSize = 14f; setTextColor(pal.textP)
                         maxLines = 1; ellipsize = android.text.TextUtils.TruncateAt.END
                         layoutParams = LinearLayout.LayoutParams(0, -2, 1f)
                     })
                     addView(TextView(act).apply {
-                        text = formatMs(tb.ms); textSize = 12f; setTextColor(T.textS)
+                        text = formatMs(tb.ms); textSize = 12f; setTextColor(pal.textS)
                         val lp = LinearLayout.LayoutParams(-2, -2); lp.marginStart = Glass.dp(10, d)
                         layoutParams = lp
                     })
@@ -201,12 +202,12 @@ class StatsView(private val act: Activity) : FrameLayout(act) {
             }
             setPadding(Glass.dp(18, d), Glass.dp(18, d), Glass.dp(18, d), Glass.dp(18, d))
             addView(TextView(act).apply {
-                text = "✨ AI 阅读报告"; textSize = 16f; setTextColor(T.textP)
+                text = "✨ AI 阅读报告"; textSize = 16f; setTextColor(Color.WHITE)
                 setTypeface(null, Typeface.BOLD)
             })
             addView(TextView(act).apply {
                 text = "让 AI 根据你的阅读数据生成个性化报告，存进笔记可随时回看"
-                textSize = 12f; setTextColor(T.textS)
+                textSize = 12f; setTextColor(Color.argb(190, 255, 255, 255))
                 setPadding(0, Glass.dp(6, d), 0, 0)
             })
             addView(TextView(act).apply {
@@ -223,18 +224,18 @@ class StatsView(private val act: Activity) : FrameLayout(act) {
         }
         listBox.addView(aiCard, LinearLayout.LayoutParams(-1, -2).also { it.topMargin = Glass.dp(16, d) })
 
-        // ---- 历史报告列表 ----
+        // ---- 历史报告列表（listNotes 已是 id DESC，最新的排最前，与全站一致）----
         val reports = db.listNotes(0, "report")
-        reports.reversed().forEach { r ->
+        reports.forEach { r ->
             val card = LinearLayout(act).apply {
                 orientation = LinearLayout.VERTICAL
                 background = GradientDrawable().apply {
-                    cornerRadius = Glass.dp(12, d).toFloat(); setColor(T.surface)
+                    cornerRadius = Glass.dp(12, d).toFloat(); setColor(pal.surface)
                 }
                 setPadding(Glass.dp(14, d), Glass.dp(12, d), Glass.dp(14, d), Glass.dp(12, d))
                 addView(TextView(act).apply {
                     text = r.content.replace("\n", " ").take(64) + "…"
-                    textSize = 12f; setTextColor(T.textS); maxLines = 2
+                    textSize = 12f; setTextColor(pal.textS); maxLines = 2
                 })
                 setOnClickListener { showReport(r.content) }
                 setOnLongClickListener {
@@ -251,7 +252,7 @@ class StatsView(private val act: Activity) : FrameLayout(act) {
     private fun sectionTitle(t: String): TextView {
         val d = density(act)
         return TextView(act).apply {
-            text = t; textSize = 13f; setTextColor(T.textT)
+            text = t; textSize = 13f; setTextColor(pal.textT)
             setTypeface(null, Typeface.BOLD); letterSpacing = 0.05f
             val lp = LinearLayout.LayoutParams(-2, -2)
             lp.topMargin = Glass.dp(18, d)
@@ -268,7 +269,11 @@ class StatsView(private val act: Activity) : FrameLayout(act) {
         }
     }
 
-    /** AI 阅读报告：统计数据 → 个性化周报文案，存 notes(bookId=0, kind=report) */
+    /**
+     * AI 阅读报告：统计数据 → 个性化周报文案，存 notes(bookId=0, kind=report)。
+     * bookId=0 是「全局笔记」哨兵值；笔记中枢 NotesHubScreen 目前按 books[note.bookId] 过滤，
+     * 会把这些报告丢弃（详见交付说明中需要的 YeshuApp 改动）。
+     */
     private fun aiReport() {
         val cfg = AiClient.config(db)
         if (!AiClient.isReady(cfg)) {
@@ -289,30 +294,80 @@ class StatsView(private val act: Activity) : FrameLayout(act) {
             append("投入最多：" + tops.joinToString { "${it.title}(${formatMs(it.ms)})" } + "\n")
             append("近7天每日：$recent7")
         }
-        val pd = android.app.ProgressDialog.show(act, "AI 阅读报告", "正在分析你的阅读数据…", true, false)
-        Thread {
+        showAiProgress("正在分析你的阅读数据…")
+        // 可取消请求：视图分离时中断网络 I/O；已生成好的报告仍会落库，不静默丢弃
+        val token = AiClient.CancelToken().also { reportToken = it }
+        Thread({
             var err: String? = null
             var reply = ""
             try {
-                reply = AiClient.chat(cfg,
-                    "你是一位温暖幽默的私人阅读顾问。用简体中文写一份简短的个性化阅读报告。",
-                    "根据以下阅读数据写一份「阅读报告」：① 一句总体评价；② 阅读习惯观察 2 条；" +
-                        "③ 一个具体可行的建议（比如下次读什么、什么时段读）；④ 一句鼓励。总共 200 字以内。" +
-                        "\n\n【数据】\n$data")
-                db.addNote(0, "report", reply)
-            } catch (t: Throwable) { err = t.message ?: t.toString() }
+                reply = AiClient.withCancellation(token) {
+                    AiClient.chat(cfg,
+                        "你是一位温暖幽默的私人阅读顾问。用简体中文写一份简短的个性化阅读报告。",
+                        "根据以下阅读数据写一份「阅读报告」：① 一句总体评价；② 阅读习惯观察 2 条；" +
+                            "③ 一个具体可行的建议（比如下次读什么、什么时段读）；④ 一句鼓励。总共 200 字以内。" +
+                            "\n\n【数据】\n$data")
+                }
+                // 全局报告用 bookId=0 作哨兵值；笔记中枢会放行 bookId==0，所以这里能显示出来。
+                // 先落库再回主线程：视图若已分离，结果也不该丢。
+                if (!token.isCancelled()) db.addNote(0, "report", reply)
+            } catch (t: Throwable) {
+                if (!token.isCancelled()) err = AiClient.userFacingError(t)
+            }
             val e = err
+            val cancelled = token.isCancelled()
             act.runOnUiThread {
-                try { pd.dismiss() } catch (ex: Exception) {}
-                if (e != null) {
-                    AlertDialog.Builder(act).setTitle("AI 调用失败").setMessage(e)
+                if (reportToken === token) reportToken = null
+                // 视图已分离：结果已落库，不再触碰 UI
+                if (!isAttachedToWindow) return@runOnUiThread
+                dismissAiProgress()
+                when {
+                    cancelled -> Unit
+                    e != null -> AlertDialog.Builder(act).setTitle("AI 调用失败").setMessage(e)
                         .setPositiveButton("关闭", null).show().also { Glass.styleDialog(it, density(act)) }
-                } else {
-                    refresh()
-                    showReport(reply)
+                    else -> {
+                        refresh()
+                        showReport(reply)
+                    }
                 }
             }
-        }.start()
+        }, "yeshu-report").apply { isDaemon = true }.start()
+    }
+
+    /** 不使用 ProgressDialog：它持有 Activity 窗口且无法取消；浮层随视图分离自动消失。 */
+    private fun showAiProgress(message: String) {
+        dismissAiProgress()
+        val d = density(act)
+        val tv = TextView(act).apply {
+            text = "✨ $message"
+            textSize = 14f
+            setTextColor(Color.WHITE)
+            gravity = Gravity.CENTER
+            background = GradientDrawable().apply {
+                cornerRadius = Glass.dp(14, d).toFloat()
+                setColor(Color.argb(232, 26, 32, 52))
+            }
+            setPadding(Glass.dp(20, d), Glass.dp(14, d), Glass.dp(20, d), Glass.dp(14, d))
+            elevation = Glass.dp(12, d).toFloat()
+            contentDescription = message
+        }
+        addView(tv, LayoutParams(-2, -2, Gravity.BOTTOM or Gravity.CENTER_HORIZONTAL).apply {
+            bottomMargin = Glass.dp(112, d)
+        })
+        aiProgress = tv
+    }
+
+    private fun dismissAiProgress() {
+        aiProgress?.let { if (it.parent === this) removeView(it) }
+        aiProgress = null
+    }
+
+    override fun onDetachedFromWindow() {
+        // 离开页面即取消进行中的 AI 报告，避免继续占用连接、也不写半截结果
+        reportToken?.cancel()
+        reportToken = null
+        dismissAiProgress()
+        super.onDetachedFromWindow()
     }
 
     private fun showReport(body: String) {
@@ -321,7 +376,8 @@ class StatsView(private val act: Activity) : FrameLayout(act) {
         sc.addView(TextView(act).apply {
             text = body
             textSize = 15f
-            setTextColor(Color.parseColor("#222222"))
+            // 对话框底色跟随主题，正文颜色也必须跟着走
+            setTextColor(if (pal.dark) pal.textP else Color.parseColor("#222222"))
             setLineSpacing(Glass.dp(4, d).toFloat(), 1.1f)
             setPadding(Glass.dp(20, d), Glass.dp(16, d), Glass.dp(20, d), Glass.dp(20, d))
             setTextIsSelectable(true)

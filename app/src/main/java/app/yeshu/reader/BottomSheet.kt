@@ -22,6 +22,8 @@ import android.view.animation.DecelerateInterpolator
 class BottomSheet(private val act: Activity, private val title: String? = null) {
 
     private val d = density(act)
+    // 跟随主题偏好：浅色主题下不能再用近黑面板 + 浅色文字
+    private val pal by lazy { LegacyPalette.of(act) }
     private lateinit var overlay: FrameLayout
     private lateinit var panel: LinearLayout
     private val items = mutableListOf<Triple<String, String, () -> Unit>>()  // icon, label, onClick
@@ -33,7 +35,8 @@ class BottomSheet(private val act: Activity, private val title: String? = null) 
 
     fun show() {
         val root = act.window.decorView as android.view.ViewGroup
-        overlay = FrameLayout(act).apply { setBackgroundColor(T.scrim) }
+        // 蒙层同样走调色板：浅色主题下用更轻的压暗，深色主题下更重。
+        overlay = FrameLayout(act).apply { setBackgroundColor(pal.scrim) }
         overlay.setOnClickListener { dismiss() }
 
         panel = LinearLayout(act).apply {
@@ -44,7 +47,7 @@ class BottomSheet(private val act: Activity, private val title: String? = null) 
                     Glass.dp(T.rSheet, d).toFloat(), Glass.dp(T.rSheet, d).toFloat(),
                     0f, 0f, 0f, 0f
                 )
-                setColor(T.surface)
+                setColor(pal.surface)
             }
             setPadding(Glass.dp(8, d), Glass.dp(10, d), Glass.dp(8, d), Glass.dp(18, d))
         }
@@ -54,7 +57,7 @@ class BottomSheet(private val act: Activity, private val title: String? = null) 
             addView(View(act).apply {
                 background = GradientDrawable().apply {
                     cornerRadius = Glass.dp(2, d).toFloat()
-                    setColor(Color.argb(60, 255, 255, 255))
+                    setColor(if (pal.dark) Color.argb(60, 255, 255, 255) else Color.argb(46, 23, 26, 43))
                 }
             }, FrameLayout.LayoutParams(Glass.dp(36, d), Glass.dp(4, d), Gravity.CENTER))
         }, LinearLayout.LayoutParams(-1, Glass.dp(16, d)))
@@ -64,7 +67,7 @@ class BottomSheet(private val act: Activity, private val title: String? = null) 
             panel.addView(TextView(act).apply {
                 text = title
                 textSize = 13f
-                setTextColor(T.textT)
+                setTextColor(pal.textT)
                 setTypeface(null, Typeface.BOLD)
                 letterSpacing = 0.08f
                 setPadding(Glass.dp(14, d), Glass.dp(6, d), Glass.dp(14, d), Glass.dp(10, d))
@@ -78,6 +81,8 @@ class BottomSheet(private val act: Activity, private val title: String? = null) 
                 gravity = Gravity.CENTER_VERTICAL
                 foreground = Glass.pressFx()
                 setPadding(Glass.dp(12, d), 0, Glass.dp(12, d), 0)
+                // 自绘图标无自身语义，标签放在整行容器上，TalkBack 只播报一次
+                contentDescription = label
                 setOnClickListener {
                     dismiss()
                     onClick()
@@ -86,14 +91,16 @@ class BottomSheet(private val act: Activity, private val title: String? = null) 
             row.addView(FrameLayout(act).apply {
                 background = GradientDrawable().apply {
                     shape = GradientDrawable.OVAL
-                    setColor(Color.argb(28, 255, 255, 255))
+                    setColor(if (pal.dark) Color.argb(28, 255, 255, 255) else Color.argb(20, 23, 26, 43))
                 }
-                addView(IconView(act, icon, 19))
+                addView(IconView(act, icon, 19, pal.icon).apply {
+                    importantForAccessibility = View.IMPORTANT_FOR_ACCESSIBILITY_NO
+                })
             }, LinearLayout.LayoutParams(Glass.dp(38, d), Glass.dp(38, d)))
             row.addView(TextView(act).apply {
                 text = label
                 textSize = 15f
-                setTextColor(T.textP)
+                setTextColor(pal.textP)
                 val lp = LinearLayout.LayoutParams(0, -2, 1f)
                 lp.marginStart = Glass.dp(14, d)
                 layoutParams = lp
@@ -148,7 +155,11 @@ class BottomSheet(private val act: Activity, private val title: String? = null) 
             start()
         }
         overlay.postDelayed({
-            (act.window.decorView as android.view.ViewGroup).removeView(overlay)
+            // Activity 可能在退出动画期间销毁，此时 decorView 已失效，直接放弃移除
+            if (act.isFinishing || act.isDestroyed) return@postDelayed
+            val root = runCatching { act.window?.decorView as? android.view.ViewGroup }.getOrNull()
+                ?: return@postDelayed
+            if (overlay.parent === root) root.removeView(overlay)
         }, T.durFast.toLong())
     }
 }
