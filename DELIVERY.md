@@ -12,10 +12,12 @@
 
 | 构建变体 | 文件 | 大小 | SHA-256 |
 | --- | --- | --- | --- |
-| Debug | `app/build/outputs/apk/debug/app-debug.apk` | 22,419,648 字节 | `F036DC5325E9A4EDA6FEE94D0962418E7FD4581F51BAB8A9148677BBE509C3F2` |
-| Release（未签名） | `app/build/outputs/apk/release/app-release-unsigned.apk` | 15,909,541 字节 | `3020DF66CC7D239253A5F8CA2F7C6D35101A01ADEF1722BD01B1EA92D5A79BBA` |
+| Debug（调试证书签名，可安装） | `app/build/outputs/apk/debug/app-debug.apk` | 20,489,286 字节 | `1B8B0431179F69565FC6E75C0962956BDD8FAB5118E59F2DA9CA7914EBBE5ECF` |
+| Release（未签名） | `app/build/outputs/apk/release/app-release-unsigned.apk` | 3,250,766 字节 | `FE0A91E88F6FF9FF0044F81C0019697462FA9F21EE41CB1782870BF5192E1570` |
 
-两个 APK 在交付时已经分别通过本地 Debug 编译 + Release 编译验证，来源项目的 `output-metadata.json` 同步保留。Release 暂未开启代码混淆（`isMinifyEnabled = false`），如要上架请先准备签名密钥并启用 R8。
+两个 APK 在交付时已经分别通过本地 Debug 编译 + Release 编译验证，来源项目的 `output-metadata.json` 同步保留。Release 已开启 R8 混淆与资源压缩（`isMinifyEnabled = true`、`isShrinkResources = true`，体积由 15.9MB 降至 3.25MB），保留规则见 `app/proguard-rules.pro`；混淆包已在 API 35 模拟器上实测安装、启动、书架与旧版阅读器渲染、底部弹层，无崩溃。
+
+Release 默认产出未签名 APK：在仓库根目录放置 gitignored 的 `keystore.properties`（`storeFile` / `storePassword` / `keyAlias` / `keyPassword`）后 `assembleRelease` 会自动签名。未签名的 APK 系统会拒绝安装，正式分发前必须用长期保存的发布证书签名。
 
 ## 二、产品定位
 
@@ -69,12 +71,15 @@ YeshuReader/
 
 | 阶段 | 结果 |
 | --- | --- |
-| JVM 单元测试（`testDebugUnitTest`） | 通过：`AiClientTest` 21 / `DocumentAiServiceTest` 4 / `DocParserTest` 3，合计 28 用例，0 失败、0 错误 |
-| API 35 真机 / 模拟器 instrumentation | 通过：15 用例 |
-| Debug Lint | 0 error / 97 warning |
-| Release Lint | 0 error / 99 warning |
-| Release manifest 自检 | 未发现 `DebugActivity` 引用、未发现疑似明文 API Key |
+| JVM 单元测试（`testDebugUnitTest`） | 通过：33 用例，0 失败、0 错误 |
+| 实况冒烟测试（可选） | `AiLiveSmokeTest` 5 用例，走真实服务商接口；未提供密钥时自动跳过 |
+| API 35 模拟器（混淆 release 包） | 通过：安装、启动、书架与旧版阅读器渲染、底部弹层，无崩溃 |
+| Debug Lint | 0 error / 98 warning |
+| Release Lint | 0 error / 100 warning |
+| Release manifest 自检 | 未发现 `DebugActivity` 引用、未发现疑似明文 API Key；`DebugActivity` 已设为 `exported="false"` |
 | APK 构建 | `assembleDebug` 与 `assembleRelease` 成功 |
+
+> 实况测试默认跳过，不影响离线 CI。启用方式：环境变量 `YESHU_AI_KEY`，或未跟踪的 `local.properties` 中写入 `yeshu.ai.key`（`yeshu.ai.baseUrl` / `yeshu.ai.model` 可覆盖默认端点）。密钥只从本机未跟踪文件读取，绝不写入源码或测试资源。
 
 > `lint.xml` 仍可能保留若干条 i18n / 资源未使用 / 依赖升级提示的 warning，不影响构建；上线前建议再走一次完整国际化与依赖刷新。
 
@@ -117,5 +122,5 @@ YeshuReader/
 
 ## 十、版本与许可
 
-- 版本号：`versionCode = 1`，`versionName = "1.0"`
-- 上线前需完成：正式商标查重、应用商店重名检查、`app.yeshu.reader` 唯一性终检、签名密钥与 R8 规则、隐私政策发布与首发地区法规核对。
+- 版本号：`versionCode = 2`，`versionName = "1.1"`
+- 上线前需完成：正式商标查重、应用商店重名检查、`app.yeshu.reader` 唯一性终检、发布签名密钥（R8 规则已就位）、隐私政策发布与首发地区法规核对。
