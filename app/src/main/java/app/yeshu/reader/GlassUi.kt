@@ -134,6 +134,12 @@ object Glass {
          * 空状态原先一律用大号 emoji 当插画，和全局的线性图标系统风格割裂。
          */
         icon: String? = null,
+        /**
+         * 可选的下一步动作。空状态只说「这里什么都没有」是没用的，
+         * 用户需要知道现在能做什么，所以关键页面都带一个按钮。
+         */
+        actionLabel: String? = null,
+        onAction: (() -> Unit)? = null,
     ): android.view.View {
         val d = density(activity)
         val box = android.widget.LinearLayout(activity).apply {
@@ -173,6 +179,24 @@ object Glass {
             gravity = Gravity.CENTER
             setPadding(0, dp(6, d), 0, 0)
         })
+        if (actionLabel != null && onAction != null) {
+            box.addView(android.widget.TextView(activity).apply {
+                text = actionLabel
+                textSize = 14f
+                gravity = Gravity.CENTER
+                setTextColor(Color.WHITE)
+                background = GradientDrawable().apply {
+                    cornerRadius = dp(14, d).toFloat()
+                    setColor(T.accent)
+                }
+                foreground = pressFx()
+                isClickable = true
+                // 触控区补到 48dp，与其它按钮一致。
+                minHeight = dp(48, d)
+                setPadding(dp(20, d), dp(12, d), dp(20, d), dp(12, d))
+                setOnClickListener { onAction() }
+            }, android.widget.LinearLayout.LayoutParams(-2, -2).also { it.topMargin = dp(14, d) })
+        }
         return box
     }
 

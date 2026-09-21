@@ -1161,7 +1161,12 @@ class ShelfView(private val act: Activity) : FrameLayout(act) {
             if (subs.isEmpty()) {
                 val hint = when {
                     searching -> Glass.emptyState(act, "🔍", "没有匹配的书或分类", "搜索会查找整个书架", icon = "search")
-                    else -> Glass.emptyState(act, "📚", "这一层还是空的", "导入书籍，或在当前层新建分类", icon = "book")
+                    else -> Glass.emptyState(
+                        act, "📚", "这一层还是空的", "导入书籍，或在当前层新建分类",
+                        icon = "book",
+                        actionLabel = "导入书籍",
+                        onAction = { (act as MainActivity).importDocuments() },
+                    )
                 }
                 val hp = LinearLayout.LayoutParams(-1, -2)
                 hp.setMargins(0, Glass.dp(60, d), 0, 0)

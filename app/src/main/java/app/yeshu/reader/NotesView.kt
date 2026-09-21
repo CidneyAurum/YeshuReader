@@ -163,6 +163,8 @@ class NotesView(private val act: Activity, private val bookId: Long) : FrameLayo
                 if (filterKind == null) "在阅读器里点「AI」生成摘要、提问或出题\n结果会自动保存在这里"
                 else "换个分类看看，或在阅读器里继续生成",
                 icon = "note",
+                actionLabel = "回到书架",
+                onAction = { (act as MainActivity).backToShelf() },
             )
             val hp = LayoutParams(-1, -2)
             hp.topMargin = Glass.dp(30, d)
