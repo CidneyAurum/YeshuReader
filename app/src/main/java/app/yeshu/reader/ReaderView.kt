@@ -84,6 +84,9 @@ class ReaderView(
         /** 生词条目最长保存多少字。段落长按拿到的是整段，直接全存进去会变成「长难句本」。 */
         private const val VOCAB_MAX_CHARS = 60
 
+        /** 超过这个预计分钟数才提示「这一章比较长」。 */
+        private const val LONG_CHAPTER_MINUTES = 40
+
         /** 每本书的最近阅读位置标签，书架条目读取它显示「第 N 章 / 第 N 页」。 */
         fun positionSettingKey(bookId: Long): String = "reader_last_position_$bookId"
         private val BOLD_RE = Regex("\\*\\*(.+?)\\*\\*")
@@ -776,6 +779,10 @@ class ReaderView(
         // 否则三键导航机型上工具坞与进度条会被系统栏盖住；同时回到主线程请求 inset。
         post { col.applySystemBarInsets(bottom) }
 
+        // 长章节提示（R62）：进入文档时若当前章很长，先说清大概要读多久，
+        // 让用户能决定「现在读还是等会儿」。只在超阈值时提示，避免每次都弹。
+        post { maybeWarnLongChapter() }
+
         // 护眼暖色与常亮在这里落地一次；之后由设置面板即时更新。
         applyWarmth()
         applyKeepAwake()
@@ -1092,6 +1099,22 @@ class ReaderView(
                 }
             )
         }
+    }
+
+    /** 超长章节的预计耗时提示。阈值取 40 分钟：低于这个长度提示只会变成噪音。 */
+    private fun maybeWarnLongChapter() {
+        if (bookFormat == "pdf" || pdfRenderer != null) return
+        val minutes = chapterRemainingMinutes()
+        if (minutes < LONG_CHAPTER_MINUTES) return
+        val name = tocHeads.lastOrNull { it.first <= currentBlockIndex() }?.second
+        showResult(
+            "这一章比较长",
+            buildString {
+                if (!name.isNullOrBlank()) append("《${name.take(24)}》")
+                append("按当前速度大约需要 $minutes 分钟。")
+                append("\n\n想边做别的事边读，可以用「更多 → 朗读」；只想让它自己走，用「更多 → 自动滚动」。")
+            },
+        )
     }
 
     // ---------- 阅读节奏（R59–R61）----------
