@@ -431,14 +431,14 @@ class ShelfView(private val act: Activity) : FrameLayout(act) {
                             streamed.append(delta)
                             act.runOnUiThread {
                                 if (aiToken !== token || !isAttachedToWindow) return@runOnUiThread
-                                pill.text = "✨ " + streamed.toString().trim().takeLast(PROGRESS_TAIL_CHARS)
+                                pill.text = streamed.toString().trim().takeLast(PROGRESS_TAIL_CHARS)
                             }
                         },
                         onRestart = {
                             // 断流重发：作废已上屏增量，避免「半截 + 全文」重复
                             streamed.setLength(0)
                             act.runOnUiThread {
-                                if (aiToken === token && isAttachedToWindow) pill.text = "✨ 生成中… 点按停止"
+                                if (aiToken === token && isAttachedToWindow) pill.text = "生成中… 点按停止"
                             }
                         },
                         timeoutMs = 120_000
@@ -472,7 +472,7 @@ class ShelfView(private val act: Activity) : FrameLayout(act) {
         dismissAiProgress()
         val d = density(act)
         val tv = TextView(act).apply {
-            text = "✨ $message"
+            text = message
             textSize = 14f
             setTextColor(Color.WHITE)
             gravity = Gravity.CENTER
@@ -622,7 +622,7 @@ class ShelfView(private val act: Activity) : FrameLayout(act) {
                         .setNegativeButton("关闭", null)
                         .show().also { Glass.styleDialog(it, density(act)) }
                 } else {
-                    showResult("✨ AI 推荐", reply)
+                    showResult("AI 推荐", reply)
                 }
             })
     }
@@ -1128,7 +1128,7 @@ class ShelfView(private val act: Activity) : FrameLayout(act) {
                 setOnLongClickListener {
                     val options = arrayOf("打开", "重命名", "移动到…", "删除")
                     AlertDialog.Builder(act)
-                        .setTitle("📁 ${f.name}")
+                        .setTitle(f.name)
                         .setItems(options) { _, which ->
                             when (which) {
                                 0 -> enterFolder(f.id)
@@ -1156,8 +1156,8 @@ class ShelfView(private val act: Activity) : FrameLayout(act) {
         if (books.size == 0) {
             if (subs.isEmpty()) {
                 val hint = when {
-                    searching -> Glass.emptyState(act, "🔍", "没有匹配的书或分类", "搜索会查找整个书架")
-                    else -> Glass.emptyState(act, "📚", "这一层还是空的", "导入书籍，或在当前层新建分类")
+                    searching -> Glass.emptyState(act, "🔍", "没有匹配的书或分类", "搜索会查找整个书架", icon = "search")
+                    else -> Glass.emptyState(act, "📚", "这一层还是空的", "导入书籍，或在当前层新建分类", icon = "book")
                 }
                 val hp = LinearLayout.LayoutParams(-1, -2)
                 hp.setMargins(0, Glass.dp(60, d), 0, 0)
@@ -1165,7 +1165,7 @@ class ShelfView(private val act: Activity) : FrameLayout(act) {
                 // 搜索无结果 → AI 找书兜底入口
                 if (searching && query != null) {
                     val aiRow = TextView(act).apply {
-                        text = "✨ 没找到？让 AI 帮你找「${query.take(12)}」"
+                        text = "没找到？让 AI 帮你找「${query.take(12)}」"
                         textSize = 14f
                         setTextColor(T.accent)
                         gravity = Gravity.CENTER
@@ -1483,7 +1483,7 @@ class ShelfView(private val act: Activity) : FrameLayout(act) {
         val kb = if (b.sizeBytes < 1024) "${b.sizeBytes} B"
                  else (b.sizeBytes / 1024).toString() + " KB"
         val pct = ((b.progress * 100).toInt()).toString() + "%"
-        val folderName = if (b.folderId == 0L) "📂 根目录" else db.getFolder(b.folderId)?.name ?: "?"
+        val folderName = if (b.folderId == 0L) "根目录" else db.getFolder(b.folderId)?.name ?: "?"
         val lastRead = if (b.lastReadAt > 0) fmt.format(java.util.Date(b.lastReadAt)) else "还没翻开过"
         val readMs = try { db.totalReadMs(b.id) } catch (e: Exception) { 0L }
         val readLabel = when {
@@ -1495,10 +1495,10 @@ class ShelfView(private val act: Activity) : FrameLayout(act) {
         val introText = intro ?: "还没有简介，点「AI 简介」一键生成"
         val body = TextView(act).apply {
             textSize = 14f
-            setTextColor(Color.parseColor("#333333"))
+            setTextColor(pal.textP)
             setLineSpacing(Glass.dp(4, d).toFloat(), 1f)
             setPadding(Glass.dp(24, d), Glass.dp(18, d), Glass.dp(24, d), Glass.dp(8, d))
-            text = "📖 $introText\n\n" +
+            text = "$introText\n\n" +
                    "作者：${b.author.ifBlank { "未填写" }}    收藏：${if (b.favorite) "是" else "否"}\n" +
                    "标签：${b.tags.ifBlank { "未填写" }}\n" +
                    "封面：${CoverStore.sourceLabel(act, b.id)}\n" +
@@ -1513,7 +1513,7 @@ class ShelfView(private val act: Activity) : FrameLayout(act) {
         AlertDialog.Builder(act)
             .setTitle("《${b.title}》")
             .setView(body)
-            .setNeutralButton(if (intro == null) "✨ AI 简介" else "✨ 换个简介") { _, _ -> aiIntro(b) }
+            .setNeutralButton(if (intro == null) "AI 简介" else "换个简介") { _, _ -> aiIntro(b) }
             .setPositiveButton("开始阅读") { _, _ -> openReader(b.id) }
             .setNegativeButton("关闭", null)
             .show().also { Glass.styleDialog(it, d) }
@@ -2033,14 +2033,14 @@ class ShelfView(private val act: Activity) : FrameLayout(act) {
                             streamed.append(delta)
                             act.runOnUiThread {
                                 if (aiToken !== token || !isAttachedToWindow) return@runOnUiThread
-                                pill.text = "✨ " + streamed.toString().trim().takeLast(PROGRESS_TAIL_CHARS)
+                                pill.text = streamed.toString().trim().takeLast(PROGRESS_TAIL_CHARS)
                             }
                         },
                         onRestart = {
                             // 断流重发：作废已上屏增量，避免「半截 + 全文」重复
                             streamed.setLength(0)
                             act.runOnUiThread {
-                                if (aiToken === token && isAttachedToWindow) pill.text = "✨ 生成中… 点按停止"
+                                if (aiToken === token && isAttachedToWindow) pill.text = "生成中… 点按停止"
                             }
                         },
                         timeoutMs = 120_000

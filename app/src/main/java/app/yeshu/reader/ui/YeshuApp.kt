@@ -37,12 +37,16 @@ import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.foundation.verticalScroll
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.KeyboardArrowDown
+import androidx.compose.material.icons.filled.KeyboardArrowUp
 import androidx.compose.material3.AssistChip
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.FilterChip
+import androidx.compose.material3.Icon
 import androidx.compose.material3.LocalContentColor
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
@@ -1694,6 +1698,8 @@ private fun SettingsScreen(activity: MainActivity) {
     var modelsPath by remember { mutableStateOf(boot.profile.modelsPath) }
     var authHeader by remember { mutableStateOf(boot.profile.authHeader) }
     var authPrefix by remember { mutableStateOf(boot.profile.authPrefix) }
+    // 接口路径与鉴权是少数派需求，默认收起；展开状态只活在内存里，不必持久化。
+    var showAdvanced by remember { mutableStateOf(false) }
     var keyInput by remember { mutableStateOf("") }
     var hasSavedKey by remember { mutableStateOf(boot.hasSavedKey) }
     var keyState by remember { mutableStateOf(boot.keyState) }
@@ -2261,6 +2267,27 @@ private fun SettingsScreen(activity: MainActivity) {
                                 modelPickerTarget = "vision"
                             }
                         )
+                        // 高级项默认收起：普通用户只需要地址/模型/Key，路径与鉴权字段把页面拉得很长。
+                        Row(
+                            Modifier.fillMaxWidth().clickable { showAdvanced = !showAdvanced },
+                            verticalAlignment = Alignment.CenterVertically,
+                        ) {
+                            Icon(
+                                if (showAdvanced) Icons.Default.KeyboardArrowUp else Icons.Default.KeyboardArrowDown,
+                                contentDescription = null,
+                                tint = secondaryText(),
+                            )
+                            Spacer(Modifier.width(8.dp))
+                            Column(Modifier.weight(1f)) {
+                                Text("高级（接口路径与鉴权）", fontWeight = FontWeight.Medium)
+                                Text(
+                                    if (showAdvanced) "收起后不会改动已填的值" else "自定义 Chat/模型路径、鉴权 Header 前缀、局域网 HTTP",
+                                    fontSize = 10.sp,
+                                    color = secondaryText(),
+                                )
+                            }
+                        }
+                        if (showAdvanced) {
                         GlassTextField(chatPath, { chatPath = it }, "Chat 接口路径或完整 URL")
                         GlassTextField(modelsPath, { modelsPath = it }, "模型列表路径（留空则不读取）")
                         Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
@@ -2276,6 +2303,7 @@ private fun SettingsScreen(activity: MainActivity) {
                             fontSize = 10.sp,
                             color = secondaryText()
                         )
+                        }
                         OutlinedTextField(
                             value = keyInput,
                             onValueChange = { keyInput = it },
@@ -2359,6 +2387,7 @@ private fun SettingsScreen(activity: MainActivity) {
                                 }
                             }
                         }
+                        if (showAdvanced) {
                         Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
                             Column(Modifier.weight(1f)) {
                                 Text("允许局域网 HTTP", fontWeight = FontWeight.Medium)
@@ -2376,6 +2405,7 @@ private fun SettingsScreen(activity: MainActivity) {
                                         .show()
                                 }
                             })
+                        }
                         }
                         Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(10.dp)) {
                             Button(

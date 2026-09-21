@@ -84,6 +84,35 @@ class StatsView(private val act: Activity) : FrameLayout(act) {
         val reading = booksAll.count { it.progress > 0.005f && it.progress < 0.99f }
         val finished = booksAll.count { it.progress >= 0.99f }
 
+        // 一条阅读记录都没有时，画出来的是全空图表和「0 分钟」，看起来像统计坏了。
+        // 直接说明还没开始读，并给一个回书架的入口。
+        if (totalMs <= 0L && days == 0 && notesN == 0) {
+            listBox.addView(
+                Glass.emptyState(
+                    act,
+                    emoji = "📖",
+                    title = "还没有阅读记录",
+                    sub = "读上几分钟，这里会出现累计时长、近 7 天趋势和阅读时长榜。",
+                    palette = pal,
+                    icon = "book",
+                ),
+                LinearLayout.LayoutParams(-1, -2),
+            )
+            listBox.addView(TextView(act).apply {
+                text = "去书架"
+                textSize = 15f
+                gravity = Gravity.CENTER
+                setTextColor(Color.WHITE)
+                background = GradientDrawable().apply {
+                    cornerRadius = Glass.dp(14, d).toFloat()
+                    setColor(T.accent)
+                }
+                foreground = Glass.pressFx()
+                setOnClickListener { (act as MainActivity).backToShelf() }
+            }, LinearLayout.LayoutParams(-1, Glass.dp(48, d)).also { it.topMargin = Glass.dp(14, d) })
+            return
+        }
+
         fun statCard(): LinearLayout {
             val row = LinearLayout(act).apply {
                 orientation = LinearLayout.HORIZONTAL
@@ -211,7 +240,7 @@ class StatsView(private val act: Activity) : FrameLayout(act) {
             }
             setPadding(Glass.dp(18, d), Glass.dp(18, d), Glass.dp(18, d), Glass.dp(18, d))
             addView(TextView(act).apply {
-                text = "✨ AI 阅读报告"; textSize = 16f; setTextColor(Color.WHITE)
+                text = "AI 阅读报告"; textSize = 16f; setTextColor(Color.WHITE)
                 setTypeface(null, Typeface.BOLD)
             })
             addView(TextView(act).apply {
@@ -323,14 +352,14 @@ class StatsView(private val act: Activity) : FrameLayout(act) {
                             streamed.append(delta)
                             act.runOnUiThread {
                                 if (reportToken !== token || !isAttachedToWindow) return@runOnUiThread
-                                pill.text = "✨ " + streamed.toString().trim().takeLast(PROGRESS_TAIL_CHARS)
+                                pill.text = streamed.toString().trim().takeLast(PROGRESS_TAIL_CHARS)
                             }
                         },
                         onRestart = {
                             // 断流重发：作废已上屏增量，避免「半截 + 全文」重复
                             streamed.setLength(0)
                             act.runOnUiThread {
-                                if (reportToken === token && isAttachedToWindow) pill.text = "✨ 生成中… 点按停止"
+                                if (reportToken === token && isAttachedToWindow) pill.text = "生成中… 点按停止"
                             }
                         },
                         timeoutMs = 120_000)
@@ -373,7 +402,7 @@ class StatsView(private val act: Activity) : FrameLayout(act) {
         dismissAiProgress()
         val d = density(act)
         val tv = TextView(act).apply {
-            text = "✨ $message"
+            text = message
             textSize = 14f
             setTextColor(Color.WHITE)
             gravity = Gravity.CENTER
@@ -430,7 +459,7 @@ class StatsView(private val act: Activity) : FrameLayout(act) {
             setPadding(Glass.dp(20, d), Glass.dp(16, d), Glass.dp(20, d), Glass.dp(20, d))
             setTextIsSelectable(true)
         })
-        AlertDialog.Builder(act).setTitle("✨ AI 阅读报告").setView(sc)
+        AlertDialog.Builder(act).setTitle("AI 阅读报告").setView(sc)
             .setPositiveButton("关闭", null).show().also { Glass.styleDialog(it, density(act)) }
     }
 

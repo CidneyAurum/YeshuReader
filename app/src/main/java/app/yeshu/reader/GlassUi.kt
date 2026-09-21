@@ -122,13 +122,18 @@ object Glass {
         }
     }
 
-    /** iOS 风格空状态卡：大 emoji + 主文案 + 副文案（跟随主题的表面/文字色） */
+    /** iOS 风格空状态卡：线性图标（或兜底 emoji）+ 主文案 + 副文案（跟随主题的表面/文字色） */
     fun emptyState(
         activity: Activity,
         emoji: String,
         title: String,
         sub: String,
-        palette: LegacyPalette = LegacyPalette.of(activity)
+        palette: LegacyPalette = LegacyPalette.of(activity),
+        /**
+         * 线性图标名（见 Icons.kt）。传了就优先用它，emoji 只作兜底。
+         * 空状态原先一律用大号 emoji 当插画，和全局的线性图标系统风格割裂。
+         */
+        icon: String? = null,
     ): android.view.View {
         val d = density(activity)
         val box = android.widget.LinearLayout(activity).apply {
@@ -140,11 +145,19 @@ object Glass {
             }
             setPadding(dp(28, d), dp(34, d), dp(28, d), dp(34, d))
         }
-        box.addView(android.widget.TextView(activity).apply {
-            text = emoji
-            textSize = 44f
-            gravity = Gravity.CENTER
-        })
+        if (icon != null) {
+            box.addView(
+                IconView(activity, icon, 48, if (palette.dark) Color.argb(210, 245, 245, 247) else palette.textT)
+                    // 自绘图标没有自身语义；标题已经在讲同一件事，避免 TalkBack 读两遍。
+                    .apply { importantForAccessibility = android.view.View.IMPORTANT_FOR_ACCESSIBILITY_NO },
+            )
+        } else {
+            box.addView(android.widget.TextView(activity).apply {
+                text = emoji
+                textSize = 44f
+                gravity = Gravity.CENTER
+            })
+        }
         box.addView(android.widget.TextView(activity).apply {
             text = title
             textSize = 17f

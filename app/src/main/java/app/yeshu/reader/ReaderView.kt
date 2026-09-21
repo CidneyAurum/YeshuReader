@@ -1036,6 +1036,22 @@ class ReaderView(
         db.setSetting("reader_theme", theme.key)
         refreshThemeCell()
 
+        // 深色↔浅色直接换色会整屏瞬变，像闪了一下。
+        // 淡到半透明再换色、然后淡回，既没有纯背景的空档，也能看出是一次切换。
+        val stage = sc
+        if (stage == null) {
+            applyReaderThemeColors()
+            return
+        }
+        stage.animate().cancel()
+        stage.animate().alpha(0.35f).setDuration(90).withEndAction {
+            applyReaderThemeColors()
+            stage.animate().alpha(1f).setDuration(140).start()
+        }.start()
+    }
+
+    /** 只做换色，不含动画，便于过渡动画在中间帧调用。 */
+    private fun applyReaderThemeColors() {
         val textBox = boxRef
         if (textBox != null) {
             textBox.setBackgroundColor(themeBackground())
@@ -2756,7 +2772,7 @@ class ReaderView(
                     call({ delta ->
                         acc.append(delta)
                         if (rAcc.isNotEmpty()) {
-                            act.runOnUiThread { thinkTv.text = "💭 已深度思考 ${rAcc.length} 字" }
+                            act.runOnUiThread { thinkTv.text = "已深度思考 ${rAcc.length} 字" }
                         }
                         val now = System.currentTimeMillis()
                         if (!task.cancelled.get() && now - lastUi[0] > 150) {
@@ -2771,7 +2787,7 @@ class ReaderView(
                         rAcc.append(reason)
                         act.runOnUiThread {
                             thinkTv.visibility = View.VISIBLE
-                            thinkTv.text = "💭 思考中… ${rAcc.takeLast(80)}"
+                            thinkTv.text = "思考中… ${rAcc.takeLast(80)}"
                             scroll.post { scroll.fullScroll(View.FOCUS_DOWN) }
                         }
                     }, {
@@ -3426,7 +3442,7 @@ class ReaderView(
                 onDone = { questions ->
                     // 出题完成 → 引导作答批改闭环
                     android.app.AlertDialog.Builder(act)
-                        .setTitle("✍️ 作答批改")
+                        .setTitle("作答批改")
                         .setMessage("题目已生成。把你的答案写在下框（可简答，如「1A 2B 3…」），AI 将对照原文批改评分。")
                         .setPositiveButton("去作答") { _, _ -> answerQuiz(cfg, questions) }
                         .setNegativeButton("稍后", null)
@@ -3455,7 +3471,7 @@ class ReaderView(
             minLines = 3
         }
         android.app.AlertDialog.Builder(act)
-            .setTitle("✍️ 提交答案")
+            .setTitle("提交答案")
             .setView(input)
             .setPositiveButton("提交批改") { _, _ ->
                 val ans = input.text.toString().trim()
@@ -3942,6 +3958,13 @@ class ReaderView(
         }
         rowViews.forEach { column.addView(it, LinearLayout.LayoutParams(-1, -2)) }
         val scroll = ScrollView(act).apply { addView(column, LayoutParams(-1, -2)) }
+        // 打开目录就停在当前章：长篇里每次从第一章往下翻很费劲。
+        // 位置要等布局完成才有，所以放到 post 里。
+        if (curHead > 0) {
+            scroll.post {
+                scroll.scrollTo(0, (rowViews[curHead].top - Glass.dp(8, d)).coerceAtLeast(0))
+            }
+        }
         panel.addView(scroll, LinearLayout.LayoutParams(-1, 0, 1f))
         panel.addView(TextView(act).apply {
             text = "关闭"

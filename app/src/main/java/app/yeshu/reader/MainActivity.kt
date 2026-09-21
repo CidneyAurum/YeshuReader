@@ -10,10 +10,25 @@ import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.activity.addCallback
+import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.material3.LinearProgressIndicator
+import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.Surface
+import androidx.compose.material3.Text
+import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
+import androidx.compose.ui.Alignment
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.unit.dp
 import androidx.core.view.WindowCompat
 import androidx.lifecycle.Observer
 import androidx.lifecycle.lifecycleScope
@@ -49,6 +64,9 @@ class MainActivity : ComponentActivity() {
         private set
     var libraryRevision by mutableIntStateOf(0)
         private set
+
+    /** 导入进度：已完成项数 to 总项数；不在导入中时为 null。 */
+    private var importProgress by mutableStateOf<Pair<Int, Int>?>(null)
 
     private var shelf: ShelfView? = null
     private var currentLegacy: View? = null
@@ -149,11 +167,39 @@ class MainActivity : ComponentActivity() {
         setContent {
             val themeMode by userPreferences.themeMode.collectAsStateWithLifecycle(initialValue = "system")
             YeshuTheme(themeMode) {
-                YeshuApp(
-                    activity = this,
-                    destination = destination,
-                    libraryRevision = libraryRevision,
-                    onNavigate = ::navigate
+                Box(Modifier.fillMaxSize()) {
+                    YeshuApp(
+                        activity = this@MainActivity,
+                        destination = destination,
+                        libraryRevision = libraryRevision,
+                        onNavigate = ::navigate
+                    )
+                    importProgress?.let { (done, total) ->
+                        ImportProgressBanner(
+                            done = done,
+                            total = total,
+                            modifier = Modifier.align(Alignment.BottomCenter),
+                        )
+                    }
+                }
+            }
+        }
+    }
+
+    /** 导入进度条：批次内已完成 N / 共 M 项。 */
+    @Composable
+    private fun ImportProgressBanner(done: Int, total: Int, modifier: Modifier = Modifier) {
+        Surface(
+            modifier = modifier.fillMaxWidth().padding(16.dp),
+            shape = RoundedCornerShape(18.dp),
+            color = MaterialTheme.colorScheme.surfaceVariant,
+            tonalElevation = 3.dp,
+        ) {
+            Column(Modifier.padding(14.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                Text("正在导入 $done / $total 项…", style = MaterialTheme.typography.labelLarge)
+                LinearProgressIndicator(
+                    progress = { if (total > 0) done.toFloat() / total else 0f },
+                    modifier = Modifier.fillMaxWidth(),
                 )
             }
         }
@@ -208,7 +254,11 @@ class MainActivity : ComponentActivity() {
         val live = WorkManager.getInstance(this).getWorkInfosByTagLiveData(tag)
         val observer = object : Observer<List<WorkInfo>> {
             override fun onChanged(infos: List<WorkInfo>) {
-                if (infos.size < expected || infos.any { !it.state.isFinished }) return
+                if (infos.size < expected) return
+                val done = infos.count { it.state.isFinished }
+                // 长文档解析要几十秒，中间不给反馈用户会以为卡死了。
+                importProgress = if (done < expected) done to expected else null
+                if (done < expected) return
                 live.removeObserver(this)
                 forgetImportBatch()
                 libraryRevision++

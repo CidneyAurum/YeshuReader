@@ -67,16 +67,19 @@ class NotesView(private val act: Activity, private val bookId: Long) : FrameLayo
             setTypeface(null, Typeface.BOLD)
             maxLines = 1
         }, LinearLayout.LayoutParams(0, -2, 1f))
-        // ✨ AI 整理：把本书散乱笔记归纳成一页精读笔记
-        top.addView(TextView(act).apply {
-            text = "✨"
-            textSize = 15f
-            setTextColor(pal.textP)
+        // AI 整理：把本书散乱笔记归纳成一页精读笔记。
+        // 用线性图标而不是 emoji，和其余入口保持同一套图标语言。
+        top.addView(FrameLayout(act).apply {
             background = Glass.pillBg(if (pal.dark) Color.argb(60, 255, 255, 255) else Color.argb(26, 23, 26, 43))
-            setPadding(Glass.dp(13, d), Glass.dp(7, d), Glass.dp(13, d), Glass.dp(7, d))
             foreground = Glass.pressFx()
             isClickable = true
             contentDescription = "AI 整理笔记"
+            setPadding(Glass.dp(13, d), Glass.dp(7, d), Glass.dp(13, d), Glass.dp(7, d))
+            addView(
+                IconView(act, "note", 18, pal.textP)
+                    .apply { importantForAccessibility = View.IMPORTANT_FOR_ACCESSIBILITY_NO },
+                FrameLayout.LayoutParams(Glass.dp(18, d), Glass.dp(18, d), Gravity.CENTER),
+            )
             val lp = LinearLayout.LayoutParams(-2, -2)
             lp.marginEnd = Glass.dp(8, d)
             layoutParams = lp
@@ -158,7 +161,8 @@ class NotesView(private val act: Activity, private val bookId: Long) : FrameLayo
                 act, "📝",
                 if (filterKind == null) "还没有笔记" else "该分类暂无笔记",
                 if (filterKind == null) "在阅读器里点「AI」生成摘要、提问或出题\n结果会自动保存在这里"
-                else "换个分类看看，或在阅读器里继续生成"
+                else "换个分类看看，或在阅读器里继续生成",
+                icon = "note",
             )
             val hp = LayoutParams(-1, -2)
             hp.topMargin = Glass.dp(30, d)
@@ -174,8 +178,8 @@ class NotesView(private val act: Activity, private val bookId: Long) : FrameLayo
                 else -> row.content
             }
             val body = when {
-                row.kind == "chat" && row.content.startsWith("U:") -> "🙋 $raw"
-                row.kind == "chat" && row.content.startsWith("A:") -> "🤖 $raw"
+                row.kind == "chat" && row.content.startsWith("U:") -> "你：$raw"
+                row.kind == "chat" && row.content.startsWith("A:") -> "书：$raw"
                 else -> raw
             }
             val card = LinearLayout(act).apply {
@@ -502,14 +506,14 @@ class NotesView(private val act: Activity, private val bookId: Long) : FrameLayo
                             streamed.append(delta)
                             act.runOnUiThread {
                                 if (digestToken !== token || !isAttachedToWindow) return@runOnUiThread
-                                pill.text = "✨ " + streamed.toString().trim().takeLast(PROGRESS_TAIL_CHARS)
+                                pill.text = streamed.toString().trim().takeLast(PROGRESS_TAIL_CHARS)
                             }
                         },
                         onRestart = {
                             // 断流重发：作废已上屏增量，避免「半截 + 全文」重复
                             streamed.setLength(0)
                             act.runOnUiThread {
-                                if (digestToken === token && isAttachedToWindow) pill.text = "✨ 生成中… 点按停止"
+                                if (digestToken === token && isAttachedToWindow) pill.text = "生成中… 点按停止"
                             }
                         },
                         timeoutMs = 120_000)
@@ -565,7 +569,7 @@ class NotesView(private val act: Activity, private val bookId: Long) : FrameLayo
         dismissAiProgress()
         val d = density(act)
         val tv = TextView(act).apply {
-            text = "✨ $message"
+            text = message
             textSize = 14f
             setTextColor(Color.WHITE)
             gravity = Gravity.CENTER
