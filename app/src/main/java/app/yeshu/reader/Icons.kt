@@ -30,6 +30,24 @@ class IconView(
         this.color = color
     }
 
+    // onDraw 里绝不新建对象（lint DrawAllocation）：阅读器底栏常驻 6+ 个图标，
+    // 每帧每图标分配 Paint/Path 会在长文滚动时制造可感知的 GC 卡顿。
+    // 复用同一个实例，绘制前 reset/rewind。
+    private val scratchPath = android.graphics.Path()
+    private val scratchPaint = Paint(Paint.ANTI_ALIAS_FLAG)
+    private val holePaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        style = Paint.Style.FILL
+        xfermode = android.graphics.PorterDuffXfermode(android.graphics.PorterDuff.Mode.CLEAR)
+    }
+
+    private fun drawScratchPath(c: Canvas, fillMode: Boolean) {
+        scratchPaint.reset()
+        scratchPaint.flags = Paint.ANTI_ALIAS_FLAG
+        scratchPaint.style = if (fillMode) Paint.Style.FILL else Paint.Style.STROKE
+        scratchPaint.color = stroke.color
+        c.drawPath(scratchPath, scratchPaint)
+    }
+
     init {
         layoutParams = android.view.ViewGroup.LayoutParams(dp(sizeDp), dp(sizeDp))
         // 纯装饰性的自绘图标本身没有语义，交给外层可点击容器描述，
@@ -84,46 +102,38 @@ class IconView(
                 }
             }
             "moon" -> {
-                val path = android.graphics.Path()
-                path.addCircle(s(12f), s(12f), s(7f), android.graphics.Path.Direction.CW)
-                path.addCircle(s(16f), s(9f), s(6f), android.graphics.Path.Direction.CW)
-                c.drawPath(path, Paint(Paint.ANTI_ALIAS_FLAG).apply {
-                    style = Paint.Style.FILL
-                    color = stroke.color
-                })
-                // 用背景色抠掉重叠部分（even-odd 效果）
-                val hole = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-                    style = Paint.Style.FILL
-                    xfermode = android.graphics.PorterDuffXfermode(android.graphics.PorterDuff.Mode.CLEAR)
-                }
-                val hp = android.graphics.Path()
-                hp.addCircle(s(16.5f), s(8.5f), s(6.5f), android.graphics.Path.Direction.CW)
+                scratchPath.rewind()
+                scratchPath.addCircle(s(12f), s(12f), s(7f), android.graphics.Path.Direction.CW)
+                scratchPath.addCircle(s(16f), s(9f), s(6f), android.graphics.Path.Direction.CW)
+                // 用 CLEAR 抠掉重叠部分（even-odd 效果）；所有对象复用，onDraw 零分配
                 val layer = saveLayer(c)
-                c.drawPath(path, fill)
-                c.drawPath(hp, hole)
+                drawScratchPath(c, fillMode = true)
+                scratchPath.rewind()
+                scratchPath.addCircle(s(16.5f), s(8.5f), s(6.5f), android.graphics.Path.Direction.CW)
+                c.drawPath(scratchPath, holePaint)
                 restoreLayer(c, layer)
             }
             "palette" -> { // 封面墙：图片山形
                 c.drawRoundRect(s(3.5f), s(4.5f), s(20.5f), s(19.5f), s(2.5f), s(2.5f), stroke)
                 c.drawCircle(s(8.5f), s(9.5f), s(1.6f), fill)
-                val m = android.graphics.Path()
-                m.moveTo(s(6f), s(17f))
-                m.lineTo(s(11f), s(11.5f))
-                m.lineTo(s(14.5f), s(15f))
-                m.lineTo(s(17f), s(12.8f))
-                m.lineTo(s(20f), s(16f))
-                c.drawPath(m, stroke)
+                scratchPath.rewind()
+                scratchPath.moveTo(s(6f), s(17f))
+                scratchPath.lineTo(s(11f), s(11.5f))
+                scratchPath.lineTo(s(14.5f), s(15f))
+                scratchPath.lineTo(s(17f), s(12.8f))
+                scratchPath.lineTo(s(20f), s(16f))
+                c.drawPath(scratchPath, stroke)
             }
             "folder" -> {
-                val p = android.graphics.Path()
-                p.moveTo(s(3.5f), s(6.5f))
-                p.lineTo(s(9.5f), s(6.5f))
-                p.lineTo(s(11.5f), s(9f))
-                p.lineTo(s(20.5f), s(9f))
-                p.lineTo(s(20.5f), s(18.5f))
-                p.lineTo(s(3.5f), s(18.5f))
-                p.close()
-                c.drawPath(p, stroke)
+                scratchPath.rewind()
+                scratchPath.moveTo(s(3.5f), s(6.5f))
+                scratchPath.lineTo(s(9.5f), s(6.5f))
+                scratchPath.lineTo(s(11.5f), s(9f))
+                scratchPath.lineTo(s(20.5f), s(9f))
+                scratchPath.lineTo(s(20.5f), s(18.5f))
+                scratchPath.lineTo(s(3.5f), s(18.5f))
+                scratchPath.close()
+                c.drawPath(scratchPath, stroke)
             }
             "check" -> { // 多选框
                 c.drawRoundRect(s(4f), s(4f), s(20f), s(20f), s(4f), s(4f), stroke)
@@ -150,18 +160,18 @@ class IconView(
             }
             "book" -> {
                 c.drawLine(s(12f), s(5.5f), s(12f), s(18.5f), stroke)
-                val l = android.graphics.Path()
-                l.moveTo(s(12f), s(5.5f))
-                l.cubicTo(s(9f), s(3.8f), s(5.5f), s(4f), s(3.5f), s(5.5f))
-                l.lineTo(s(3.5f), s(16.5f))
-                l.cubicTo(s(5.5f), s(15f), s(9f), s(14.8f), s(12f), s(16.5f))
-                c.drawPath(l, stroke)
-                val r = android.graphics.Path()
-                r.moveTo(s(12f), s(5.5f))
-                r.cubicTo(s(15f), s(3.8f), s(18.5f), s(4f), s(20.5f), s(5.5f))
-                r.lineTo(s(20.5f), s(16.5f))
-                r.cubicTo(s(18.5f), s(15f), s(15f), s(14.8f), s(12f), s(16.5f))
-                c.drawPath(r, stroke)
+                scratchPath.rewind()
+                scratchPath.moveTo(s(12f), s(5.5f))
+                scratchPath.cubicTo(s(9f), s(3.8f), s(5.5f), s(4f), s(3.5f), s(5.5f))
+                scratchPath.lineTo(s(3.5f), s(16.5f))
+                scratchPath.cubicTo(s(5.5f), s(15f), s(9f), s(14.8f), s(12f), s(16.5f))
+                c.drawPath(scratchPath, stroke)
+                scratchPath.rewind()
+                scratchPath.moveTo(s(12f), s(5.5f))
+                scratchPath.cubicTo(s(15f), s(3.8f), s(18.5f), s(4f), s(20.5f), s(5.5f))
+                scratchPath.lineTo(s(20.5f), s(16.5f))
+                scratchPath.cubicTo(s(18.5f), s(15f), s(15f), s(14.8f), s(12f), s(16.5f))
+                c.drawPath(scratchPath, stroke)
             }
             "note" -> {
                 c.drawRoundRect(s(5f), s(3.5f), s(19f), s(20.5f), s(2f), s(2f), stroke)

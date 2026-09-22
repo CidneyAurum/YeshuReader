@@ -218,7 +218,7 @@ object Glass {
             setColor(Accent.primary)
         }
         val clip = android.graphics.drawable.ClipDrawable(
-            fill, Gravity.LEFT, android.graphics.drawable.ClipDrawable.HORIZONTAL
+            fill, Gravity.START, android.graphics.drawable.ClipDrawable.HORIZONTAL
         )
         return View(activity).apply {
             background = android.graphics.drawable.LayerDrawable(arrayOf(track, clip))

@@ -788,13 +788,16 @@ class ReaderView(
         applyKeepAwake()
 
         // 自动滚动时触摸即暂停，松手继续：否则想停下来看一眼都做不到。
-        sc?.setOnTouchListener { _, ev ->
+        // ScrollView 的点击语义（翻到点击处）由系统处理，这里只做暂停，不劫持 performClick。
+        sc?.setOnTouchListener { v, ev ->
             when (ev.actionMasked) {
                 android.view.MotionEvent.ACTION_DOWN -> {
                     autoScrollTask?.let { repeatHandler?.removeCallbacks(it) }
                 }
                 android.view.MotionEvent.ACTION_UP, android.view.MotionEvent.ACTION_CANCEL -> {
                     autoScrollTask?.let { task -> repeatHandler?.postDelayed(task, AUTO_SCROLL_INTERVAL_MS) }
+                    // 让系统继续处理点击/滚动，不吞事件。
+                    v.performClick()
                 }
             }
             false
@@ -820,10 +823,13 @@ class ReaderView(
             h.postDelayed(loop, 380)
             true
         }
-        v.setOnTouchListener { _, ev ->
+        v.setOnTouchListener { v, ev ->
             if (ev.actionMasked == android.view.MotionEvent.ACTION_UP ||
                 ev.actionMasked == android.view.MotionEvent.ACTION_CANCEL) {
                 h.removeCallbacks(loop)
+                // 返回 false 让 onClick 照常触发；这里补一次 performClick 是为无障碍服务
+                // （TalkBack 的触摸浏览模式不派发普通 touch 事件）。
+                v.performClick()
             }
             false
         }
@@ -1066,7 +1072,6 @@ class ReaderView(
         } else 0
         // 字体族与对齐也要一起重排：只改字号会让「换成衬线」看起来没生效。
         val typeface = typefaceFor(fontFamilyKey)
-        val align = if (justify) android.text.Layout.Alignment.ALIGN_NORMAL else null
         for (i in 0 until box.childCount) {
             val v = box.getChildAt(i) as? TextView ?: continue
             if (v.tag == "head") {
@@ -1080,10 +1085,13 @@ class ReaderView(
                 v.setPadding(Glass.dp(marginDp, d), Glass.dp(6, d), Glass.dp(marginDp, d), Glass.dp(6, d))
                 v.setTypeface(typeface, Typeface.NORMAL)
                 // 两端对齐用 justificationMode 而不是 alignment：后者对中文无效。
-                v.justificationMode = if (justify) android.text.Layout.JUSTIFICATION_MODE_INTER_WORD
-                else android.text.Layout.JUSTIFICATION_MODE_NONE
+                // 常量在 android.graphics.text.LineBreaker；setter 需要 API 34，
+                // 低版本调用会 NoSuchMethodError 崩溃，必须加版本闸门（静默降级为默认排版）。
+                if (android.os.Build.VERSION.SDK_INT >= 34) {
+                    v.justificationMode = if (justify) android.graphics.text.LineBreaker.JUSTIFICATION_MODE_INTER_WORD
+                    else android.graphics.text.LineBreaker.JUSTIFICATION_MODE_NONE
+                }
             }
-            if (align == null) v.textAlignment = View.TEXT_ALIGNMENT_TEXT_START
         }
         if (anchorIdx >= 0) {
             // 重排是一次 requestLayout，必须等布局完成后再按锚点还原滚动位置
@@ -1199,27 +1207,43 @@ class ReaderView(
         else -> null
     }
 
-    /** 护眼暖色叠加层。加在阅读器最上层且不接收触摸，只做染色。 */
+    /**
+     * 护眼暖色叠加层。加在阅读器最上层且不接收触摸，只做染色。
+     *
+     * addView 同样必须切主线程：ReaderView 在 IO 协程里构造，直接 addView
+     * 会与 Compose 的布局阶段竞争（真机诊断在常亮 flag 上抓到过同类崩溃）。
+     */
     private fun applyWarmth() {
-        if (warmth <= 0) {
-            warmOverlay?.visibility = View.GONE
-            return
+        act.runOnUiThread {
+            if (warmth <= 0) {
+                warmOverlay?.visibility = View.GONE
+                return@runOnUiThread
+            }
+            val overlay = warmOverlay ?: View(act).apply {
+                isClickable = false
+                isFocusable = false
+                importantForAccessibility = View.IMPORTANT_FOR_ACCESSIBILITY_NO
+                // 暖色而不是纯橙：橙在深色底上会明显偏色，琥珀色更接近「夜间模式」的观感。
+                setBackgroundColor(Color.argb((warmth * 0.55f).toInt().coerceIn(0, 140), 255, 176, 92))
+                addView(this, LayoutParams(-1, -1))
+            }.also { warmOverlay = it }
+            overlay.visibility = View.VISIBLE
         }
-        val overlay = warmOverlay ?: View(act).apply {
-            isClickable = false
-            isFocusable = false
-            importantForAccessibility = View.IMPORTANT_FOR_ACCESSIBILITY_NO
-            // 暖色而不是纯橙：橙在深色底上会明显偏色，琥珀色更接近「夜间模式」的观感。
-            setBackgroundColor(Color.argb((warmth * 0.55f).toInt().coerceIn(0, 140), 255, 176, 92))
-            addView(this, LayoutParams(-1, -1))
-        }.also { warmOverlay = it }
-        overlay.visibility = View.VISIBLE
     }
 
-    /** 阅读时保持常亮。只在阅读器存活期间生效，退出即恢复系统行为。 */
+    /**
+     * 阅读时保持常亮。只在阅读器存活期间生效，退出即恢复系统行为。
+     *
+     * 必须切到主线程：ReaderView 是在 IO 协程里构造的（工作台为不阻塞首帧把
+     * 加载挪到了后台），而 Window flag 的增删会触发视图层 requestLayout，
+     * 在后台线程调就直接 CalledFromWrongThreadException 崩溃——真机诊断抓到过。
+     */
     private fun applyKeepAwake() {
-        if (keepAwake) act.window.addFlags(android.view.WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
-        else act.window.clearFlags(android.view.WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+        val flag = android.view.WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON
+        act.runOnUiThread {
+            if (keepAwake) act.window.addFlags(flag)
+            else act.window.clearFlags(flag)
+        }
     }
 
     /**

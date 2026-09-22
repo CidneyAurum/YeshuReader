@@ -6,7 +6,8 @@ import android.graphics.BitmapFactory
 import android.graphics.Color
 import android.graphics.Matrix
 import android.graphics.pdf.PdfRenderer
-import android.media.ExifInterface
+// androidx 版的 ExifInterface：平台版在部分厂商 ROM 上解析行为不一致且已停止维护
+import androidx.exifinterface.media.ExifInterface
 import android.net.Uri
 import android.os.Handler
 import android.os.Looper

@@ -66,6 +66,7 @@ import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.SideEffect
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
@@ -480,7 +481,7 @@ private fun WorkbenchScreen(
     var snapshot by remember { mutableStateOf<WorkbenchSnapshot?>(null) }
     var loading by remember { mutableStateOf(true) }
     var error by remember { mutableStateOf<String?>(null) }
-    var reloadTick by remember { mutableStateOf(0) }
+    var reloadTick by remember { mutableIntStateOf(0) }
     var showAiIntro by remember { mutableStateOf(false) }
     LaunchedEffect(revision, reloadTick) {
         loading = true
@@ -997,12 +998,12 @@ private data class DetailContent(
 private fun NotesHubScreen(activity: MainActivity, revision: Int) {
     val db = remember { Db(activity) }
     val scope = rememberCoroutineScope()
-    var localRevision by remember { mutableStateOf(0) }
+    var localRevision by remember { mutableIntStateOf(0) }
     // 笔记、书目与 AI 成果在 IO 线程一次性读取后再交给界面：Room 开启了 allowMainThreadQueries，
     // 直接在组合阶段查询会让每次重组都在 UI 线程跑好几条查询。刷新期间保留上一次结果，避免闪白。
     var data by remember { mutableStateOf<NotesHubData?>(null) }
     var error by remember { mutableStateOf<String?>(null) }
-    var reloadTick by remember { mutableStateOf(0) }
+    var reloadTick by remember { mutableIntStateOf(0) }
     var detail by remember { mutableStateOf<DetailContent?>(null) }
     var pendingDelete by remember { mutableStateOf<Db.NoteDetail?>(null) }
     // 笔记多起来以后「按时间」很难复习同一本书：提供按书聚合的视图

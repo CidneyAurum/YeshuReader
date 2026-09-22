@@ -1045,11 +1045,15 @@ class ShelfView(private val act: Activity) : FrameLayout(act) {
                                         setPadding(Glass.dp(6, d), 0, 0, Glass.dp(5, d))
                                     }, LayoutParams(-1, -2).also { it.gravity = Gravity.BOTTOM })
                                     // 按压反馈
+                                    // 只做视觉反馈并放行事件（false）；UP 时补 performClick 供无障碍触发点击。
                                     setOnTouchListener { v, ev ->
                                         when (ev.actionMasked) {
                                             android.view.MotionEvent.ACTION_DOWN -> v.alpha = 0.75f
                                             android.view.MotionEvent.ACTION_UP,
-                                            android.view.MotionEvent.ACTION_CANCEL -> v.alpha = 1f
+                                            android.view.MotionEvent.ACTION_CANCEL -> {
+                                                v.alpha = 1f
+                                                v.performClick()
+                                            }
                                         }
                                         false
                                     }
@@ -1118,13 +1122,16 @@ class ShelfView(private val act: Activity) : FrameLayout(act) {
                 })
                 addView(IconView(act, "chevron", 16, pal.icon))
                 // 按压：轻微缩放反馈
+                // 只做视觉反馈并放行事件（false）；UP 时补 performClick 供无障碍触发点击。
                 setOnTouchListener { v, ev ->
                     when (ev.actionMasked) {
                         android.view.MotionEvent.ACTION_DOWN ->
                             v.animate().scaleX(0.98f).scaleY(0.98f).setDuration(T.durFast.toLong()).start()
                         android.view.MotionEvent.ACTION_UP,
-                        android.view.MotionEvent.ACTION_CANCEL ->
+                        android.view.MotionEvent.ACTION_CANCEL -> {
                             v.animate().scaleX(1f).scaleY(1f).setDuration(T.durNorm.toLong()).start()
+                            v.performClick()
+                        }
                     }
                     false
                 }
@@ -1321,7 +1328,7 @@ class ShelfView(private val act: Activity) : FrameLayout(act) {
                                 cornerRadius = (1.5f * d)
                                 setColor(T.accent)
                             },
-                            Gravity.LEFT, android.graphics.drawable.ClipDrawable.HORIZONTAL
+                            Gravity.START, android.graphics.drawable.ClipDrawable.HORIZONTAL
                         ).apply { level = (b.progress * 10000).toInt() }
                         val track = View(context).apply {
                             background = android.graphics.drawable.LayerDrawable(arrayOf(trackBg, trackFill))
@@ -1345,13 +1352,16 @@ class ShelfView(private val act: Activity) : FrameLayout(act) {
                     it.marginStart = Glass.dp(6, d)
                 })
                 // 按压：轻微缩放
+                // 只做视觉反馈并放行事件（false）；UP 时补 performClick 供无障碍触发点击。
                 setOnTouchListener { v, ev ->
                     when (ev.actionMasked) {
                         android.view.MotionEvent.ACTION_DOWN ->
                             v.animate().scaleX(0.97f).scaleY(0.97f).setDuration(T.durFast.toLong()).start()
                         android.view.MotionEvent.ACTION_UP,
-                        android.view.MotionEvent.ACTION_CANCEL ->
+                        android.view.MotionEvent.ACTION_CANCEL -> {
                             v.animate().scaleX(1f).scaleY(1f).setDuration(T.durNorm.toLong()).start()
+                            v.performClick()
+                        }
                     }
                     false
                 }
@@ -1508,7 +1518,7 @@ class ShelfView(private val act: Activity) : FrameLayout(act) {
                 addView(View(act).apply {
                     background = android.graphics.drawable.ClipDrawable(
                         GradientDrawable().apply { setColor(T.accent) },
-                        Gravity.LEFT, android.graphics.drawable.ClipDrawable.HORIZONTAL
+                        Gravity.START, android.graphics.drawable.ClipDrawable.HORIZONTAL
                     ).apply { level = (b.progress * 10000).toInt() }
                 }, LayoutParams(-1, (2.5f * d).toInt()).also {
                     it.gravity = Gravity.BOTTOM
@@ -1539,13 +1549,16 @@ class ShelfView(private val act: Activity) : FrameLayout(act) {
                 ellipsize = android.text.TextUtils.TruncateAt.END
             }, LinearLayout.LayoutParams(-2, -2).also { it.topMargin = Glass.dp(3, d) })
             // 按压：轻微缩放
+            // 只做视觉反馈并放行事件（false）；UP 时补 performClick 供无障碍触发点击。
             setOnTouchListener { v, ev ->
                 when (ev.actionMasked) {
                     android.view.MotionEvent.ACTION_DOWN ->
                         v.animate().scaleX(0.97f).scaleY(0.97f).setDuration(T.durFast.toLong()).start()
                     android.view.MotionEvent.ACTION_UP,
-                    android.view.MotionEvent.ACTION_CANCEL ->
+                    android.view.MotionEvent.ACTION_CANCEL -> {
                         v.animate().scaleX(1f).scaleY(1f).setDuration(T.durNorm.toLong()).start()
+                        v.performClick()
+                    }
                 }
                 false
             }

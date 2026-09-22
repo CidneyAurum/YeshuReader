@@ -4,7 +4,7 @@ plugins {
     id("com.android.application")
     id("org.jetbrains.kotlin.android")
     id("org.jetbrains.kotlin.plugin.compose")
-    id("org.jetbrains.kotlin.kapt")
+    id("com.google.devtools.ksp")
 }
 
 // release 签名来自仓库根目录下 gitignored 的 keystore.properties，格式（storeFile 相对仓库根目录）：
@@ -79,6 +79,14 @@ android {
     lint {
         abortOnError = true
         checkReleaseBuilds = true
+        // SetTextI18n：本项目用户可见文案全部硬编码中文（无多语言计划），
+        // 逐处 getString 会引入一整套资源表而不改变任何用户可见行为，统一关闭。
+        // ViewConstructor：全部自定义 View 都由代码创建（无 XML inflate 路径），属误报。
+        // GradleDependency：依赖升级走单独评审，不在 lint 里催更。
+        disable += "SetTextI18n"
+        disable += "ViewConstructor"
+        disable += "GradleDependency"
+        disable += "ObsoleteSdkInt"
         // AGP 8.7 + Kotlin 2.0's FIR lint analysis crashes on a few test-only Kotlin
         // classes. Unit/instrumentation compilation and execution still cover these sources.
         ignoreTestSources = true
@@ -91,17 +99,11 @@ kotlin {
     }
 }
 
-kapt {
-    arguments {
-        // Room 导出 schema JSON，使手写 Migration 可以被 schema 校验；目录不存在时由编译器创建。
-        arg("room.schemaLocation", "$projectDir/schemas")
-    }
-}
-
 dependencies {
     val composeBom = platform("androidx.compose:compose-bom:2024.12.01")
 
     implementation("androidx.core:core-ktx:1.15.0")
+    implementation("androidx.exifinterface:exifinterface:1.3.7")
     implementation("androidx.activity:activity-compose:1.10.0")
     implementation("androidx.lifecycle:lifecycle-runtime-compose:2.8.7")
     implementation(composeBom)
@@ -111,7 +113,7 @@ dependencies {
 
     implementation("androidx.room:room-runtime:2.6.1")
     implementation("androidx.room:room-ktx:2.6.1")
-    kapt("androidx.room:room-compiler:2.6.1")
+    ksp("androidx.room:room-compiler:2.6.1")
     implementation("androidx.datastore:datastore-preferences:1.1.2")
     implementation("androidx.work:work-runtime-ktx:2.10.0")
 

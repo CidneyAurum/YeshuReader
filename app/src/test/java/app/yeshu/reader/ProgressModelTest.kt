@@ -66,6 +66,31 @@ class ProgressModelTest {
     }
 
     @Test
+    fun `保存-恢复-再保存的循环不漂移`() {
+        // 一次往返精确相等只说明映射互逆；连续多轮往返不漂移才说明
+        // 「恢复后再保存」不会累积误差（D16：此前版本正是这里会漂）。
+        for (start in intArrayOf(0, 5, 250, 700, 999)) {
+            var index = start
+            repeat(10) {
+                val progress = ProgressModel.progressOf(index, 1000, fullyLoaded = true)
+                index = ProgressModel.indexForProgress(progress, 1000)
+            }
+            assertEquals("从 $start 出发 10 轮往返后漂移", start, index)
+        }
+    }
+
+    @Test
+    fun `未渲染完时的往返回到同一块或相邻块`() {
+        // 0.98 上限会让末段进度的逆运算偏一块以内——这是设计内的取舍，
+        // 断言放宽到 ±1，超出才算漂移。
+        for (start in intArrayOf(0, 100, 500, 900)) {
+            val progress = ProgressModel.progressOf(start, 1000, fullyLoaded = false)
+            val back = ProgressModel.indexForProgress(progress, 1000)
+            assertTrue("未渲染完的往返漂移超过 1 块：$start -> $back", kotlin.math.abs(back - start) <= 1)
+        }
+    }
+
+    @Test
     fun `逆运算对退化输入保持安全`() {
         assertEquals(0, ProgressModel.indexForProgress(0.5f, 0))
         assertEquals(0, ProgressModel.indexForProgress(0.5f, 1))
