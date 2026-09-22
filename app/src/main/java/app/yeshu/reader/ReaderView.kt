@@ -168,6 +168,11 @@ class ReaderView(
     /** 自动滚动的循环任务；非空表示正在自动滚动。 */
     private var autoScrollTask: Runnable? = null
     private var autoScrollSpeed = 2
+    /** 单线程后台执行器：进度写库顺序执行，避免并发写互相覆盖（滚动中每 1.5s 一次）。 */
+    private val ioExecutor = java.util.concurrent.Executors.newSingleThreadExecutor { r ->
+        Thread(r, "yeshu-progress").apply { isDaemon = true }
+    }
+
     /** 朗读语速倍率，跨会话保留。 */
     private var speechRate = 1f
 
@@ -1150,27 +1155,36 @@ class ReaderView(
         return ((chars.toFloat() / charsPerMinute) * 60f / 60f).toInt().coerceAtLeast(1)
     }
 
-    /**
-     * 用本次会话修正阅读速度。
-     *
-     * 只在会话足够长（≥1 分钟且滚过至少 3 块）时更新：太短的会话（翻一下就走）
-     * 会把速度估到离谱的数值，反过来污染「剩余时间」。
-     */
-    private fun learnReadingSpeed(elapsedMs: Long) {
-        val blocks = docBlocks ?: return
+    /** 一次速度采样：在主线程读取的全部输入，供后台线程消费。 */
+    private data class SpeedSample(val chars: Int, val elapsedMs: Long)
+
+    /** 主线程侧读取视图状态并计算字数；线程敏感的读取全部在这里完成。 */
+    private fun captureSpeedSample(elapsedMs: Long): SpeedSample? {
+        val blocks = docBlocks ?: return null
         val start = sessionStartBlock
         val end = currentBlockIndex()
         sessionStartBlock = end
-        if (start < 0 || end <= start || elapsedMs < 60_000L) return
+        if (start < 0 || end <= start || elapsedMs < 60_000L) return null
         val chars = (start until minOf(end, blocks.size)).sumOf { blocks[it].text.length }
-        if (chars < 300) return
-        val measured = (chars * 60_000.0 / elapsedMs).toInt()
+        if (chars < 300) return null
+        return SpeedSample(chars, elapsedMs)
+    }
+
+    /** 后台线程侧：只做纯计算与写库。 */
+    private fun applySpeedSample(sample: SpeedSample) {
+        val measured = (sample.chars * 60_000.0 / sample.elapsedMs).toInt()
         if (measured !in 80..2000) return
         // 指数平滑：单次会话波动很大，直接覆盖会让剩余时间忽长忽短。
         charsPerMinute = (charsPerMinute * 0.6f + measured * 0.4f).toInt().coerceIn(80, 2000)
         db.setSetting("reader_chars_per_min", charsPerMinute.toString())
     }
 
+    /**
+     * 用本次会话修正阅读速度。
+     *
+     * 只在会话足够长（≥1 分钟且滚过至少 3 块）时更新：太短的会话（翻一下就走）
+     * 会把速度估到离谱的数值，反过来污染「剩余时间」。
+     */
     /** 今日已读分钟数与目标，用于顶栏提示与达成提醒。 */
     private fun todayReadMinutes(): Int = (Db(act).todayReadMs() / 60_000L).toInt()
 
@@ -4692,8 +4706,14 @@ class ReaderView(
             fitsOnScreen = child.height <= sv.height,
             interacted = hasInteracted
         )
-        db.updateProgress(bookId, pr)
-        rememberPosition()
+        // 滚动回调发生在主线程：同步写库（updateProgress + setSetting 两次）在低端机上
+        // 足以让滚动掉帧。挪到后台线程；进度读取走内存/另一条路径，不受写入先后影响。
+        ioExecutor.execute {
+            runCatching {
+                db.updateProgress(bookId, pr)
+                rememberPosition()
+            }
+        }
     }
 
     /**
@@ -4823,9 +4843,14 @@ class ReaderView(
             capMs = READ_SESSION_CAP_MS
         )
         if (counted <= 0L) return
-        try { db.addReadTime(bookId, counted) } catch (e: Exception) {}
-        // 顺手用这次真实会话修正阅读速度，让「本章剩余时间」越用越准。
-        learnReadingSpeed(counted)
+        // 速度学习要读视图状态（docBlocks/当前块），必须在主线程先取好快照，
+        // 不能跟着写库一起进后台线程——那会与布局/滚动竞争。
+        val speedSample = captureSpeedSample(counted)
+        // 写库在后台：pauseReadSession 也可能从主线程（onStop）进来。
+        ioExecutor.execute {
+            try { db.addReadTime(bookId, counted) } catch (e: Exception) {}
+            speedSample?.let { applySpeedSample(it) }
+        }
     }
 
     /** 由宿主在 onStop 调用：退到后台时暂停计时并落库，避免用户在别处仍被计入阅读时长 */
@@ -4863,6 +4888,7 @@ class ReaderView(
         speech?.release()
         speech = null
         speechBar = null
+        ioExecutor.shutdownNow()
         // pauseReadSession 是幂等的：saveProgress + flushReadTime 各只生效一次
         pauseReadSession()
         super.onDetachedFromWindow()
