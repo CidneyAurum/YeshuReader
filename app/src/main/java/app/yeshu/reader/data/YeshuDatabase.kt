@@ -110,6 +110,10 @@ interface YeshuDao {
     @Query("SELECT * FROM books WHERE deleted_at=0 AND (title LIKE '%' || :query || '%' OR author LIKE '%' || :query || '%' OR tags LIKE '%' || :query || '%') ORDER BY last_read_at DESC, added_at DESC")
     fun searchBooks(query: String): List<LibraryItemEntity>
 
+    /** 全库搜索：在用户的划线、笔记与 AI 结果里找。正文全文索引需要解析全部文件，代价过大。 */
+    @Query("SELECT * FROM notes WHERE content LIKE '%' || :query || '%' ORDER BY created_at DESC LIMIT :limit")
+    fun searchNotes(query: String, limit: Int): List<NoteEntity>
+
     @Query("SELECT * FROM books WHERE id=:id AND deleted_at=0 LIMIT 1")
     fun getBook(id: Long): LibraryItemEntity?
 

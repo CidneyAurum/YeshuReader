@@ -260,6 +260,15 @@ class Db(context: Context) {
         (if (folderId < 0) dao.listBooks() else dao.listBooks(folderId)).map { it.toModel() }
 
     fun searchBooks(q: String): List<Book> = dao.searchBooks(q.trim()).map { it.toModel() }
+
+    /**
+     * 在划线、笔记与 AI 结果里搜索。
+     *
+     * 不做全书正文索引：那需要把每本书都解析并建索引，代价远超收益。
+     * 界面上会明确写出搜索范围，避免用户以为「搜不到 = 书里没有」。
+     */
+    fun searchNotes(q: String, limit: Int = 60): List<NoteDetail> =
+        dao.searchNotes(q.trim(), limit).map { it.toDetail() }
     fun getBook(id: Long): Book? = dao.getBook(id)?.toModel()
 
     fun updateProgress(id: Long, progress: Float) {

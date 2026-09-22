@@ -1364,6 +1364,76 @@ class ShelfView(private val act: Activity) : FrameLayout(act) {
             if (multiMode) cardView = wrapSelectable(card, b.id)
             listBox.addView(cardView, cp)
         }
+
+        // 搜索时再给一段「划线与笔记」：书名搜不到不代表内容里没有。
+        // 不做全书正文索引（代价过大），所以这里明确写出搜索范围。
+        if (searching) appendNoteSearchResults(query.orEmpty(), d)
+    }
+
+    /**
+     * 全库搜索的第二段：在用户的划线、笔记与 AI 结果里找。
+     *
+     * 只搜用户自己产生的内容，不解析书籍原文——那需要把每本书都过一遍并建索引。
+     * 文案里写明范围，避免「搜不到 = 书里没有」的误解。
+     */
+    private fun appendNoteSearchResults(query: String, d: Float) {
+        if (query.isBlank()) return
+        val matches = runCatching { db.searchNotes(query) }.getOrDefault(emptyList())
+        if (matches.isEmpty()) return
+        val titles = runCatching { db.listBooks().associate { it.id to it.title } }.getOrDefault(emptyMap())
+
+        listBox.addView(sectionLabel("划线与笔记 · ${matches.size}", d))
+        val card = LinearLayout(act).apply {
+            orientation = LinearLayout.VERTICAL
+            background = GradientDrawable().apply {
+                cornerRadius = Glass.dp(T.rCard, d).toFloat(); setColor(pal.surface)
+            }
+            setPadding(Glass.dp(14, d), Glass.dp(6, d), Glass.dp(14, d), Glass.dp(6, d))
+        }
+        matches.take(20).forEach { note ->
+            card.addView(TextView(act).apply {
+                text = buildString {
+                    append(NoteKindLabels.label(note.kind))
+                    titles[note.bookId]?.let { append(" · ").append(it.take(16)) }
+                }
+                textSize = 11f
+                setTextColor(pal.textS)
+                setPadding(0, Glass.dp(10, d), 0, 0)
+            })
+            card.addView(TextView(act).apply {
+                text = note.content.replace('\n', ' ').take(90)
+                textSize = 14f
+                setTextColor(pal.textP)
+                background = Glass.pillBg(if (pal.dark) Color.argb(45, 255, 255, 255) else Color.argb(24, 23, 26, 43))
+                foreground = Glass.pressFx()
+                isClickable = true
+                minHeight = Glass.dp(44, d)
+                gravity = Gravity.CENTER_VERTICAL
+                setPadding(Glass.dp(10, d), Glass.dp(8, d), Glass.dp(10, d), Glass.dp(8, d))
+                contentDescription = "打开笔记：${note.content.take(20)}"
+                setOnClickListener {
+                    if (note.bookId > 0) (act as MainActivity).openReader(note.bookId, note.anchor) else (act as MainActivity).showNotes(0)
+                }
+            }, LinearLayout.LayoutParams(-1, -2).also { it.topMargin = Glass.dp(4, d) })
+        }
+        if (matches.size > 20) {
+            card.addView(TextView(act).apply {
+                text = "还有 ${matches.size - 20} 条未显示，输入更具体的关键词可以缩小范围"
+                textSize = 11f
+                setTextColor(pal.textS)
+                setPadding(0, Glass.dp(8, d), 0, Glass.dp(4, d))
+            })
+        }
+        listBox.addView(card, LinearLayout.LayoutParams(-1, -2).also { it.topMargin = Glass.dp(12, d) })
+    }
+
+    /** 分节小标题。 */
+    private fun sectionLabel(text: String, d: Float): TextView = TextView(act).apply {
+        this.text = text
+        textSize = 13f
+        setTextColor(pal.textS)
+        setTypeface(null, Typeface.BOLD)
+        setPadding(0, Glass.dp(16, d), 0, Glass.dp(4, d))
     }
 
     /** 多选包装：左上角勾选圈，点击切换选中 */

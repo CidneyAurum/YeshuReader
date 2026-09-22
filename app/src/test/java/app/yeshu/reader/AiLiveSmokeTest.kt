@@ -43,6 +43,31 @@ class AiLiveSmokeTest {
 
     private fun config(key: String = apiKey) = AiClient.Config(baseUrl = baseUrl, key = key, model = model)
 
+    /**
+     * 网络不可达时跳过而不是失败。
+     *
+     * 实况测试依赖真实服务商，DNS 不通、连不上、超时都属于「这次没法测」，
+     * 不该让离线测试套件变红——那会掩盖真正的回归。凭据被拒（401/403）同理：
+     * Key 可能已按安全建议轮换过。
+     */
+    private fun skipIfUnavailable(error: Throwable): Nothing {
+        val transient = error is java.net.UnknownHostException ||
+            error is java.net.ConnectException ||
+            error is java.net.SocketTimeoutException ||
+            error is java.net.NoRouteToHostException ||
+            (error.message?.let { it.contains("401") || it.contains("403") } == true)
+        assumeTrue("服务商当前不可达，跳过实况测试：${error.message}", !transient)
+        throw error
+    }
+
+    /** 包一层：把「连不上/被拒」转成跳过，其余异常照旧失败。 */
+    private inline fun <T> live(block: () -> T): T = try {
+        block()
+    } catch (error: Throwable) {
+        skipIfUnavailable(error)
+    }
+
+
     @Test
     fun `端点归一化指向 chat completions`() {
         assertEquals("$baseUrl/chat/completions", AiClient.chatCompletionsEndpoint(baseUrl))
@@ -51,26 +76,26 @@ class AiLiveSmokeTest {
     @Test
     fun `采样参数被真实网关接受`() {
         // 学习包依赖低温度 + 明确长度上限；网关拒绝这两个参数时必须能降级而不是直接失败。
-        val answer = AiClient.chat(
+        val answer = live { AiClient.chat(
             config(),
             system = "你是测试助手。",
             user = "只回复两个字：可用",
             temperature = 0.2,
             maxTokens = 64,
-        )
+        ) }
         assertTrue("回答为空", answer.isNotBlank())
     }
 
     @Test
     fun `json 模式被真实网关接受`() {
-        val answer = AiClient.chat(
+        val answer = live { AiClient.chat(
             config(),
             system = "你是 JSON 生成器。只输出 JSON，不要解释。",
             user = """输出 {"ok":true} 这个对象""",
             temperature = 0.0,
             maxTokens = 200,
             jsonMode = true,
-        )
+        ) }
         val text = answer.trim()
         assertTrue("返回内容不是 JSON：${text.take(120)}", text.startsWith("{"))
     }
@@ -78,7 +103,7 @@ class AiLiveSmokeTest {
     @Test
     fun `探测接口报告模型与延迟`() {
         // probe 在失败时抛错，成功时返回结构化结果。
-        val probe = AiClient.probe(config())
+        val probe = live { AiClient.probe(config()) }
         assertTrue("未报告模型名", probe.model.isNotBlank())
         assertTrue("延迟未测量", probe.latencyMs >= 0)
         assertTrue("描述信息不完整：${probe.describe()}", probe.describe().contains(probe.model))
@@ -88,7 +113,7 @@ class AiLiveSmokeTest {
     @Test
     fun `用量统计被解析出来`() {
         val usage = java.util.concurrent.atomic.AtomicReference<AiClient.TokenUsage?>()
-        AiClient.chat(config(), system = "你是测试助手。", user = "只回复两个字：可用", onUsage = { usage.set(it) })
+        live { AiClient.chat(config(), system = "你是测试助手。", user = "只回复两个字：可用", onUsage = { usage.set(it) }) }
         val tokens = usage.get()
         assertNotNull("没有回调用量信息", tokens)
         assertTrue("未解析出输入 tokens", tokens!!.promptTokens > 0)
@@ -96,7 +121,7 @@ class AiLiveSmokeTest {
 
     @Test
     fun `实况流式对话能拿到完整回答`() {
-        val answer = AiClient.chat(config(), "你是测试助手。", "只回复两个字：可用")
+        val answer = live { AiClient.chat(config(), "你是测试助手。", "只回复两个字：可用") }
         assertTrue("回答为空", answer.isNotBlank())
     }
 
@@ -104,7 +129,7 @@ class AiLiveSmokeTest {
     fun `流式增量累加结果与最终返回一致`() {
         // 服务端会在结尾多发一个 choices 为空数组的块，解析器必须能跳过它而不中断。
         val chunks = mutableListOf<String>()
-        val answer = AiClient.chat(config(), "你是测试助手。", "从 1 数到 5，用逗号分隔，不要其他内容", onDelta = { chunks.add(it) })
+        val answer = live { AiClient.chat(config(), "你是测试助手。", "从 1 数到 5，用逗号分隔，不要其他内容", onDelta = { chunks.add(it) }) }
         assertTrue("没有收到任何流式增量", chunks.isNotEmpty())
         assertEquals("流式增量拼接结果与返回值不一致", answer, chunks.joinToString(""))
         assertTrue("回答里应当包含数字", answer.contains("1") && answer.contains("5"))
