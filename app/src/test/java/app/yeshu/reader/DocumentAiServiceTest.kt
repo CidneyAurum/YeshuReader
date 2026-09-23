@@ -123,6 +123,42 @@ class DocumentAiServiceTest {
         assertEquals(listOf("- 没有来源的结论"), rejected.uncitedConclusionLines)
     }
 
+    @Test
+    fun `摘要不受理解包六段格式约束`() {
+        // 真机实测：摘要输出完全正常（一句话概括 + 要点），却被判「缺少分层摘要/目录大纲/
+        // 关键概念/核心结论/闪卡/测验」六个段落——因为校验不区分任务种类。
+        // 摘要天生不会产出闪卡与测验，这类误判会让用户以为功能坏了。
+        val context = anchoredContext(DocumentAnchor(AnchorType.PARAGRAPH, 1, "段落 1"))
+        val summary = """
+            这份资料讲的是排期与重构 [PARAGRAPH:1]。
+            - 先定排期 [PARAGRAPH:1]
+            - 再谈重构 [PARAGRAPH:1]
+        """.trimIndent()
+
+        val validated = DocumentAiService.validateModelOutput(summary, context, DocumentAiService.KIND_SUMMARY)
+        assertTrue("摘要不该被六段格式判失败", validated.isAcceptable)
+        assertTrue("段落缺失列表应为空", validated.missingSections.isEmpty())
+    }
+
+    @Test
+    fun `非理解包仍然核对引用是否真实存在`() {
+        // 放宽段落检查不等于放弃引用校验：编造锚点必须被识别。
+        val context = anchoredContext(DocumentAnchor(AnchorType.PARAGRAPH, 1, "段落 1"))
+        val fabricated = "结论见 [PARAGRAPH:99]"
+        val validated = DocumentAiService.validateModelOutput(fabricated, context, DocumentAiService.KIND_SUMMARY)
+        assertTrue("不存在的锚点应被标为无效", validated.citations.invalid.isNotEmpty())
+    }
+
+    @Test
+    fun `理解包仍然要求六段齐全`() {
+        // 分派不能把理解包的检查一起放宽掉。
+        val context = anchoredContext(DocumentAnchor(AnchorType.PARAGRAPH, 1, "段落 1"))
+        val partial = "## 分层摘要\n摘要 [PARAGRAPH:1]"
+        val validated = DocumentAiService.validateModelOutput(partial, context, DocumentAiService.KIND_STUDY_PACK)
+        assertFalse("理解包缺段落应判失败", validated.isAcceptable)
+        assertTrue(validated.missingSections.isNotEmpty())
+    }
+
     private fun parsedDoc(format: String, vararg blocks: Block) = ParsedDoc(
         format = format,
         blocks = blocks.toList(),

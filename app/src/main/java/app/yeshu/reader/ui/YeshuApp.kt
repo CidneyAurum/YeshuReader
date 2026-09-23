@@ -390,6 +390,9 @@ private fun DocumentWorkbenchScreen(
                             DocumentTool("AI", "理解包、问答与自测", ActiveViolet) { reader?.openAiWorkbench() }
                             DocumentTool("笔记", "批注与 AI 结果", Color(0xFFFF8A65)) { onNavigate(Destination.BookNotes(bookId)) }
                             // 宽屏侧栏原先没有聊天入口，聊天只在窄屏可用
+                            // 底栏「更多」在宽屏被侧栏取代；本地工具（亮度/划的重点/文件信息）
+                            // 必须在这里有入口，否则平板上完全够不到。
+                            DocumentTool("更多", "亮度 · 划的重点 · 文件信息", LuminousCyan) { reader?.openMoreActions() }
                             DocumentTool("AI 问答", "带着当前章上下文聊天", ElectricBlue) {
                                 onNavigate(Destination.Chat(bookId, ""))
                             }

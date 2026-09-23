@@ -199,6 +199,49 @@ class IconView(
                 c.drawLine(s(6f), s(6f), s(18f), s(18f), stroke)
                 c.drawLine(s(18f), s(6f), s(6f), s(18f), stroke)
             }
+            "chat" -> { // 对话气泡：圆角矩形 + 左下小尾巴
+                c.drawRoundRect(s(3.5f), s(4.5f), s(20.5f), s(16f), s(3.5f), s(3.5f), stroke)
+                scratchPath.rewind()
+                scratchPath.moveTo(s(8f), s(16f))
+                scratchPath.lineTo(s(8f), s(20f))
+                scratchPath.lineTo(s(12.5f), s(16f))
+                c.drawPath(scratchPath, stroke)
+                c.drawLine(s(8f), s(8.5f), s(16f), s(8.5f), stroke)
+                c.drawLine(s(8f), s(12f), s(13.5f), s(12f), stroke)
+            }
+            "history" -> { // 回溯箭头：环形 + 逆时针箭头，表示「前情」
+                scratchPath.rewind()
+                scratchPath.addArc(
+                    android.graphics.RectF(s(4f), s(4f), s(20f), s(20f)), -60f, 300f
+                )
+                c.drawPath(scratchPath, stroke)
+                // 箭头指向起点，明确「往回」的方向
+                c.drawLine(s(4f), s(4.5f), s(4f), s(9.5f), stroke)
+                c.drawLine(s(4f), s(9.5f), s(9f), s(9.5f), stroke)
+                // 中心指针：强调「当前时刻」
+                c.drawLine(s(12f), s(12f), s(12f), s(8f), stroke)
+            }
+            "question" -> { // 问号：弧线 + 竖笔 + 点，用于「问答」
+                scratchPath.rewind()
+                scratchPath.moveTo(s(9f), s(9.5f))
+                scratchPath.cubicTo(s(9f), s(6f), s(15f), s(6f), s(15f), s(9.5f))
+                scratchPath.cubicTo(s(15f), s(12f), s(12f), s(12.5f), s(12f), s(15f))
+                c.drawPath(scratchPath, stroke)
+                c.drawCircle(s(12f), s(18.5f), s(1.1f), fill)
+            }
+            "sparkle" -> { // 四角星：AI 生成类动作的通用标记
+                scratchPath.rewind()
+                scratchPath.moveTo(s(12f), s(3.5f))
+                scratchPath.lineTo(s(14f), s(10f))
+                scratchPath.lineTo(s(20.5f), s(12f))
+                scratchPath.lineTo(s(14f), s(14f))
+                scratchPath.lineTo(s(12f), s(20.5f))
+                scratchPath.lineTo(s(10f), s(14f))
+                scratchPath.lineTo(s(3.5f), s(12f))
+                scratchPath.lineTo(s(10f), s(10f))
+                scratchPath.close()
+                c.drawPath(scratchPath, fill)
+            }
             "sort" -> { // 上下双向箭头
                 c.drawLine(s(8f), s(19f), s(8f), s(5f), stroke)
                 c.drawLine(s(5f), s(8f), s(8f), s(5f), stroke)

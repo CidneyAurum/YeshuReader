@@ -204,12 +204,19 @@ class DocumentAiService(
         maxContextChars: Int = DEFAULT_CONTEXT_CHARS,
         promptVersion: Int = PROMPT_VERSION,
         query: String? = null,
-        outputLanguage: String? = null
+        outputLanguage: String? = null,
+        /**
+         * 任务种类。此前这里写死 KIND_STUDY_PACK，导致摘要/问答/出题只能绕过本类
+         * 直接用 AiClient.chat——于是它们没有缓存（每次点都真实计费）、
+         * 没有锚点抽样（只取前 24k 字，长文档后半段完全没读）、也没有引用锚点。
+         * 统一走这里之后，四种任务共享同一套缓存/抽样/引用/校验。
+         */
+        kind: String = KIND_STUDY_PACK,
     ): Preparation = prepareTask(
         item = item,
         file = file,
         config = config,
-        kind = KIND_STUDY_PACK,
+        kind = kind,
         query = query,
         maxContextChars = maxContextChars,
         promptVersion = promptVersion,
@@ -366,7 +373,7 @@ class DocumentAiService(
         modelOutput: String,
         usage: AiClient.TokenUsage? = null
     ): AiArtifact {
-        val validated = validateModelOutput(modelOutput, request.context)
+        val validated = validateModelOutput(modelOutput, request.context, request.kind)
         if (!validated.isAcceptable) {
             throw InvalidModelOutputException(validationMessage(validated), validated)
         }
@@ -953,8 +960,33 @@ class DocumentAiService(
 
         /** Pure structural and citation validation for a model response. */
         @JvmStatic
-        fun validateModelOutput(text: String, context: AnchoredContext): ValidatedOutput {
+        /**
+         * 校验模型输出。
+         *
+         * **六段格式只属于理解包**：摘要/问答/出题天生不会产出「闪卡」「测验」段落。
+         * 此前这个函数不区分 kind，一律按六段格式检查，于是统一走本类的摘要任务
+         * 必然被判「校验未通过」——真机上实测到的现象就是：模型回答完全正常，
+         * 界面却报缺六个段落，用户只能「仍要保存」。
+         *
+         * 现在按 kind 分派：只有理解包检查段落完整性，其余任务只做
+         * 所有任务都该遵守的引用校验（引用必须指向真实存在的锚点）。
+         */
+        fun validateModelOutput(
+            text: String,
+            context: AnchoredContext,
+            kind: String = KIND_STUDY_PACK,
+        ): ValidatedOutput {
             val content = text.trim()
+            if (kind != KIND_STUDY_PACK) {
+                // 非理解包：不做段落完整性检查，但引用仍然要核对。
+                return ValidatedOutput(
+                    content = content,
+                    citations = validateCitations(content, context),
+                    missingSections = emptyList(),
+                    uncitedConclusionLines = emptyList(),
+                    sectionReport = emptyList(),
+                )
+            }
             val bodies = sectionBodies(content)
             val missing = REQUIRED_SECTIONS.filterNot { bodies.containsKey(it) }
             val report = REQUIRED_SECTIONS.map { section -> sectionReportFor(section, bodies[section], context) }

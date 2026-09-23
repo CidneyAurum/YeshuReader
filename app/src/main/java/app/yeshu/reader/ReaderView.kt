@@ -2346,6 +2346,15 @@ class ReaderView(
         val icon: String,
         val label: String,
         val description: String,
+        /**
+         * 与 ai_artifacts.kind 对应。
+         *
+         * 有了它才能回答「这个动作我是不是已经做过了」——此前只有理解包能查看历史结果，
+         * 其余动作重复点击会重复调用模型、重复计费，而界面完全看不出来。
+         */
+        val kind: String,
+        /** 相对代价档位，直接标在菜单里，让用户一眼看出点哪个更省。 */
+        val cost: String,
         val run: () -> Unit
     )
 
@@ -2354,6 +2363,13 @@ class ReaderView(
      *
      * 用户在看到菜单时就要知道「会发多少、发去哪」，而不是点进去才从确认框里发现。
      * token 用「字符数 / 2」粗估并明确标注「估算」——本地无法知道服务商真实分词。
+     */
+    /**
+     * 本次会发送多少、发去哪。
+     *
+     * 数量按**实际会读的正文**估算：此前这里一律写 `MAX_CONTEXT_CHARS`（12 万字符），
+     * 而短文档、PDF、图片集都会远小于它，用户看到「6 万 token」会以为很贵而不敢点。
+     * 每行还各自标了代价档位（省 / 中 / 高），所以这里只说总口径。
      */
     private fun aiSendEstimate(): String {
         val host = providerHost()
@@ -2365,26 +2381,45 @@ class ReaderView(
             isImageFormat(bookFormat) || isImageArchive(bookFormat) ->
                 "发往 $host · 发送当前图片 · 费用由服务商收取"
             else -> {
-                val chars = min(docFullText.length, DocumentAiService.MAX_CONTEXT_CHARS)
-                "发往 $host · 约 $chars 字符 ≈ ${chars / 2} token（估算）· 费用由服务商收取"
+                val readable = docFullText.length
+                val chars = min(readable, DocumentAiService.MAX_CONTEXT_CHARS)
+                val sample = if (readable > chars) "（全文 $readable 字符，按锚点抽样 $chars）" else ""
+                "发往 $host · 最多约 $chars 字符 ≈ ${chars / 2} token$sample · 费用由服务商收取"
             }
         }
     }
 
-    private fun aiActions(): List<AiAction> = listOf(
-        AiAction("study_pack", "book", "生成理解包", "摘要 + 大纲 + 概念 + 卡片 + 自测，最全面") {
+    /**
+     * 主推动作与其余动作分开定义。
+     *
+     * 「生成理解包」是绝大多数人真正想要的（一次拿到摘要+大纲+概念+卡片+自测），
+     * 它单独做成一整块主卡片；其余动作按「快速」与「互动」两组排列。
+     * 图标语义也一并修正：此前「和书聊聊」与「节选问答」共用放大镜、
+     * 「前情提要」用的是导航箭头，用户只能靠读文字区分。
+     */
+    private fun primaryAiAction(): AiAction =
+        AiAction("study_pack", "sparkle", "生成理解包", "摘要 + 大纲 + 概念 + 卡片 + 自测，一次到位", DocumentAiService.KIND_STUDY_PACK, "高") {
             studyPackAction()
-        },
-        AiAction("summary", "note", "快速摘要", "只读开头部分，比理解包快且省；不含大纲与自测") {
+        }
+
+    private fun quickAiActions(): List<AiAction> = listOf(
+        AiAction("summary", "note", "摘要", "全文锚点抽样，输出更短；适合先看个大概", DocumentAiService.KIND_SUMMARY, "中") {
             aiSummary()
         },
-        AiAction("recap", "chevron", "前情提要", "把当前章之前的内容浓缩成一段回顾，含人物与概念") {
+        AiAction("recap", "history", "前情提要", "把当前章之前的内容浓缩成一段回顾", DocumentAiService.KIND_RECAP, "中") {
             recapAction()
         },
-        AiAction("chat", "search", "和书聊聊", "带着当前章上下文自由提问") { openChat() },
-        AiAction("ask", "search", "节选问答", "就一个具体问题在选定范围内找答案") { askAction() },
-        AiAction("quiz", "check", "出题自测", "生成 5 道题，作答后由 AI 批改评分") { quizAction() }
     )
+
+    private fun interactiveAiActions(): List<AiAction> = listOf(
+        AiAction("chat", "chat", "和书聊聊", "多轮对话，历史会保留", "chat", "中") { openChat() },
+        AiAction("ask", "question", "问一个问题", "一次性提问，结果存进笔记；不走多轮对话", DocumentAiService.KIND_QA, "中") { askAction() },
+        AiAction("quiz", "check", "出题自测", "生成 5 道题，作答后由 AI 批改评分", DocumentAiService.KIND_QUIZ, "高") { quizAction() },
+    )
+
+    /** 兼容旧调用点：合并成一份有序列表。 */
+    private fun aiActions(): List<AiAction> =
+        listOf(primaryAiAction()) + quickAiActions() + interactiveAiActions()
 
     /**
      * AI 助手入口：分组 + 图标 + 一行说明的底部弹层。
@@ -2396,48 +2431,110 @@ class ReaderView(
      */
     private fun showAiMenu() {
         val sheet = BottomSheet(act, "AI 助手")
-        val actions = aiActions()
-        // 记住上次用过的动作：重复使用同一个功能不必每次在 6 项里找
-        db.getSetting(AI_LAST_ACTION_KEY)?.let { last ->
-            actions.firstOrNull { it.key == last }?.let { action ->
-                sheet.section("上次使用")
-                sheet.item("chevron", "重复上次：${action.label}", action.description) {
+
+        // 未配置服务商时，列出 6 个点了都会弹「未配置」的动作毫无意义，
+        // 而且信息条会渲染成「发往 ·」这种病句。这里直接给出唯一有用的下一步。
+        val config = AiClient.config(db)
+        if (!AiClient.isReady(config)) {
+            sheet.info("还没有配置 AI 服务：下面这些动作都需要它才能使用。")
+            sheet.primary("sliders", "配置 AI 服务", "填写接口地址、Key 与模型名；AI 为自带 Key，内容只发往你指定的服务商") {
+                (act as MainActivity).showSettings()
+            }
+            // 这几条是能力预告，点了同样去配置——比做成不可点的死行更有用。
+            sheet.section("配置后可以做什么")
+            sheet.item("sparkle", "生成理解包", "摘要 + 大纲 + 概念 + 卡片 + 自测，一次到位") { (act as MainActivity).showSettings() }
+            sheet.item("chat", "和书聊聊", "带着当前章上下文自由提问") { (act as MainActivity).showSettings() }
+            sheet.item("check", "出题自测", "生成 5 道题并批改评分") { (act as MainActivity).showSettings() }
+            sheet.section("不需要 AI 的功能")
+            sheet.item("more", "搜索 · 目录 · 书签 · 阅读设置", "都在「更多」里，现在就能用") { showMoreActions() }
+            sheet.show()
+            return
+        }
+
+        val lastKey = db.getSetting(AI_LAST_ACTION_KEY)
+        val primary = primaryAiAction()
+        val quick = quickAiActions()
+        val interactive = interactiveAiActions()
+
+        // 上次用过的动作直接在对应条目上打「上次」徽标，不再单开一段重复整条动作。
+        fun badgeFor(key: String): String? = if (key == lastKey) "上次" else null
+
+        // 发送范围只说明一次：此前它作为每个分组的副标题重复出现，
+        // 同一句话占掉四行，把真正要点的动作挤到了屏幕外。
+        sheet.info(aiSendEstimate())
+
+        // 已生成的产物按 kind 索引：每个动作都能知道自己有没有现成结果，
+        // 而不是只有理解包能「查看」。不知道已有结果 = 重复生成 = 重复付费。
+        val existingByKind = runCatching { db.listArtifacts(bookId).associateBy { it.kind } }
+            .getOrDefault(emptyMap())
+
+        /** 代价档位拼在说明末尾：同一屏里能直接横向比较，不必逐条读。 */
+        fun costed(action: AiAction): String = "${action.description} · 代价${action.cost}"
+
+        fun addAction(action: AiAction, asPrimary: Boolean) {
+            val existing = existingByKind[action.kind]
+            if (existing != null && !asPrimary) {
+                // 有现成结果：先给「查看」，重新生成降为次级动作。
+                sheet.item(action.icon, "查看${action.label}", "上次的结果，回看不产生费用", badge = "已生成") {
+                    showArtifactContent(action.label, existing.content)
+                }
+                sheet.item(action.icon, "重新生成${action.label}", "覆盖上一次的结果 · 代价${action.cost}", badge = badgeFor(action.key)) {
+                    db.setSetting(AI_LAST_ACTION_KEY, action.key)
+                    action.run()
+                }
+                return
+            }
+            val label = if (existing != null) "查看理解包" else action.label
+            val description = if (existing != null) "上次生成的内容，可直接回看；需要更新时再重新生成" else costed(action)
+            val badge = if (existing != null) "已生成" else if (asPrimary) "推荐" else badgeFor(action.key)
+            if (asPrimary) {
+                sheet.primary(action.icon, label, description, badge = badge) {
+                    if (existing != null) showArtifactContent(action.label, existing.content)
+                    else {
+                        db.setSetting(AI_LAST_ACTION_KEY, action.key)
+                        action.run()
+                    }
+                }
+            } else {
+                sheet.item(action.icon, label, description, badge = badge) {
                     db.setSetting(AI_LAST_ACTION_KEY, action.key)
                     action.run()
                 }
             }
         }
-        sheet.section("本地 · 不联网", "这些动作只在本机完成，不发送任何内容")
-        sheet.item("search", "书内搜索", "在当前文档里查找词句，支持上一处/下一处") { searchInBook() }
-        if (docBlocks?.isNotEmpty() == true) {
-            sheet.item("list", "目录", "跳到章节或页码，每章标注全书进度") { listToc() }
-        }
-        val marked = currentAnchor().let { it.isNotBlank() && it in bookmarkAnchors }
-        sheet.item(
-            "book",
-            if (marked) "取消当前位置书签" else "收藏当前位置",
-            if (marked) "移除这一处的书签" else "把当前位置记进书签，长按底栏书签可回看"
-        ) { toggleBookmark() }
-        sheet.item("note", "我划的重点", "回看并跳转到划过的段落，可按颜色筛选") { showHighlightList() }
-        sheet.item("sliders", "阅读设置", "主题 / 行距 / 页边距 / 字号 / 亮度") { showReaderSettings() }
-        sheet.item("folder", "文件信息", "格式 / 大小 / 导入时间 / 内容指纹") { showFileInfo() }
 
-        sheet.section("理解与梳理", aiSendEstimate())
-        actions.take(3).forEach { action ->
-            sheet.item(action.icon, action.label, action.description) {
-                db.setSetting(AI_LAST_ACTION_KEY, action.key)
-                action.run()
-            }
+        addAction(primary, asPrimary = true)
+
+        sheet.section("快速过一遍")
+        quick.forEach { action ->
+            // 「前情提要」依赖章节结构；没有章节的文档点了只会得到一句「无法定位」，
+            // 与其让用户点空，不如不列出来。
+            if (action.kind == DocumentAiService.KIND_RECAP && tocHeads.isEmpty()) return@forEach
+            addAction(action, asPrimary = false)
         }
 
-        sheet.section("互动", aiSendEstimate())
-        actions.drop(3).forEach { action ->
-            sheet.item(action.icon, action.label, action.description) {
-                db.setSetting(AI_LAST_ACTION_KEY, action.key)
-                action.run()
-            }
-        }
+        sheet.section("和这本书互动")
+        interactive.forEach { addAction(it, asPrimary = false) }
+
+        // 本地工具不混进 AI 菜单：用户点「AI」时看到的是搜索/目录/收藏，
+        // 既分不清哪些会联网，也让真正想用的 AI 动作沉在下面。这里只留一句指路。
+        sheet.section("本地工具")
+        sheet.item("more", "搜索 · 目录 · 书签 · 阅读设置", "都在「更多」里，不联网、不产生费用") { showMoreActions() }
         sheet.show()
+    }
+
+    /**
+     * 展示已生成的 AI 产物。
+     *
+     * 此前产物只能在生成时的那次对话框里看到，关掉就找不回来——用户会以为
+     * 「生成过一次就不能再看」，于是重复生成、重复付费。
+     */
+    private fun showArtifactContent(title: String, content: String) {
+        if (content.isBlank()) {
+            showResult(title, "这份结果没有内容，可以重新生成一次。")
+            return
+        }
+        showResult(title, content)
     }
 
     /** R39：当前文件的客观信息。内容指纹只是去重用的哈希前缀，不是秘密。 */
@@ -2467,6 +2564,9 @@ class ReaderView(
     fun openTableOfContents() = listToc()
 
     fun openAiWorkbench() = showAiMenu()
+
+    /** 宽屏侧栏没有底栏「更多」格，必须单独暴露，否则亮度/划的重点在平板上不可达。 */
+    fun openMoreActions() = showMoreActions()
 
     /** A source-addressable, cached package: summary, outline, concepts, findings, flashcards and quiz. */
     private fun studyPackAction(cfgOverride: AiClient.Config? = null) {
@@ -2520,6 +2620,93 @@ class ReaderView(
         }
     }
 
+    /**
+     * 文本类 AI 任务的**统一入口**。
+     *
+     * 此前摘要/问答/出题绕过 DocumentAiService 直接调 AiClient.chat，代价是：
+     *  - 没有缓存：同一份文档同一问题重复点击，每次都真实计费；
+     *  - 只读前 24k 字（`take(24000)`）：一本十万字的书，后半部分从未被读过，
+     *    而「快速摘要」的菜单文案却写着「只读开头部分」——这不是取舍，是功能缺失；
+     *  - 没有引用锚点：结果里的 [CHAPTER:x] 无从产生，用户点不回去；
+     *  - 没有输出校验与引用修复。
+     *
+     * 统一走这里之后，四种文本任务共享同一套缓存 / 锚点抽样 / 引用 / 校验，
+     * 并且 PreparedRequest 算好的采样参数（温度、长度上限、JSON 模式）真正生效
+     * ——此前它们被算出来却从未传给 AiClient。
+     */
+    private fun runTextTask(
+        kind: String,
+        title: String,
+        cfg: AiClient.Config,
+        query: String? = null,
+        /** 落笔记用的 kind；为 null 表示由调用方自己负责保存。 */
+        persistKind: String? = kind,
+        onGenerated: ((String) -> Unit)? = null,
+        onRetry: ((AiClient.Config) -> Unit)? = null,
+    ) {
+        val item = db.getBook(bookId) ?: return
+        val file = File(act.filesDir, item.fileName)
+        if (!file.isFile) {
+            showResult("提示", "找不到原始文件，无法读取正文。")
+            return
+        }
+        val service = DocumentAiService(db)
+        var validation: String? = null
+        var generated = false
+        val scope = "范围：全文锚点抽样，最多 ${DocumentAiService.MAX_CONTEXT_CHARS / 1000}k 字符" +
+            if (docFullText.isNotBlank()) "（本文 ${formatChars(docFullText.length)} 字符）" else ""
+        runAiStream(
+            kind = persistKind,
+            title = title,
+            cfg = cfg,
+            scopeLine = scope,
+            validate = { validation },
+            onKeep = { text -> onGenerated?.invoke(text) },
+            onDone = { text -> if (generated) onGenerated?.invoke(text) },
+            onRetry = onRetry,
+        ) { onDelta, onReason, onRestart, onCached ->
+            val prepared = service.prepare(
+                item = item,
+                file = file,
+                config = cfg,
+                maxContextChars = DocumentAiService.MAX_CONTEXT_CHARS,
+                query = query,
+                kind = kind,
+            )
+            when (prepared) {
+                is DocumentAiService.Preparation.Cached -> {
+                    onCached()
+                    onDelta(prepared.artifact.content)
+                    prepared.artifact.content
+                }
+                is DocumentAiService.Preparation.Ready -> {
+                    generated = true
+                    val request = prepared.request
+                    val output = AiClient.chat(
+                        cfg,
+                        request.systemPrompt,
+                        request.userPrompt,
+                        onDelta,
+                        onReason = onReason,
+                        onRestart = onRestart,
+                        // 这些推荐值此前被算出来却从未传下去，严格结构化任务因此没拿到低温与 JSON 模式。
+                        temperature = request.temperature,
+                        maxTokens = request.maxTokens,
+                        jsonMode = request.jsonMode,
+                        onUsage = ::recordUsage,
+                    )
+                    validation = try {
+                        service.saveCompleted(request, output)
+                        null
+                    } catch (e: DocumentAiService.InvalidModelOutputException) {
+                        e.message ?: "模型输出未通过校验"
+                    }
+                    output
+                }
+            }
+        }
+    }
+
     private fun generateTextStudyPack(item: Book, file: File, cfg: AiClient.Config) {
         val service = DocumentAiService(db)
         // 校验结果由 call 内部写入，validate 在 call 返回后读取，用于决定是否保留正文
@@ -2537,9 +2724,10 @@ class ReaderView(
             onKeep = { text -> persistStudyPack(text, "unvalidated") },
             onDone = { text -> if (generated) persistStudyPack(text, "") },
             onRetry = { alt -> generateTextStudyPack(item, file, alt) }
-        ) { onDelta, onReason, onRestart ->
+        ) { onDelta, onReason, onRestart, onCached ->
             when (val prepared = service.prepare(item, file, cfg, DocumentAiService.MAX_CONTEXT_CHARS)) {
                 is DocumentAiService.Preparation.Cached -> {
+                    onCached()
                     onDelta(prepared.artifact.content)
                     prepared.artifact.content
                 }
@@ -2601,7 +2789,7 @@ class ReaderView(
                 onKeep = { text -> persistStudyPack(text, "unvalidated") },
                 onDone = { text -> if (generated) persistStudyPack(text, "") },
                 onRetry = { alt -> generateVisualStudyPack(item, file, alt, pageIndices, singleImage) }
-            ) { onDelta, onReason, onRestart ->
+            ) { onDelta, onReason, onRestart, onCached ->
                 val pages = if (singleImage) {
                     listOfNotNull(imageBitmap?.copy(Bitmap.Config.ARGB_8888, false))
                 } else {
@@ -2719,7 +2907,7 @@ class ReaderView(
             cfg = cfg,
             scopeLine = scope,
             onRetry = { alt -> recapAction(alt) }
-        ) { onDelta, onReason, onRestart ->
+        ) { onDelta, onReason, onRestart, onCached ->
             AiClient.chat(cfg, SYS_PROMPT,
                 "读者正在读长篇/资料，下面是当前章节之前的带锚点节选（[CHAPTER:n] 是章节，[PARAGRAPH:n] 是段落）。" +
                     "请用约 250 字梳理「到目前为止发生了什么」：关键事件、出场人物及其动机、留下的悬念；" +
@@ -2763,7 +2951,7 @@ class ReaderView(
             cfg = cfg,
             scopeLine = "范围：当前章节前 ${formatChars(sent.length)} 字符（共 ${formatChars(chapter.length)}）",
             onRetry = { alt -> castAction(alt) }
-        ) { onDelta, onReason, onRestart ->
+        ) { onDelta, onReason, onRestart, onCached ->
             AiClient.chat(cfg, SYS_PROMPT,
                 "从下面的章节内容中提取出场人物（最多 6 个）。每个人物一行：「名字 —— 身份/角色 + 当前状态或动机」，" +
                     "按重要性排序。若为非小说类文档，则提取核心概念/术语代替人物。\n\n$sent",
@@ -2838,7 +3026,20 @@ class ReaderView(
         onKeep: ((String) -> Unit)? = null,
         onRetry: ((AiClient.Config) -> Unit)? = null,
         onDone: ((String) -> Unit)? = null,
-        call: (onDelta: (String) -> Unit, onReason: (String) -> Unit, onRestart: () -> Unit) -> String
+        /**
+         * 命中本地缓存时回调。
+         *
+         * 缓存命中不会调用模型、不产生费用，但界面此前把它渲染得和真实生成完全一样，
+         * 用户无法判断这一次点击是否被计费。命中时明确说明，用户才敢放心重复查看。
+         */
+        onCached: (() -> Unit)? = null,
+        call: (
+            onDelta: (String) -> Unit,
+            onReason: (String) -> Unit,
+            onRestart: () -> Unit,
+            /** 命中缓存时调用；调用方最清楚这次是什么任务，所以由它来点亮提示条。 */
+            onCached: () -> Unit,
+        ) -> String
     ) {
         if (activeAiTask != null) {
             // 并发任务会留下两个对话框，且「停止」只作用于其中一个，直接拒绝比假装成功更诚实
@@ -2860,6 +3061,20 @@ class ReaderView(
             text = scopeLine.orEmpty()
         }
         // 校验/错误横幅：压在正文上方，正文本身不再被整段替换
+        // 缓存命中提示条：与「失败/校验」横幅同一位置，但用中性色，
+        // 因为「没花钱」不是错误。
+        val cachedTv = TextView(act).apply {
+            textSize = 11.5f
+            setTextColor(pal.textS)
+            background = Glass.pillBg(if (pal.dark) Color.argb(38, 255, 255, 255) else Color.argb(20, 23, 26, 43))
+            setPadding(Glass.dp(14, d), Glass.dp(7, d), Glass.dp(14, d), Glass.dp(7, d))
+            visibility = View.GONE
+        }
+        // 命中缓存时把提示条亮出来（文案在调用方给，因为它最清楚这次是什么任务）。
+        val markCached: () -> Unit = {
+            cachedTv.text = "用的是上次的结果 · 未产生新费用"
+            cachedTv.visibility = View.VISIBLE
+        }
         val bannerTv = TextView(act).apply {
             textSize = 12.5f
             setTextColor(Color.parseColor("#B3261E"))
@@ -2919,6 +3134,7 @@ class ReaderView(
         val outer = LinearLayout(act).apply {
             orientation = LinearLayout.VERTICAL
             addView(scopeTv)
+            addView(cachedTv)
             addView(bannerTv)
             addView(sectionRow)
             addView(scroll, LinearLayout.LayoutParams(-1, Glass.dp(320, d)))
@@ -3137,7 +3353,7 @@ class ReaderView(
                         rAcc.setLength(0)
                         lastUi[0] = 0L
                         act.runOnUiThread { thinkTv.visibility = View.GONE }
-                    })
+                    }, markCached)
                 }
                 if (reply.isBlank()) throw RuntimeException("模型返回为空")
                 problem = validate?.invoke(reply)
@@ -3650,7 +3866,7 @@ class ReaderView(
                     cfg = cfg,
                     scopeLine = scope,
                     onRetry = { alt -> aiSummary(alt) }
-                ) { onDelta, onReason, onRestart ->
+                ) { onDelta, onReason, onRestart, onCached ->
                     val pages = collectPdfPages(indices)
                     try {
                         AiClient.chatVision(cfg, SYS_PROMPT,
@@ -3663,21 +3879,12 @@ class ReaderView(
                 }
             }
         } else {
-            if (!requireExtractableText("前段摘要")) return
-            val text = docFullText
-            if (text.isBlank()) { showResult("提示", "本文档没有可提取文本"); return }
-            val sent = text.take(24000)
-            runAiStream(
-                kind = "summary",
-                title = "前段摘要",
+            runTextTask(
+                kind = DocumentAiService.KIND_SUMMARY,
+                title = "摘要",
                 cfg = cfg,
-                scopeLine = textScope(sent.length),
-                onRetry = { alt -> aiSummary(alt) }
-            ) { onDelta, onReason, onRestart ->
-                AiClient.chat(cfg, SYS_PROMPT,
-                    "请为下面的内容生成摘要：先一句话概括，再用 3-6 个要点列出核心内容。\n\n【内容开始】\n$sent\n【内容结束】",
-                    onDelta, onReason = onReason, onRestart = onRestart, onUsage = ::recordUsage)
-            }
+                onRetry = { alt -> aiSummary(alt) },
+            )
         }
     }
 
@@ -3713,7 +3920,7 @@ class ReaderView(
                             cfg = cfg,
                             scopeLine = scope,
                             onRetry = { alt -> askAction(alt) }
-                        ) { onDelta, onReason, onRestart ->
+                        ) { onDelta, onReason, onRestart, onCached ->
                             val pages = collectPdfPages(indices)
                             try {
                                 AiClient.chatVision(cfg, SYS_PROMPT,
@@ -3725,24 +3932,14 @@ class ReaderView(
                         }
                     }
                 } else {
-                    if (!requireExtractableText("节选问答")) return@setPositiveButton
-                    val text = docFullText
-                    if (text.isBlank()) {
-                        showResult("提示", "本文档没有可提取文本")
-                        return@setPositiveButton
-                    }
-                    val sent = text.take(24000)
-                    runAiStream(
-                        kind = "ask",
+                    if (!requireExtractableText("问答")) return@setPositiveButton
+                    runTextTask(
+                        kind = DocumentAiService.KIND_QA,
                         title = "问答 · $q",
                         cfg = cfg,
-                        scopeLine = textScope(sent.length),
-                        onRetry = { alt -> askAction(alt) }
-                    ) { onDelta, onReason, onRestart ->
-                        AiClient.chat(cfg, SYS_PROMPT,
-                            "根据以下资料回答问题。若资料中没有答案请直说。\n\n问题：$q\n\n【资料开始】\n$sent\n【资料结束】",
-                            onDelta, onReason = onReason, onRestart = onRestart, onUsage = ::recordUsage)
-                    }
+                        query = q,
+                        onRetry = { alt -> askAction(alt) },
+                    )
                 }
             }
             .setNegativeButton("取消", null)
@@ -3751,60 +3948,63 @@ class ReaderView(
 
     private fun quizAction(cfgOverride: AiClient.Config? = null) {
         val cfg = cfgOverride ?: (aiReady() ?: return)
-        if (bookFormat != "pdf" && !requireExtractableText("出题自测")) return
-        val pdfIndices = if (bookFormat == "pdf") (0 until min(8, pdfRenderer?.pageCount ?: 0)).toList() else emptyList()
-        val scope = if (bookFormat == "pdf") pdfScope(pdfIndices) else textScope(min(20000, docFullText.length))
-        val build = { onDelta: (String) -> Unit, onReason: (String) -> Unit, onRestart: () -> Unit ->
-            if (bookFormat == "pdf") {
-                if (pdfIndices.isEmpty()) throw RuntimeException("PDF 没有可分析页面")
-                val pages = collectPdfPages(pdfIndices)
-                try {
-                    AiClient.chatVision(cfg, SYS_PROMPT,
-                        "根据这些页面截图出 5 道自测题（选择/简答混合）。只输出题目本身，不要给答案——用户作答后你会批改。",
-                        pages, onDelta, onReason = onReason, onRestart = onRestart, onUsage = ::recordUsage)
-                } finally {
-                    pages.forEach { it.recycle() }
-                }
-            } else {
-                val text = docFullText
-                if (text.isBlank()) throw RuntimeException("本文档没有可提取文本")
-                AiClient.chat(cfg, SYS_PROMPT,
-                    "根据以下内容出 5 道自测题（选择/简答混合）。只输出题目本身，不要给出答案——用户稍后作答，你会批改。\n\n${text.take(20000)}",
-                    onDelta, onReason = onReason, onRestart = onRestart, onUsage = ::recordUsage)
-            }
+        // 出题完成 → 引导作答批改闭环
+        val quizDone: (String) -> Unit = { questions ->
+            android.app.AlertDialog.Builder(act)
+                .setTitle("作答批改")
+                .setMessage("题目已生成。把你的答案写在下框（可简答，如「1A 2B 3…」），AI 将对照原文批改评分。")
+                .setPositiveButton("去作答") { _, _ -> answerQuiz(cfg, questions) }
+                .setNegativeButton("稍后", null)
+                .show().also { Glass.styleDialog(it, density(act)) }
         }
-        val start = {
+
+        // 文本类文档走统一入口：缓存、锚点抽样、引用锚点、JSON 模式一次到位。
+        // 此前它读的是 text.take(20000)——十万字的书只出前两万字的题。
+        if (bookFormat != "pdf") {
+            if (!requireExtractableText("出题自测")) return
+            runTextTask(
+                kind = DocumentAiService.KIND_QUIZ,
+                title = "自测题",
+                cfg = cfg,
+                onGenerated = quizDone,
+                onRetry = { alt -> quizAction(alt) },
+            )
+            return
+        }
+
+        // PDF 没有可提取文本，只能走视觉通道，保持原样。
+        val pdfIndices = (0 until min(8, pdfRenderer?.pageCount ?: 0)).toList()
+        if (pdfIndices.isEmpty()) {
+            showResult("提示", "PDF 没有可分析页面")
+            return
+        }
+        confirmVisionSend(
+            "出题自测",
+            visionRangeTitle(pdfIndices),
+            "目标服务：${providerHost()}\n只会发送这些页面的图像，文档原文件不会上传。",
+        ) {
             runAiStream(
                 kind = "quiz",
                 title = "自测题",
                 cfg = cfg,
-                scopeLine = scope,
+                scopeLine = pdfScope(pdfIndices),
                 onRetry = { alt -> quizAction(alt) },
-                onDone = { questions ->
-                    // 出题完成 → 引导作答批改闭环
-                    android.app.AlertDialog.Builder(act)
-                        .setTitle("作答批改")
-                        .setMessage("题目已生成。把你的答案写在下框（可简答，如「1A 2B 3…」），AI 将对照原文批改评分。")
-                        .setPositiveButton("去作答") { _, _ -> answerQuiz(cfg, questions) }
-                        .setNegativeButton("稍后", null)
-                        .show().also { Glass.styleDialog(it, density(act)) }
-                },
-                call = build
-            )
-        }
-        if (bookFormat == "pdf") {
-            confirmVisionSend(
-                "出题自测",
-                visionRangeTitle(pdfIndices),
-                "目标服务：${providerHost()}\n只会发送这些页面的图像，文档原文件不会上传。",
-                start
-            )
-        } else {
-            start()
+                onDone = quizDone,
+            ) { onDelta, onReason, onRestart, onCached ->
+                val pages = collectPdfPages(pdfIndices)
+                try {
+                    AiClient.chatVision(
+                        cfg, SYS_PROMPT,
+                        "根据这些页面截图出 5 道自测题（选择/简答混合）。只输出题目本身，不要给答案——用户作答后你会批改。",
+                        pages, onDelta, onReason = onReason, onRestart = onRestart, onUsage = ::recordUsage,
+                    )
+                } finally {
+                    pages.forEach { it.recycle() }
+                }
+            }
         }
     }
 
-    /** 批改：原文 + 题目 + 用户答案 → 逐题判分与讲解 */
     private fun answerQuiz(cfg: AiClient.Config, questions: String) {
         val input = EditText(act).apply {
             hint = "在此输入你的答案…"
@@ -3833,7 +4033,7 @@ class ReaderView(
                     cfg = cfg,
                     scopeLine = if (bookFormat == "pdf") "范围：PDF 题面（未附原文）" else textScope(refText.length),
                     onRetry = { alt -> answerQuiz(alt, questions) }
-                ) { onDelta, onReason, onRestart ->
+                ) { onDelta, onReason, onRestart, onCached ->
                     AiClient.chat(cfg, SYS_PROMPT,
                         "你是阅卷老师。下面是原文、题目和学生的答案。请逐题判定对错并简要讲解，" +
                             "最后给总分（共 $count 题，每题约 ${"%.1f".format(per)} 分，满分 100）和一句鼓励。\n\n" +
@@ -3978,7 +4178,7 @@ class ReaderView(
             scopeLine = "范围：选中段落，已发送 ${clip.length} 字符",
             anchor = anchor,
             onRetry = { alt -> runBlockAi(kind, title, blockText, alt, instruction, anchor) }
-        ) { onDelta, onReason, onRestart ->
+        ) { onDelta, onReason, onRestart, onCached ->
             AiClient.chat(cfg, SYS_PROMPT, "$instruction\n\n「$clip」", onDelta, onReason = onReason, onRestart = onRestart, onUsage = ::recordUsage)
         }
     }
@@ -4418,21 +4618,39 @@ class ReaderView(
         autoScrollTask = null
     }
 
+    /**
+     * 「更多」：本地工具与阅读方式的统一入口。
+     *
+     * AI 菜单改成只放 AI 动作后，本地功能全部归到这里——宽屏侧栏没有「更多」时
+     * 亮度/划的重点/文件信息就无处可去，所以侧栏也补了入口（见 openMoreActions）。
+     */
     private fun showMoreActions() {
-        BottomSheet(act, "更多")
-            .section("本书")
-            .item("folder", "笔记", "查看这本书的摘记、摘要与问答") { (act as MainActivity).showNotes(bookId) }
-            .item("list", "目录", "跳到章节或页码") { listToc() }
-            .item("note", "AI 助手", "理解包、问答、出题与聊天") { showAiMenu() }
-            .section("阅读")
-            .item("sliders", "阅读设置", "主题 / 行距 / 页边距 / 字号") { showReaderSettings() }
+        val sheet = BottomSheet(act, "更多")
+        sheet.section("本书", "本地完成，不联网、不产生费用")
+            .item("list", "目录", "跳到章节或页码，每章标注全书进度") { listToc() }
+            .item("search", "书内搜索", "查找词句，支持上一处 / 下一处") { searchInBook() }
+            .item("note", "我划的重点", "回看并跳转到划过的段落，可按颜色筛选") { showHighlightList() }
+            .item("folder", "本书笔记", "摘记、摘要与 AI 结果都在这里") { (act as MainActivity).showNotes(bookId) }
+
+        val marked = currentAnchor().let { it.isNotBlank() && it in bookmarkAnchors }
+        sheet.section("阅读方式")
+            .item(
+                "book",
+                if (marked) "取消当前位置书签" else "收藏当前位置",
+                if (marked) "移除这一处的书签" else "把当前位置记进书签，长按底栏书签可回看",
+            ) { toggleBookmark() }
+            .item("sliders", "阅读设置", "主题 / 行距 / 页边距 / 字号 / 两端对齐") { showReaderSettings() }
             .item("bulb", "亮度", "单独调节阅读器亮度") { brightnessDialog() }
-            .item("book", "切换书籍", "不用退回书架，直接打开最近读过的书") { showQuickSwitch() }
             .item("play", "朗读", "用系统语音从当前位置读起，会跟随高亮") { startSpeech() }
             .item("chevron", "自动滚动", "免手翻页；触摸屏幕即暂停") { toggleAutoScroll() }
-            .section("关于本文档")
+            .item("book", "切换书籍", "不用退回书架，直接打开最近读过的书") { showQuickSwitch() }
+
+        sheet.section("AI")
+            .item("sparkle", "AI 助手", "理解包、摘要、问答与出题") { showAiMenu() }
+
+        sheet.section("关于本文档")
             .item("folder", "文件信息", "格式 / 大小 / 导入时间 / 内容指纹") { showFileInfo() }
-            .show()
+        sheet.show()
     }
 
     /** 目录：列出全部章节标题（EPUB 的 h1/h2 与 TXT 识别的章回），点击直达；PDF 走页码跳转 */
