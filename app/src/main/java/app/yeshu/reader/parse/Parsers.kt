@@ -660,10 +660,17 @@ object DocParser {
             }
 
             val hrefMap = manifest.associate { it.id to it.href }
+            // EPUB3 的导航文档（properties="nav"）常常也在 spine 里。它不是正文：
+            // 把它的 <h2> 和 <li> 当内容会往目录最前面塞一条书名，并且让后面所有
+            // 段落的编号整体后移——AI 引用 [PARAGRAPH:n] 因此指到错误位置。
+            val navHrefs = manifest.filter { it.props.split(' ').contains("nav") }
+                .map { resolvePath(baseDir, it.href) }
+                .toSet()
             val blocks = mutableListOf<Block>()
             for (idref in spine) {
                 val href = hrefMap[idref] ?: continue
                 val entryPath = resolvePath(baseDir, href)
+                if (entryPath in navHrefs) continue
                 val lower = entryPath.lowercase()
                 if (!lower.endsWith(".xhtml") && !lower.endsWith(".html") && !lower.endsWith(".htm")) continue
                 val html = readEntryDecoded(z, entryPath) ?: continue
@@ -1378,6 +1385,10 @@ object DocParser {
         val SKIP = setOf("script", "style")
         var buf = StringBuilder()
         var skipDepth = 0
+        // <head> 里全是元数据（title/meta/link），不是正文。
+        // 之前把 <title> 也当成标题块，于是每个章节在目录里出现两次
+        // （一次来自 <title>、一次来自 <h1>），章节计数也被抬高一位。
+        var headDepth = 0
 
         xmlPull(html) { xp ->
             loop@ while (true) {
@@ -1388,20 +1399,27 @@ object DocParser {
                     XmlPullParser.START_TAG -> {
                         val n = xp.name.lowercase()
                         if (n in SKIP) skipDepth++
+                        if (n == "head") headDepth++
                     }
                     XmlPullParser.TEXT -> {
-                        if (skipDepth == 0) buf.append(xp.text)
+                        if (skipDepth == 0 && headDepth == 0) buf.append(xp.text)
                     }
                     XmlPullParser.END_TAG -> {
                         val n = xp.name.lowercase()
+                        if (n == "head" && headDepth > 0) {
+                            headDepth--
+                            // 丢弃 head 期间累积的空白/元数据，避免漏进下一个块
+                            buf = StringBuilder()
+                            continue@loop
+                        }
                         if (n in SKIP && skipDepth > 0) { skipDepth--; continue@loop }
-                        if (skipDepth > 0) continue@loop
-                        if (n in HEADINGS || n in PARA || n == "title") {
+                        if (skipDepth > 0 || headDepth > 0) continue@loop
+                        if (n in HEADINGS || n in PARA) {
                             val t = buf.toString().trim()
                             buf = StringBuilder()
                             if (t.isEmpty()) continue@loop
-                            // h1-h6/title 记为标题块；p/li/blockquote/裸 div 都收进正文
-                            val type = if (n in HEADINGS || n == "title") Block.HEADING else Block.TEXT
+                            // h1-h6 记为标题块；p/li/blockquote/裸 div 都收进正文
+                            val type = if (n in HEADINGS) Block.HEADING else Block.TEXT
                             out.add(Block(type, t))
                         }
                     }

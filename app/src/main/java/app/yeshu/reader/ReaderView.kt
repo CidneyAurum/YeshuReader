@@ -168,6 +168,15 @@ class ReaderView(
     /** 自动滚动的循环任务；非空表示正在自动滚动。 */
     private var autoScrollTask: Runnable? = null
     private var autoScrollSpeed = 2
+    /**
+     * 把写库任务交给后台线程。执行器若已被关闭（视图生命周期结束）就丢弃这次写入，
+     * 而不是让 RejectedExecutionException 冒到调用方把界面打崩——进度晚存一次无害，
+     * 崩一次是灾难。
+     */
+    private fun submitToIo(block: () -> Unit) {
+        runCatching { ioExecutor.execute(block) }
+    }
+
     /** 单线程后台执行器：进度写库顺序执行，避免并发写互相覆盖（滚动中每 1.5s 一次）。 */
     private val ioExecutor = java.util.concurrent.Executors.newSingleThreadExecutor { r ->
         Thread(r, "yeshu-progress").apply { isDaemon = true }
@@ -2938,42 +2947,51 @@ class ReaderView(
         return out.toString().take(24000)
     }
 
-    /** 人物速查：从当前章提取出场人物与身份 */
-    private fun castAction(cfgOverride: AiClient.Config? = null) {
-        val cfg = cfgOverride ?: (aiReady() ?: return)
-        if (!requireExtractableText("人物速查")) return
-        val chapter = currentChapterText()
-        if (chapter.isBlank()) { showResult("提示", "当前章节没有可分析文本"); return }
-        val sent = chapter.take(12000)
-        runAiStream(
-            kind = "cast",
-            title = "人物速查",
-            cfg = cfg,
-            scopeLine = "范围：当前章节前 ${formatChars(sent.length)} 字符（共 ${formatChars(chapter.length)}）",
-            onRetry = { alt -> castAction(alt) }
-        ) { onDelta, onReason, onRestart, onCached ->
-            AiClient.chat(cfg, SYS_PROMPT,
-                "从下面的章节内容中提取出场人物（最多 6 个）。每个人物一行：「名字 —— 身份/角色 + 当前状态或动机」，" +
-                    "按重要性排序。若为非小说类文档，则提取核心概念/术语代替人物。\n\n$sent",
-                onDelta, onReason = onReason, onRestart = onRestart, onUsage = ::recordUsage)
-        }
-    }
 
     /** 打开与书聊天页（携带当前章上下文） */
     private fun openChat() {
-        (act as MainActivity).showChat(bookId, currentChapterText())
+        val chapter = currentChapterContext()
+        (act as MainActivity).showChat(bookId, chapter.blocks, chapter.paragraphBase, chapter.chapterBase)
     }
 
     /** 当前可见章节的纯文本（供聊天 system 上下文） */
-    private fun currentChapterText(): String {
-        val blocks = docBlocks ?: return ""
-        // 找当前章起点：最后一个 tocHead <= 当前块（当前块按真实可见位置取）
+    /**
+     * 当前章的上下文，连同它在全书里的编号起点。
+     *
+     * 两处修正：
+     *  - 以前只取起点后 40 块，长章节的后半段完全没有上下文；
+     *  - 以前不传编号起点，而聊天里的 `[PARAGRAPH:n]` 是全书口径，片段内从 1 重新计数
+     *    会让引用指到别的段落（真机实测：点引用报「超出文档范围」）。
+     */
+    private fun currentChapterContext(): ChatChapterContext {
+        val blocks = docBlocks ?: return ChatChapterContext(emptyList(), 0, 0)
+        val markdown = bookFormat == "md"
         val curIdx = currentBlockIndex().coerceAtLeast(0)
         var start = 0
         for (h in tocHeads) { if (h.first <= curIdx) start = h.first else break }
-        // 取起点后 ~40 块
-        return blocks.drop(start).take(40).joinToString("\n") { it.text }
+        // 章末 = 下一个标题；没有下一个就取到文末。
+        var end = blocks.size
+        for (h in tocHeads) { if (h.first > start) { end = h.first; break } }
+        val chapterBlocks = blocks.subList(start, end.coerceAtMost(blocks.size))
+
+        // 起点之前的段落/章节数作为编号偏移，与 blockIndexForAnchor 的计数口径一致。
+        var paragraphBase = 0
+        var chapterBase = 0
+        for (i in 0 until start.coerceAtMost(blocks.size)) {
+            val b = blocks[i]
+            if (b.text.isBlank()) continue
+            if (isHeadingBlock(b, markdown)) chapterBase++ else paragraphBase++
+        }
+        return ChatChapterContext(chapterBlocks.toList(), paragraphBase, chapterBase)
     }
+
+    /**
+     * 聊天用的章节上下文：**块列表**（不是拼接后的文本）+ 全书口径的编号起点。
+     *
+     * 传块而不是文本，是为了让聊天侧按同一套块计数编号；文本往返会把含换行的段落
+     * 切碎，编号随之失真，引用就跳不回原文。
+     */
+    data class ChatChapterContext(val blocks: List<Block>, val paragraphBase: Int, val chapterBase: Int)
 
     private fun aiReady(): AiClient.Config? {
         val cfg = AiClient.config(db)
@@ -4926,7 +4944,7 @@ class ReaderView(
         )
         // 滚动回调发生在主线程：同步写库（updateProgress + setSetting 两次）在低端机上
         // 足以让滚动掉帧。挪到后台线程；进度读取走内存/另一条路径，不受写入先后影响。
-        ioExecutor.execute {
+        submitToIo {
             runCatching {
                 db.updateProgress(bookId, pr)
                 rememberPosition()
@@ -5065,7 +5083,7 @@ class ReaderView(
         // 不能跟着写库一起进后台线程——那会与布局/滚动竞争。
         val speedSample = captureSpeedSample(counted)
         // 写库在后台：pauseReadSession 也可能从主线程（onStop）进来。
-        ioExecutor.execute {
+        submitToIo {
             try { db.addReadTime(bookId, counted) } catch (e: Exception) {}
             speedSample?.let { applySpeedSample(it) }
         }
@@ -5106,7 +5124,11 @@ class ReaderView(
         speech?.release()
         speech = null
         speechBar = null
-        ioExecutor.shutdownNow()
+        // 注意：这里**不能**关掉 ioExecutor。
+        //  - pauseReadSession 紧接着还要通过它落库，关掉就抛 RejectedExecutionException
+        //    （真机实测：从阅读器进「和书聊聊」直接闪退）；
+        //  - detach 之后视图还可能被重新 attach（旋转、Compose 重组），关掉就永久失效。
+        // 执行器是单线程 daemon，闲置不占资源，留着才是正确取舍。
         // pauseReadSession 是幂等的：saveProgress + flushReadTime 各只生效一次
         pauseReadSession()
         super.onDetachedFromWindow()

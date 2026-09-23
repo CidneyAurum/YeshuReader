@@ -39,6 +39,7 @@ import androidx.work.WorkManager
 import androidx.work.workDataOf
 import app.yeshu.reader.backup.BackupService
 import app.yeshu.reader.data.LibraryImportWorker
+import app.yeshu.reader.parse.Block
 import app.yeshu.reader.data.LibraryImporter
 import app.yeshu.reader.preferences.UserPreferences
 import app.yeshu.reader.ui.YeshuApp
@@ -56,7 +57,17 @@ sealed interface Destination {
     /** [anchor] 非空时进入阅读器后按该锚点定位一次（来自笔记/成果里的引用 chip）。 */
     data class Reader(val bookId: Long, val anchor: String = "") : Destination
     data class BookNotes(val bookId: Long) : Destination
-    data class Chat(val bookId: Long, val chapterContext: String) : Destination
+    /**
+     * [paragraphBase]/[chapterBase] 是当前章在全书里的编号起点：
+     * 聊天里的 [PARAGRAPH:n] 按全书口径编号，不补偏移就指不到正确段落。
+     */
+    data class Chat(
+        val bookId: Long,
+        /** 当前章的块列表。传块而不是文本：文本往返会让段落编号与阅读器不一致，引用就跳不回去。 */
+        val chapterBlocks: List<Block>,
+        val paragraphBase: Int = 0,
+        val chapterBase: Int = 0,
+    ) : Destination
 }
 
 class MainActivity : ComponentActivity() {
@@ -219,7 +230,8 @@ class MainActivity : ComponentActivity() {
 
     fun showSettings() = navigate(Destination.Settings)
     fun showNotes(bookId: Long) = navigate(Destination.BookNotes(bookId))
-    fun showChat(bookId: Long, chapterContext: String) = navigate(Destination.Chat(bookId, chapterContext))
+    fun showChat(bookId: Long, chapterBlocks: List<Block>, paragraphBase: Int = 0, chapterBase: Int = 0) =
+        navigate(Destination.Chat(bookId, chapterBlocks, paragraphBase, chapterBase))
     fun showStats() = navigate(Destination.Stats)
     fun backToShelf() = showShelf()
 
@@ -323,8 +335,10 @@ class MainActivity : ComponentActivity() {
             is Destination.Reader -> outState.putLong(KEY_DESTINATION_BOOK, current.bookId)
             is Destination.BookNotes -> outState.putLong(KEY_DESTINATION_BOOK, current.bookId)
             is Destination.Chat -> {
+                // 章节上下文是块列表，不适合塞进 Bundle（可能很大）。
+                // 恢复时以「无上下文」重开聊天，而不是把块拼成文本再切回来——
+                // 那会让段落编号与阅读器不一致，引用就指错位置。
                 outState.putLong(KEY_DESTINATION_BOOK, current.bookId)
-                outState.putString(KEY_DESTINATION_CONTEXT, current.chapterContext)
             }
             else -> Unit
         }
@@ -351,7 +365,7 @@ class MainActivity : ComponentActivity() {
             "reader" -> if (bookId > 0) Destination.Reader(bookId) else Destination.Shelf
             "booknotes" -> if (bookId > 0) Destination.BookNotes(bookId) else Destination.Shelf
             "chat" -> if (bookId > 0) {
-                Destination.Chat(bookId, state.getString(KEY_DESTINATION_CONTEXT).orEmpty())
+                Destination.Chat(bookId, emptyList())
             } else {
                 Destination.Shelf
             }
@@ -369,7 +383,6 @@ class MainActivity : ComponentActivity() {
         const val KEY_REVISION = "yeshu_library_revision"
         const val KEY_DESTINATION = "yeshu_destination"
         const val KEY_DESTINATION_BOOK = "yeshu_destination_book"
-        const val KEY_DESTINATION_CONTEXT = "yeshu_destination_context"
         const val KEY_IMPORT_BATCH_TAG = "yeshu_import_batch_tag"
         const val KEY_IMPORT_BATCH_SIZE = "yeshu_import_batch_size"
     }

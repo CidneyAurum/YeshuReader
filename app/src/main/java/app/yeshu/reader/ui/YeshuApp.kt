@@ -330,7 +330,13 @@ private fun DestinationContent(
         is Destination.Chat -> LegacyHost(
             activity,
             Modifier.statusBarsPadding().navigationBarsPadding().imePadding()
-        ) { ChatView(activity, destination.bookId, destination.chapterContext) }
+        ) { ChatView(
+                            activity,
+                            destination.bookId,
+                            destination.chapterBlocks,
+                            destination.paragraphBase,
+                            destination.chapterBase,
+                        ) }
     }
 }
 
@@ -394,7 +400,7 @@ private fun DocumentWorkbenchScreen(
                             // 必须在这里有入口，否则平板上完全够不到。
                             DocumentTool("更多", "亮度 · 划的重点 · 文件信息", LuminousCyan) { reader?.openMoreActions() }
                             DocumentTool("AI 问答", "带着当前章上下文聊天", ElectricBlue) {
-                                onNavigate(Destination.Chat(bookId, ""))
+                                onNavigate(Destination.Chat(bookId, emptyList()))
                             }
                             Spacer(Modifier.weight(1f))
                             Text("AI 只在你主动触发时发送所选范围。", color = secondaryText(), fontSize = 10.sp)

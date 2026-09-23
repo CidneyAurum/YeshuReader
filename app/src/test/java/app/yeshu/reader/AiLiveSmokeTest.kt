@@ -57,7 +57,11 @@ class AiLiveSmokeTest {
             error is java.net.NoRouteToHostException ||
             // 网关瞬时掐断 TLS 握手（负载/中间设备）：重试通常能过，不是代码问题。
             error is javax.net.ssl.SSLException ||
-            (error.message?.let { it.contains("401") || it.contains("403") } == true)
+            // 5xx 是服务端状态（过载/限流/维护），与代码无关；实测遇到过 503。
+            (error.message?.let { msg ->
+                msg.contains("401") || msg.contains("403") ||
+                    Regex("HTTP 5\\d\\d").containsMatchIn(msg)
+            } == true)
         assumeTrue("服务商当前不可达，跳过实况测试：${error.message}", !transient)
         throw error
     }

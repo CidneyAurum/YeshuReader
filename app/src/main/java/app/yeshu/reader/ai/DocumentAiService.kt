@@ -576,7 +576,10 @@ class DocumentAiService(
             parsed: ParsedDoc,
             formatHint: String = parsed.format,
             maxChars: Int = DEFAULT_CONTEXT_CHARS,
-            query: String? = null
+            query: String? = null,
+            /** 段落/章节编号偏移，见 [buildAnchoredContextFromText]。 */
+            paragraphOffset: Int = 0,
+            chapterOffset: Int = 0,
         ): AnchoredContext {
             require(maxChars in MIN_CONTEXT_CHARS..MAX_CONTEXT_CHARS) {
                 "maxChars must be in $MIN_CONTEXT_CHARS..$MAX_CONTEXT_CHARS"
@@ -587,7 +590,7 @@ class DocumentAiService(
             val segments = if (format == "pptx") {
                 slideSegments(parsed.blocks)
             } else {
-                proseSegments(parsed.blocks, markdown = format == "md")
+                proseSegments(parsed.blocks, markdown = format == "md", paragraphOffset, chapterOffset)
             }
             if (segments.isEmpty()) {
                 return AnchoredContext("", emptyList(), 0, 0, false, maxChars, "")
@@ -624,7 +627,17 @@ class DocumentAiService(
             text: String,
             formatHint: String = "txt",
             maxChars: Int = DEFAULT_CONTEXT_CHARS,
-            query: String? = null
+            query: String? = null,
+            /**
+             * 段落/章节编号的起始偏移。
+             *
+             * 传入的往往只是文档的一个片段（例如「当前章」），而 [AnchoredContext] 里的
+             * 编号是**全书**口径——阅读器按全书非标题块计数来定位引用。不补偏移的话，
+             * 片段内会从 1 重新计数，模型引用 [PARAGRAPH:7] 实际指向全书第 7 段，
+             * 与片段里的第 7 段完全是两处（真机实测：点引用报「超出文档范围」）。
+             */
+            paragraphOffset: Int = 0,
+            chapterOffset: Int = 0,
         ): AnchoredContext {
             val format = normalizeFormat(formatHint).takeIf { it in SUPPORTED_FORMATS } ?: "txt"
             val blocks = text.replace("\r\n", "\n").replace('\r', '\n')
@@ -639,7 +652,43 @@ class DocumentAiService(
                 parsed = ParsedDoc(format = format, blocks = blocks, fullText = text),
                 formatHint = format,
                 maxChars = maxChars,
-                query = query
+                query = query,
+                paragraphOffset = paragraphOffset,
+                chapterOffset = chapterOffset,
+            )
+        }
+
+        /**
+         * 直接由**块列表**构造锚点上下文，不做文本往返。
+         *
+         * 为什么需要它：把块用 "
+" 拼成文本、再按 "
+" 切回块，会在段落内部本来就含换行时
+         * 把一个块切成多个，段落编号因此比阅读器的真实块数多——模型照着上下文引用
+         * [PARAGRAPH:7]，阅读器按自己的块数一算就「超出文档范围」（真机实测）。
+         * 直接用块列表可以保证两边编号逐一对齐。
+         */
+        @JvmStatic
+        fun buildAnchoredContextFromBlocks(
+            blocks: List<Block>,
+            formatHint: String = "txt",
+            maxChars: Int = DEFAULT_CONTEXT_CHARS,
+            query: String? = null,
+            paragraphOffset: Int = 0,
+            chapterOffset: Int = 0,
+        ): AnchoredContext {
+            val format = normalizeFormat(formatHint).takeIf { it in SUPPORTED_FORMATS } ?: "txt"
+            val usable = blocks.filter { it.text.isNotBlank() }
+            if (usable.isEmpty()) {
+                return AnchoredContext("", emptyList(), 0, 0, false, maxChars, "")
+            }
+            return buildAnchoredContext(
+                parsed = ParsedDoc(format = format, blocks = usable, fullText = ""),
+                formatHint = format,
+                maxChars = maxChars,
+                query = query,
+                paragraphOffset = paragraphOffset,
+                chapterOffset = chapterOffset,
             )
         }
 
@@ -1270,10 +1319,16 @@ class DocumentAiService(
             return (listOf(header) + lines).joinToString("\n").take(MAX_OUTLINE_CHARS)
         }
 
-        private fun proseSegments(blocks: List<Block>, markdown: Boolean): List<SourceSegment> {
+        private fun proseSegments(
+            blocks: List<Block>,
+            markdown: Boolean,
+            paragraphOffset: Int = 0,
+            chapterOffset: Int = 0,
+        ): List<SourceSegment> {
             val result = mutableListOf<SourceSegment>()
-            var chapter = 0
-            var paragraph = 0
+            // 从偏移量起算，使片段内的编号与全书口径一致（引用才能跳回正确位置）。
+            var chapter = chapterOffset
+            var paragraph = paragraphOffset
             for (block in blocks) {
                 val normalized = normalizeText(block.text)
                 if (normalized.isBlank()) continue

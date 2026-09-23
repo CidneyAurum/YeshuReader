@@ -150,6 +150,40 @@ class DocumentAiServiceTest {
     }
 
     @Test
+    fun `片段上下文可以带上全书编号偏移`() {
+        // 真机实测：聊天只拿到「当前章」文本，段落编号从 1 重新开始，
+        // 而阅读器按全书计数定位引用——模型引用的 [PARAGRAPH:7] 因此指向别处，
+        // 点一下报「超出文档范围」。偏移量必须生效。
+        val chapter = "本章第一段\n本章第二段"
+        val withoutOffset = DocumentAiService.buildAnchoredContextFromText(chapter)
+        val withOffset = DocumentAiService.buildAnchoredContextFromText(
+            chapter, paragraphOffset = 40, chapterOffset = 3,
+        )
+
+        fun paragraphs(ctx: DocumentAiService.AnchoredContext) =
+            ctx.anchors.filter { it.type == AnchorType.PARAGRAPH }.map { it.index }
+
+        assertEquals(listOf(1, 2), paragraphs(withoutOffset))
+        assertEquals("带偏移时应从 40 起算", listOf(41, 42), paragraphs(withOffset))
+    }
+
+    @Test
+    fun `按块构造上下文时段落编号与阅读器一致`() {
+        // 真机样本：第一章只有一个 <p>，但该段落内部含换行。
+        // 走文本往返（拼接后按换行符切回）会把它当成两段，编号随之比阅读器多；
+        // 直接传块列表则一段就是一编号。
+        val blocks = listOf(
+            Block(Block.HEADING, "第一章 排期"),
+            Block(Block.TEXT, "今天下午和产品组过了新版本的排期，决定下周三前完成登录模块的重构。\n有点累，但方向清楚了。"),
+        )
+        val ctx = DocumentAiService.buildAnchoredContextFromBlocks(blocks, formatHint = "epub")
+
+        val paragraphIndexes = ctx.anchors.filter { it.type == AnchorType.PARAGRAPH }.map { it.index }
+        assertEquals("一个 <p> 只能算一段", listOf(1), paragraphIndexes)
+        assertEquals("一个标题只能算一章", listOf(1), ctx.anchors.filter { it.type == AnchorType.CHAPTER }.map { it.index })
+    }
+
+    @Test
     fun `理解包仍然要求六段齐全`() {
         // 分派不能把理解包的检查一起放宽掉。
         val context = anchoredContext(DocumentAnchor(AnchorType.PARAGRAPH, 1, "段落 1"))

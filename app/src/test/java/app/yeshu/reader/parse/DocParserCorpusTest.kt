@@ -99,6 +99,28 @@ class DocParserCorpusTest {
     }
 
     @Test
+    fun `epub 的 head 元数据不进正文`() {
+        // 真机样本的每个章节文件长这样：<head><title>第一章 排期</title></head>
+        //                            <body><h1>第一章 排期</h1><p>…</p></body>
+        // 之前把 <title> 也当成标题块，于是目录里每章出现两次（title 一次、h1 一次），
+        // 章节计数也随之虚高——真机目录里「第一章 排期」确实重复显示了两遍。
+        val doc = parse("sample_epub2.epub")
+        val headingTexts = headings(doc)
+        assertEquals("每章只应有一个标题块", headingTexts.distinct().size, headingTexts.size)
+        assertEquals(listOf("第一章 排期", "第二章 文档"), headingTexts)
+    }
+
+    @Test
+    fun `段落内部的换行不会被当成新段落`() {
+        // 第一章的 <p> 内含一个换行；它仍是一个段落块。
+        // 段落数决定了 AI 引用编号 [PARAGRAPH:n] 能否跳回原文，数错就跳错位置。
+        val doc = parse("sample_epub2.epub")
+        val paragraphs = doc.blocks.filter { it.type == Block.TEXT && it.text.isNotBlank() }
+        assertEquals("两章各一个 <p>，共两段", 2, paragraphs.size)
+        assertTrue("段落应保留内部换行", paragraphs.first().text.contains("\n"))
+    }
+
+    @Test
     fun `真实 epub3 嵌套目录也能提取`() {
         val doc = parse("sample_epub3.epub")
         assertEquals("epub", doc.format)
