@@ -48,33 +48,14 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 
-sealed interface Destination {
-    data object Workbench : Destination
-    data object Shelf : Destination
-    data object Notes : Destination
-    data object Settings : Destination
-    data object Stats : Destination
-    /** [anchor] 非空时进入阅读器后按该锚点定位一次（来自笔记/成果里的引用 chip）。 */
-    data class Reader(val bookId: Long, val anchor: String = "") : Destination
-    data class BookNotes(val bookId: Long) : Destination
-    /**
-     * [paragraphBase]/[chapterBase] 是当前章在全书里的编号起点：
-     * 聊天里的 [PARAGRAPH:n] 按全书口径编号，不补偏移就指不到正确段落。
-     */
-    data class Chat(
-        val bookId: Long,
-        /** 当前章的块列表。传块而不是文本：文本往返会让段落编号与阅读器不一致，引用就跳不回去。 */
-        val chapterBlocks: List<Block>,
-        val paragraphBase: Int = 0,
-        val chapterBase: Int = 0,
-    ) : Destination
-}
-
 class MainActivity : ComponentActivity() {
     var destination by mutableStateOf<Destination>(Destination.Workbench)
         private set
     var libraryRevision by mutableIntStateOf(0)
         private set
+
+    /** 返回栈：记录「从哪进来的」，让返回键回到真实来处而不是写死的书架。 */
+    private val backStack = ReaderBackStack()
 
     /** 导入进度：已完成项数 to 总项数；不在导入中时为 null。 */
     private var importProgress by mutableStateOf<Pair<Int, Int>?>(null)
@@ -147,8 +128,14 @@ class MainActivity : ComponentActivity() {
         }
         WindowCompat.setDecorFitsSystemWindows(window, false)
         // 旋转/深色切换等配置变更后恢复导航状态；仅全新启动时回到工作台
-        destination = savedInstanceState?.let(::restoreDestination) ?: Destination.Workbench
+        destination = savedInstanceState?.getString(KEY_DESTINATION)?.let(::decodeDestination)
+            ?: Destination.Workbench
         libraryRevision = savedInstanceState?.getInt(KEY_REVISION) ?: 0
+        // 返回栈也要恢复：只恢复「现在在哪」而不恢复「从哪来」的话，
+        // 旋屏之后按返回会直接跳到工作台，而用户明明是从书架进来的。
+        savedInstanceState?.getStringArrayList(KEY_BACK_STACK)?.let { tokens ->
+            backStack.restore(tokens.mapNotNull(::decodeDestination))
+        }
 
         // 导入批次可能在进程被回收后才完成（WorkManager 没有前台通知），
         // 启动时补挂一次观察，把结果提示交给用户，避免导入静默结束。
@@ -161,19 +148,7 @@ class MainActivity : ComponentActivity() {
         // 导入中途进程被杀会留下 .import_*.tmp 全尺寸副本，启动时清掉（带时限，不影响正在进行的导入）。
         lifecycleScope.launch(Dispatchers.IO) { runCatching { LibraryImporter.sweepStaleTemporaryFiles(applicationContext) } }
 
-        onBackPressedDispatcher.addCallback(this) {
-            destination = when (val current = destination) {
-                is Destination.Reader -> Destination.Shelf
-                is Destination.BookNotes -> Destination.Reader(current.bookId)
-                is Destination.Chat -> Destination.Reader(current.bookId)
-                Destination.Stats -> Destination.Workbench
-                Destination.Workbench -> {
-                    finish()
-                    return@addCallback
-                }
-                else -> Destination.Workbench
-            }
-        }
+        onBackPressedDispatcher.addCallback(this) { goBack() }
 
         setContent {
             val themeMode by userPreferences.themeMode.collectAsStateWithLifecycle(initialValue = "system")
@@ -217,7 +192,19 @@ class MainActivity : ComponentActivity() {
     }
 
     fun navigate(target: Destination) {
+        backStack.onNavigate(target, destination)
         destination = target
+    }
+
+    /**
+     * 返回一步。
+     *
+     * 阅读器顶栏的返回箭头也走这里：系统返回键和界面上的返回必须是同一套规则，
+     * 否则会出现「按箭头去书架、按系统键回工作台」这种同一动作两种结果。
+     */
+    fun goBack() {
+        val target = backStack.onBack(destination)
+        if (target == null) finish() else destination = target
     }
 
     fun showShelf() = navigate(Destination.Shelf)
@@ -330,46 +317,45 @@ class MainActivity : ComponentActivity() {
     override fun onSaveInstanceState(outState: Bundle) {
         super.onSaveInstanceState(outState)
         outState.putInt(KEY_REVISION, libraryRevision)
-        outState.putString(KEY_DESTINATION, destinationKey(destination))
-        when (val current = destination) {
-            is Destination.Reader -> outState.putLong(KEY_DESTINATION_BOOK, current.bookId)
-            is Destination.BookNotes -> outState.putLong(KEY_DESTINATION_BOOK, current.bookId)
-            is Destination.Chat -> {
-                // 章节上下文是块列表，不适合塞进 Bundle（可能很大）。
-                // 恢复时以「无上下文」重开聊天，而不是把块拼成文本再切回来——
-                // 那会让段落编号与阅读器不一致，引用就指错位置。
-                outState.putLong(KEY_DESTINATION_BOOK, current.bookId)
-            }
-            else -> Unit
-        }
+        outState.putString(KEY_DESTINATION, encodeDestination(destination))
+        // 返回栈一并存下，旋屏后才回得到原来的来处。
+        // 聊天里的章节块列表不塞进 Bundle（可能很大）：恢复时以「无上下文」重开聊天，
+        // 而不是把块拼成文本再切回来——那会让段落编号与阅读器不一致，引用就指错位置。
+        outState.putStringArrayList(KEY_BACK_STACK, ArrayList(backStack.snapshot().map(::encodeDestination)))
     }
 
-    private fun destinationKey(destination: Destination): String = when (destination) {
+    /**
+     * 目的地 → 字符串，供 [onSaveInstanceState] 使用。
+     *
+     * 锚点里带冒号（如 `PARAGRAPH:2`），所以解析时按前两段切、剩下整段当锚点，
+     * 不能简单 split(":") 后取 [2]。
+     */
+    private fun encodeDestination(destination: Destination): String = when (destination) {
         Destination.Workbench -> "workbench"
         Destination.Shelf -> "shelf"
         Destination.Notes -> "notes"
         Destination.Settings -> "settings"
         Destination.Stats -> "stats"
-        is Destination.Reader -> "reader"
-        is Destination.BookNotes -> "booknotes"
-        is Destination.Chat -> "chat"
+        is Destination.Reader -> "reader:${destination.bookId}:${destination.anchor}"
+        is Destination.BookNotes -> "booknotes:${destination.bookId}"
+        is Destination.Chat -> "chat:${destination.bookId}"
     }
 
-    private fun restoreDestination(state: Bundle): Destination {
-        val bookId = state.getLong(KEY_DESTINATION_BOOK, -1L)
-        return when (state.getString(KEY_DESTINATION)) {
+    /** 解析失败或书 id 缺失时返回 null，由调用方决定兜底去哪里。 */
+    private fun decodeDestination(token: String): Destination? {
+        val parts = token.split(":", limit = 3)
+        return when (parts[0]) {
+            "workbench" -> Destination.Workbench
             "shelf" -> Destination.Shelf
             "notes" -> Destination.Notes
             "settings" -> Destination.Settings
             "stats" -> Destination.Stats
-            "reader" -> if (bookId > 0) Destination.Reader(bookId) else Destination.Shelf
-            "booknotes" -> if (bookId > 0) Destination.BookNotes(bookId) else Destination.Shelf
-            "chat" -> if (bookId > 0) {
-                Destination.Chat(bookId, emptyList())
-            } else {
-                Destination.Shelf
-            }
-            else -> Destination.Workbench
+            "reader" -> parts.getOrNull(1)?.toLongOrNull()?.takeIf { it > 0 }
+                ?.let { Destination.Reader(it, parts.getOrNull(2).orEmpty()) }
+            "booknotes" -> parts.getOrNull(1)?.toLongOrNull()?.takeIf { it > 0 }?.let { Destination.BookNotes(it) }
+            "chat" -> parts.getOrNull(1)?.toLongOrNull()?.takeIf { it > 0 }
+                ?.let { Destination.Chat(it, emptyList()) }
+            else -> null
         }
     }
 
@@ -382,7 +368,7 @@ class MainActivity : ComponentActivity() {
     private companion object {
         const val KEY_REVISION = "yeshu_library_revision"
         const val KEY_DESTINATION = "yeshu_destination"
-        const val KEY_DESTINATION_BOOK = "yeshu_destination_book"
+        const val KEY_BACK_STACK = "yeshu_back_stack"
         const val KEY_IMPORT_BATCH_TAG = "yeshu_import_batch_tag"
         const val KEY_IMPORT_BATCH_SIZE = "yeshu_import_batch_size"
     }

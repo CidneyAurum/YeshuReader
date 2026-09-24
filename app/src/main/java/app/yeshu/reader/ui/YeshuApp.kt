@@ -18,6 +18,11 @@ import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxHeight
+import androidx.compose.foundation.layout.WindowInsets
+import androidx.compose.foundation.layout.WindowInsetsSides
+import androidx.compose.foundation.layout.only
+import androidx.compose.foundation.layout.systemBars
+import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
@@ -101,6 +106,7 @@ import app.yeshu.reader.Book
 import app.yeshu.reader.ChatView
 import app.yeshu.reader.Db
 import app.yeshu.reader.Destination
+import app.yeshu.reader.TOP_LEVEL_DESTINATIONS
 import app.yeshu.reader.HighlightExport
 import app.yeshu.reader.LibraryItem
 import app.yeshu.reader.MainActivity
@@ -142,8 +148,13 @@ private val topDestinations = listOf(
     TopDestination("设置", "⚙", Destination.Settings)
 )
 
-/** 预计算顶层目的地集合，避免每次重组都分配列表。 */
-private val topDestinationSet: Set<Destination> = topDestinations.mapTo(mutableSetOf()) { it.destination }
+/**
+ * 顶层目的地集合。
+ *
+ * 直接复用 [TOP_LEVEL_DESTINATIONS]：底栏列表和返回栈的「哪些算平级」必须是同一份定义，
+ * 各写一份迟早会漂移（多一个 tab 却忘了同步，返回键就会在该 tab 上多压一层）。
+ */
+private val topDestinationSet: Set<Destination> = TOP_LEVEL_DESTINATIONS
 
 /**
  * “在读”判定必须与 Db.statusFor 完全一致：>0.005 为在读、>=0.99 为读完。
@@ -371,6 +382,10 @@ private fun DocumentWorkbenchScreen(
                 loaded.first.post { loaded.first.jumpToPendingAnchor() }
             }
         }
+        // 阅读器是 legacy View，收不到 Compose 已经消费掉的 WindowInsets，
+        // 必须把状态栏高度显式递进去，否则顶栏会被画到状态栏底下、返回按钮点不到。
+        val statusBarTop = WindowInsets.systemBars.only(WindowInsetsSides.Top).getTop(LocalDensity.current)
+        LaunchedEffect(reader, statusBarTop) { reader?.applyHostInsets(statusBarTop) }
         if (wide) {
             Row(Modifier.fillMaxSize()) {
                 // ReaderView 内部已通过 applySystemBarInsets 自行处理系统栏，这里不再重复加 padding

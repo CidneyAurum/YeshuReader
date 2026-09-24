@@ -42,12 +42,12 @@ class StatsView(private val act: Activity) : FrameLayout(act) {
             background = Glass.iconBg()
             foreground = Glass.pressFx()
             layoutParams = LinearLayout.LayoutParams(Glass.dp(48, d), Glass.dp(48, d))
-            contentDescription = "返回书架"
+            contentDescription = "返回"
             addView(IconView(act, "back", 22, pal.icon).apply {
                 // 自绘图标无自身语义，标签已在容器上，避免 TalkBack 重复/空播报
                 importantForAccessibility = View.IMPORTANT_FOR_ACCESSIBILITY_NO
             }, FrameLayout.LayoutParams(Glass.dp(24, d), Glass.dp(24, d), Gravity.CENTER))
-            setOnClickListener { (act as MainActivity).backToShelf() }
+            setOnClickListener { (act as MainActivity).goBack() }
         })
         top.addView(TextView(act).apply {
             text = "阅读统计"
@@ -108,7 +108,7 @@ class StatsView(private val act: Activity) : FrameLayout(act) {
                     setColor(T.accent)
                 }
                 foreground = Glass.pressFx()
-                setOnClickListener { (act as MainActivity).backToShelf() }
+                setOnClickListener { (act as MainActivity).goBack() }
             }, LinearLayout.LayoutParams(-1, Glass.dp(48, d)).also { it.topMargin = Glass.dp(14, d) })
             return
         }

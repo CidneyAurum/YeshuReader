@@ -21,6 +21,7 @@ import android.text.style.StyleSpan
 import android.util.SparseArray
 import android.view.Gravity
 import android.view.View
+import android.view.ViewGroup
 import android.widget.FrameLayout
 import android.widget.ImageView
 import android.widget.LinearLayout
@@ -253,6 +254,36 @@ class ReaderView(
     }
 
     /** 点正文呼出/隐藏工具栏（iBooks 式沉浸阅读） */
+    private var chromeTop: View? = null
+    private var chromeTopBaseMargin = 0
+    private var hostInsetTop = 0
+
+    /**
+     * 由宿主（Compose 侧）传入状态栏高度。
+     *
+     * 阅读器是嵌在 Compose `AndroidView` 里的 legacy View，WindowInsets 在 Compose 侧已被消费，
+     * ViewCompat 的 insets 监听器只会收到 0。于是悬浮顶栏被画到状态栏底下：
+     * 左上角返回按钮的整块区域都落在状态栏的触摸区里，点它毫无反应——
+     * 用户看到的就是「进了书就回不去」。
+     *
+     * 只抬顶栏、不给正文加内边距：正文本就要在状态栏下流动（顶部有渐变 scrim 保证图标可读），
+     * 给整列加内边距会在沉浸阅读时白白空出一条。
+     */
+    fun applyHostInsets(top: Int) {
+        hostInsetTop = top
+        applyChromeInsets()
+    }
+
+    private fun applyChromeInsets() {
+        val bar = chromeTop ?: return
+        val lp = bar.layoutParams as? ViewGroup.MarginLayoutParams ?: return
+        val target = chromeTopBaseMargin + hostInsetTop
+        if (lp.topMargin != target) {
+            lp.topMargin = target
+            bar.layoutParams = lp
+        }
+    }
+
     private fun toggleBars() {
         val t = topBar ?: return
         val tabs = documentBar
@@ -424,7 +455,7 @@ class ReaderView(
         if (book != null) {
             setup(book)
         } else {
-            post { (act as MainActivity).showShelf() }
+            post { (act as MainActivity).goBack() }
         }
     }
 
@@ -625,10 +656,10 @@ class ReaderView(
                 setStroke(Glass.dp(1, d), Color.argb(42, 255, 255, 255))
             }
             foreground = Glass.pressFx()
-            contentDescription = "返回书架"
+            contentDescription = "返回"
             layoutParams = LinearLayout.LayoutParams(Glass.dp(40, d), Glass.dp(40, d))
             addView(IconView(act, "back", 20), FrameLayout.LayoutParams(Glass.dp(22, d), Glass.dp(22, d), Gravity.CENTER))
-            setOnClickListener { saveProgress(); closePdf(); (act as MainActivity).showShelf() }
+            setOnClickListener { saveProgress(); closePdf(); (act as MainActivity).goBack() }
         }
         top.addView(back)
         // 居中书名 + 当前章节副标题（滚动联动）
@@ -660,6 +691,8 @@ class ReaderView(
         col.addView(top, LayoutParams(-1, -2).also { lp ->
             lp.setMargins(Glass.dp(10, d), Glass.dp(6, d), Glass.dp(10, d), Glass.dp(5, d))
         })
+        chromeTop = top
+        chromeTopBaseMargin = Glass.dp(6, d)
 
         // 文档二层工作台原先是一条与底部工具坞并列的横栏（阅读/目录/AI/笔记），
         // 两条栏权重相同且「目录」重复出现，用户不知道该点哪条。
