@@ -34,6 +34,9 @@ class IconView(
     // 每帧每图标分配 Paint/Path 会在长文滚动时制造可感知的 GC 卡顿。
     // 复用同一个实例，绘制前 reset/rewind。
     private val scratchPath = android.graphics.Path()
+
+    /** onDraw 里每帧 new RectF 会造成 GC 抖动，复用同一个矩形。 */
+    private val scratchRect = android.graphics.RectF()
     private val scratchPaint = Paint(Paint.ANTI_ALIAS_FLAG)
     private val holePaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
         style = Paint.Style.FILL
@@ -211,9 +214,8 @@ class IconView(
             }
             "history" -> { // 回溯箭头：环形 + 逆时针箭头，表示「前情」
                 scratchPath.rewind()
-                scratchPath.addArc(
-                    android.graphics.RectF(s(4f), s(4f), s(20f), s(20f)), -60f, 300f
-                )
+                scratchRect.set(s(4f), s(4f), s(20f), s(20f))
+                scratchPath.addArc(scratchRect, -60f, 300f)
                 c.drawPath(scratchPath, stroke)
                 // 箭头指向起点，明确「往回」的方向
                 c.drawLine(s(4f), s(4.5f), s(4f), s(9.5f), stroke)

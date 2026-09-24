@@ -4071,55 +4071,89 @@ class ReaderView(
      *    以前第一行就 `aiReady() ?: return`，未配置 Key 时连收藏都点不出来。
      * 2) 本地分组补上「划重点」「复制」「分享」，不再只有一条「收藏金句」。
      */
-    private fun explainBlock(blockText: String, blockIndex: Int = -1, cfgOverride: AiClient.Config? = null) {
+    private fun explainBlock(blockText: String, blockIndex: Int = -1, cfgOverride: AiClient.Config? = null, scopeLabel: String = "段落") {
         val anchor = if (blockIndex >= 0) anchorForBlockIndex(blockIndex) else ""
         val preview = blockText.trim().take(40) + if (blockText.trim().length > 40) "…" else ""
         val sheet = BottomSheet(act, preview)
+        // 「段落」/「句子」是名词，直接拼进「这一$scopeLabel」会得到「这一段落」，
+        // 所以另外派生一个量词：这一段 / 这一句。
+        val scopeNoun = if (scopeLabel == "段落") "段" else "句"
+        // 范围写在最前面：整段和单句的操作项几乎一样，不点明会以为菜单点错了。
+        sheet.section("范围 · $scopeLabel")
+        // 只有多句的段落才给「选一句」：一句话的段落再选一次纯属多此一举。
+        val sentences = Sentences.split(blockText)
+        if (scopeLabel == "段落" && sentences.size >= 2) {
+            sheet.item("note", "选一句处理…", "这一段有 ${sentences.size} 句，挑一句再选操作") {
+                pickSentence(sentences, blockIndex, cfgOverride)
+            }
+        }
         sheet.section("本地 · 不联网")
         val quoteLabel = if (anchor.isNotBlank()) "收藏金句（$anchor）" else "收藏金句"
         sheet.item("book", quoteLabel, "存进笔记，列表里能跳回这一段") { saveQuote(blockText, anchor) }
-        if (blockIndex >= 0) {
+        // 划重点只能整段：句子级高亮没有存储结构，给了会被当成「只标了这一句」。
+        if (blockIndex >= 0 && scopeLabel == "段落") {
             val marked = highlightColors.containsKey(blockIndex)
             sheet.item("note", if (marked) "改颜色 / 清除重点" else "划重点", "选一个颜色标记这一段") {
                 showHighlightPicker(blockIndex, blockText)
             }
         }
-        sheet.item("note", "复制这段", "只写进剪贴板，不联网") { copyBlockText(blockText) }
-        sheet.item("search", "搜索这段", "用开头几个字在当前文档里找相关内容") { searchForBlockText(blockText) }
+        sheet.item("note", "复制这$scopeNoun", "只写进剪贴板，不联网") { copyBlockText(blockText, scopeNoun) }
+        sheet.item("search", "搜索这$scopeNoun", "用开头几个字在当前文档里找相关内容") { searchForBlockText(blockText) }
         sheet.item("note", "加入生词本", "存进笔记的「生词」，复习时能跳回这一段") { saveVocab(blockText, anchor) }
         sheet.item("search", "查词典 / 翻译", "交给系统里已安装的词典或翻译应用") { lookupBlockText(blockText) }
-        sheet.item("share", "分享这段", "生成本段图片分享出去") { shareBlockAsImage(blockText, anchor) }
+        sheet.item("share", "分享这$scopeNoun", "生成本段图片分享出去") { shareBlockAsImage(blockText, anchor) }
 
-        sheet.section("AI 操作", "会把这一段发往 ${providerHost()}，费用由服务商收取")
-        sheet.item("bulb", "解释含义", "这段话是什么意思、为什么重要") {
+        sheet.section("AI 操作", "会把这一${scopeNoun}发往 ${providerHost()}，费用由服务商收取")
+        sheet.item("bulb", "解释含义", "这${scopeNoun}文字是什么意思、为什么重要") {
             val cfg = cfgOverride ?: (aiReady() ?: return@item)
-            runBlockAi("explain", "段落解释", blockText, cfg,
-                "请解释下面这段话的含义（是什么意思、为什么重要），简洁作答：", anchor)
+            runBlockAi("explain", "$scopeLabel 解释", blockText, cfg,
+                "请解释下面这段话的含义（是什么意思、为什么重要），简洁作答：", anchor, scopeLabel)
         }
         sheet.item("search", "翻译", "翻译成中文 / English / 日本語") {
             val cfg = cfgOverride ?: (aiReady() ?: return@item)
-            translateBlock(blockText, anchor, cfg)
+            translateBlock(blockText, anchor, cfg, scopeLabel)
         }
         sheet.item("bulb", "大白话讲解", "用中学生能懂的话讲一遍") {
             val cfg = cfgOverride ?: (aiReady() ?: return@item)
             runBlockAi("explain", "大白话讲解", blockText, cfg,
-                "用大白话给中学生讲解下面这段话，可以打比方，通俗但不失准确：", anchor)
+                "用大白话给中学生讲解下面这段话，可以打比方，通俗但不失准确：", anchor, scopeLabel)
         }
-        sheet.item("chevron", "续写一段", "顺着文风自然续写 150–250 字") {
-            val cfg = cfgOverride ?: (aiReady() ?: return@item)
-            runBlockAi("continue", "续写", blockText, cfg,
-                "顺着下面的文字风格与情节，自然续写一段（150-250字）：", anchor)
+        // 续写只对整段有意义：给一句话续写会得到一句没头没尾的话。
+        if (scopeLabel == "段落") {
+            sheet.item("chevron", "续写一段", "顺着文风自然续写 150–250 字") {
+                val cfg = cfgOverride ?: (aiReady() ?: return@item)
+                runBlockAi("continue", "续写", blockText, cfg,
+                    "顺着下面的文字风格与情节，自然续写一段（150-250字）：", anchor, scopeLabel)
+            }
         }
         sheet.show()
     }
 
+    /**
+     * 挑一句再处理。
+     *
+     * 用列表而不是让用户在正文里拖选：正文的单击已经给了「切换沉浸模式」、长按给了整段菜单，
+     * 再叠一层选区手势会互相打架，而且在手机上拖选很难对准。
+     */
+    private fun pickSentence(sentences: List<String>, blockIndex: Int, cfgOverride: AiClient.Config?) {
+        val labels = sentences.mapIndexed { index, sentence ->
+            val oneLine = sentence.replace(Regex("\\s+"), " ")
+            "${index + 1}. " + oneLine.take(28) + if (oneLine.length > 28) "…" else ""
+        }.toTypedArray()
+        android.app.AlertDialog.Builder(act)
+            .setTitle("选一句")
+            .setItems(labels) { _, which -> explainBlock(sentences[which], blockIndex, cfgOverride, "句子") }
+            .setNegativeButton("取消", null)
+            .show().also { Glass.styleDialog(it, density(act)) }
+    }
+
     /** 复制段落：纯本地动作，长按菜单里最常用的一条。 */
-    private fun copyBlockText(blockText: String) {
+    private fun copyBlockText(blockText: String, scopeNoun: String = "段") {
         val text = blockText.trim()
         if (text.isEmpty()) return
         val clipboard = act.getSystemService(Context.CLIPBOARD_SERVICE) as android.content.ClipboardManager
-        clipboard.setPrimaryClip(android.content.ClipData.newPlainText("段落", text))
-        toast("已复制这一段")
+        clipboard.setPrimaryClip(android.content.ClipData.newPlainText("选中文字", text))
+        toast("已复制这$scopeNoun")
     }
 
     /** 用段落开头作为搜索词，直接出命中计数。 */
@@ -4186,23 +4220,25 @@ class ReaderView(
         blockText: String,
         cfg: AiClient.Config,
         instruction: String,
-        anchor: String
+        anchor: String,
+        scopeLabel: String = "段落"
     ) {
         val clip = blockText.trim().take(3000)
         runAiStream(
             kind = kind,
             title = title,
             cfg = cfg,
-            scopeLine = "范围：选中段落，已发送 ${clip.length} 字符",
+            // 范围必须写清楚：结果会落进笔记，事后要能看出当时问的是整段还是某一句话。
+            scopeLine = "范围：选中$scopeLabel，已发送 ${clip.length} 字符",
             anchor = anchor,
-            onRetry = { alt -> runBlockAi(kind, title, blockText, alt, instruction, anchor) }
+            onRetry = { alt -> runBlockAi(kind, title, blockText, alt, instruction, anchor, scopeLabel) }
         ) { onDelta, onReason, onRestart, onCached ->
             AiClient.chat(cfg, SYS_PROMPT, "$instruction\n\n「$clip」", onDelta, onReason = onReason, onRestart = onRestart, onUsage = ::recordUsage)
         }
     }
 
     /** 翻译：目标语言可选，源语言自身从列表里剔除（中文书里不再出现「翻译成中文」） */
-    private fun translateBlock(blockText: String, anchor: String, cfg: AiClient.Config) {
+    private fun translateBlock(blockText: String, anchor: String, cfg: AiClient.Config, scopeLabel: String = "段落") {
         val source = detectSourceLanguage(blockText)
         val targets = listOf("中文", "English", "日本語").filterNot { it == source }
         if (targets.isEmpty()) {
@@ -4213,7 +4249,7 @@ class ReaderView(
             .setTitle("翻译成…")
             .setItems(targets.toTypedArray()) { _, which ->
                 runBlockAi("translate", "翻译 · ${targets[which]}", blockText, cfg,
-                    "把下面的文字翻译成流畅的${targets[which]}，只输出译文：", anchor)
+                    "把下面的文字翻译成流畅的${targets[which]}，只输出译文：", anchor, scopeLabel)
             }
             .setNegativeButton("取消", null)
             .show().also { Glass.styleDialog(it, density(act)) }
