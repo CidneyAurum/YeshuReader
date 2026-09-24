@@ -4,18 +4,20 @@
 > 应用标识：`app.yeshu.reader`
 > 商店副标题：本地书架与 AI 文档助手
 > 品牌口号：读书，也读懂资料
-> 文档版本：2026-08-24
+> 文档版本：2026-09-24（对应 1.6）
 
 本文档用于交付最终成品。压缩包内不包含 `Android SDK`、Gradle 用户缓存、密钥、临时截图、QA 抓屏或调试副产物；这些内容只存在于开发者本机，团队成员拉取源码后可在自己的 `local.properties` 中配置 `sdk.dir` 后直接重建。
 
 ## 一、最终成品（APK）
 
+交付版本：**1.6**（`versionCode 8`）。
+
 | 构建变体 | 文件 | 大小 | SHA-256 |
 | --- | --- | --- | --- |
-| Debug（调试证书签名，可安装） | `app/build/outputs/apk/debug/app-debug.apk` | 20,489,286 字节 | `1B8B0431179F69565FC6E75C0962956BDD8FAB5118E59F2DA9CA7914EBBE5ECF` |
-| Release（未签名） | `app/build/outputs/apk/release/app-release-unsigned.apk` | 3,250,766 字节 | `FE0A91E88F6FF9FF0044F81C0019697462FA9F21EE41CB1782870BF5192E1570` |
+| Debug（调试证书签名，可安装） | `app/build/outputs/apk/debug/app-debug.apk` | 13,373,954 字节 | `F9013E926762C692FA23DE490D99863AF58293F95265A6CFBA1773CA2CCBDE74` |
+| Release（未签名） | `app/build/outputs/apk/release/app-release-unsigned.apk` | 3,381,841 字节 | `DA64706C4B8E8D9A2E4274D1E051FD68045E3CFABF462AC64235EDDA5137DBCA` |
 
-两个 APK 在交付时已经分别通过本地 Debug 编译 + Release 编译验证，来源项目的 `output-metadata.json` 同步保留。Release 已开启 R8 混淆与资源压缩（`isMinifyEnabled = true`、`isShrinkResources = true`，体积由 15.9MB 降至 3.25MB），保留规则见 `app/proguard-rules.pro`；混淆包已在 API 35 模拟器上实测安装、启动、书架与旧版阅读器渲染、底部弹层，无崩溃。
+两个 APK 在交付时已经分别通过本地 Debug 编译 + Release 编译验证，来源项目的 `output-metadata.json` 同步保留。Release 已开启 R8 混淆与资源压缩（`isMinifyEnabled = true`、`isShrinkResources = true`，体积由 15.9MB 降至 3.38MB），保留规则见 `app/proguard-rules.pro`；混淆包已在 API 35 模拟器上实测安装、启动、书架与旧版阅读器渲染、底部弹层，无崩溃。
 
 Release 默认产出未签名 APK：在仓库根目录放置 gitignored 的 `keystore.properties`（`storeFile` / `storePassword` / `keyAlias` / `keyPassword`）后 `assembleRelease` 会自动签名。未签名的 APK 系统会拒绝安装，正式分发前必须用长期保存的发布证书签名。
 
@@ -71,11 +73,11 @@ YeshuReader/
 
 | 阶段 | 结果 |
 | --- | --- |
-| JVM 单元测试（`testDebugUnitTest`） | 通过：33 用例，0 失败、0 错误 |
+| JVM 单元测试（`testDebugUnitTest`） | 通过：167 用例，0 失败、0 错误 |
 | 实况冒烟测试（可选） | `AiLiveSmokeTest` 5 用例，走真实服务商接口；未提供密钥时自动跳过 |
-| API 35 模拟器（混淆 release 包） | 通过：安装、启动、书架与旧版阅读器渲染、底部弹层，无崩溃 |
-| Debug Lint | 0 error / 98 warning |
-| Release Lint | 0 error / 100 warning |
+| API 35 模拟器（1.6 debug 包） | 通过：导入 TXT → 打开 → 长按段落 → 「这一段有 3 句」→ 选第 1 句 → 单句菜单范围与文案正确；无崩溃 |
+| Debug Lint | 0 error / 2 warning（targetSdk 35、BYOK 需放行的网络安全配置，均为有意保留） |
+| Release Lint | 0 error / 2 warning（同上） |
 | Release manifest 自检 | 未发现 `DebugActivity` 引用、未发现疑似明文 API Key；`DebugActivity` 已设为 `exported="false"` |
 | APK 构建 | `assembleDebug` 与 `assembleRelease` 成功 |
 
