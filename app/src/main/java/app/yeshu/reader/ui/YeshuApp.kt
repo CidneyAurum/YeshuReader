@@ -73,6 +73,7 @@ import androidx.compose.runtime.SideEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
@@ -1032,6 +1033,8 @@ private fun NotesHubScreen(activity: MainActivity, revision: Int) {
     var pendingDelete by remember { mutableStateOf<Db.NoteDetail?>(null) }
     // 笔记多起来以后「按时间」很难复习同一本书：提供按书聚合的视图
     var groupByBook by remember { mutableStateOf(false) }
+    // 跨书搜索：摘记攒到几十条之后，靠翻列表找一句话已经不现实。
+    var query by rememberSaveable { mutableStateOf("") }
     val snackbarHostState = remember { SnackbarHostState() }
 
     LaunchedEffect(revision, localRevision, reloadTick) {
@@ -1151,6 +1154,34 @@ private fun NotesHubScreen(activity: MainActivity, revision: Int) {
 
     val loaded = data
     val failure = error
+    // 在已加载的数据上过滤，不再查库：搜索要跟手，几百条以内内存过滤足够快。
+    val keyword = query.trim()
+    val filteredNotes = remember(loaded, keyword) {
+        val all = loaded?.notes.orEmpty()
+        if (keyword.isEmpty()) all
+        else all.filter { (note, book) ->
+            note.content.contains(keyword, ignoreCase = true) ||
+                book?.title?.contains(keyword, ignoreCase = true) == true
+        }
+    }
+    val filteredMarks = remember(loaded, keyword) {
+        val all = loaded?.marks.orEmpty()
+        if (keyword.isEmpty()) all
+        else all.filter {
+            it.body.contains(keyword, ignoreCase = true) ||
+                it.title.contains(keyword, ignoreCase = true) ||
+                it.badge.contains(keyword, ignoreCase = true)
+        }
+    }
+    val filteredArtifacts = remember(loaded, keyword) {
+        val all = loaded?.artifacts.orEmpty()
+        if (keyword.isEmpty()) all
+        else all.filter {
+            it.artifact.content.contains(keyword, ignoreCase = true) ||
+                it.bookTitle?.contains(keyword, ignoreCase = true) == true
+        }
+    }
+    val matchCount = filteredNotes.size + filteredMarks.size + filteredArtifacts.size
     BoxWithConstraints(Modifier.fillMaxSize()) {
         val pageWidth = if (maxWidth > 900.dp) 900.dp else maxWidth
         LazyColumn(
@@ -1182,6 +1213,39 @@ private fun NotesHubScreen(activity: MainActivity, revision: Int) {
                 }
                 else -> {
                     item {
+                        OutlinedTextField(
+                            value = query,
+                            onValueChange = { query = it },
+                            modifier = Modifier.fillMaxWidth(),
+                            placeholder = { Text("搜索摘记、划线与 AI 成果") },
+                            singleLine = true,
+                            shape = RoundedCornerShape(18.dp),
+                            leadingIcon = { Text("🔍", fontSize = 14.sp, modifier = Modifier.padding(start = 10.dp)) },
+                            trailingIcon = {
+                                if (keyword.isNotEmpty()) {
+                                    TextButton(onClick = { query = "" }) { Text("清除") }
+                                }
+                            },
+                        )
+                    }
+                    if (keyword.isNotEmpty() && matchCount == 0) {
+                        item {
+                            GlassPanel(
+                                modifier = Modifier.fillMaxWidth(),
+                                shape = RoundedCornerShape(24.dp),
+                                contentPadding = PaddingValues(24.dp),
+                            ) {
+                                Column(Modifier.fillMaxWidth(), horizontalAlignment = Alignment.CenterHorizontally) {
+                                    Text("没有匹配的内容", fontWeight = FontWeight.Bold, fontSize = 15.sp)
+                                    Text(
+                                        "「$keyword」在摘记、划线与 AI 成果里都没找到。",
+                                        color = secondaryText(), fontSize = 12.sp,
+                                    )
+                                }
+                            }
+                        }
+                    }
+                    item {
                         Row(
                             Modifier.horizontalScroll(rememberScrollState()),
                             horizontalArrangement = Arrangement.spacedBy(8.dp)
@@ -1202,7 +1266,7 @@ private fun NotesHubScreen(activity: MainActivity, revision: Int) {
                     }
                     if (groupByBook) {
                         // 按书聚合：每本书一个组头（书名 + 条数），组内仍按时间倒序
-                        val grouped = loaded.notes.groupBy { it.first.bookId }
+                        val grouped = filteredNotes.groupBy { it.first.bookId }
                             .toList()
                             .sortedByDescending { (_, items) -> items.maxOf { it.first.createdAt } }
                         grouped.forEach { (bookId, items) ->
@@ -1224,7 +1288,7 @@ private fun NotesHubScreen(activity: MainActivity, revision: Int) {
                             }
                         }
                     } else {
-                        items(loaded.notes, key = { "note-${it.first.id}" }) { (note, book) ->
+                        items(filteredNotes, key = { "note-${it.first.id}" }) { (note, book) ->
                             NoteHubCard(
                                 title = book?.title ?: "阅读报告",
                                 kind = noteKindLabel(note.kind, note.content),
@@ -1237,7 +1301,7 @@ private fun NotesHubScreen(activity: MainActivity, revision: Int) {
                             )
                         }
                     }
-                    if (loaded.marks.isNotEmpty()) {
+                    if (filteredMarks.isNotEmpty()) {
                         item {
                             SectionHeader("标记", "书签与划过的重点，点击回到原文位置")
                         }
@@ -1265,13 +1329,13 @@ private fun NotesHubScreen(activity: MainActivity, revision: Int) {
                                 shape = RoundedCornerShape(18.dp),
                             ) { Text("导出全部划线") }
                         }
-                        items(loaded.marks, key = { it.key }) { mark ->
+                        items(filteredMarks, key = { it.key }) { mark ->
                             MarkHubCard(mark) { activity.openReader(mark.bookId, mark.anchor) }
                         }
                     }
-                    if (loaded.artifacts.isNotEmpty()) {
+                    if (filteredArtifacts.isNotEmpty()) {
                         item { SectionHeader("AI 成果", "生成过的理解包，关闭对话框后仍可回看") }
-                        items(loaded.artifacts, key = { "artifact-${it.artifact.id}" }) { row ->
+                        items(filteredArtifacts, key = { "artifact-${it.artifact.id}" }) { row ->
                             ArtifactHubCard(
                                 row = row,
                                 onOpen = {
