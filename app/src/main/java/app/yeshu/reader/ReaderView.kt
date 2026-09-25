@@ -728,7 +728,7 @@ class ReaderView(
         // 「拖进度条跳转」是读书时最直接的移动方式，而 3dp 的线根本捏不住。
         val prog = Glass.progressTrack(act)
         progBar = prog
-        val progTouch = FrameLayout(act)
+        val progTouch = ProgressTouchView(act)
         progTouch.addView(
             prog,
             FrameLayout.LayoutParams(-1, Glass.dp(3, d), Gravity.CENTER_VERTICAL).also { lp ->
@@ -750,6 +750,31 @@ class ReaderView(
             lp.setMargins(0, Glass.dp(1, d), 0, Glass.dp(1, d))
         })
         val barInset = Glass.dp(22, d)
+        // 纯拖动控件对读屏用户是不可用的：TalkBack 只能「激活」，不会拖。
+        // 补上描述与前后翻页动作，让它至少能被读出来、也能一步步挪。
+        progTouch.contentDescription = "阅读进度，可左右拖动跳转"
+        progTouch.isFocusable = true
+        androidx.core.view.ViewCompat.setAccessibilityDelegate(
+            progTouch,
+            object : androidx.core.view.AccessibilityDelegateCompat() {
+                override fun onInitializeAccessibilityNodeInfo(host: View, info: androidx.core.view.accessibility.AccessibilityNodeInfoCompat) {
+                    super.onInitializeAccessibilityNodeInfo(host, info)
+                    info.addAction(androidx.core.view.accessibility.AccessibilityNodeInfoCompat.AccessibilityActionCompat.ACTION_SCROLL_BACKWARD)
+                    info.addAction(androidx.core.view.accessibility.AccessibilityNodeInfoCompat.AccessibilityActionCompat.ACTION_SCROLL_FORWARD)
+                }
+
+                override fun performAccessibilityAction(host: View, action: Int, args: android.os.Bundle?): Boolean {
+                    val step = 0.05f
+                    when (action) {
+                        androidx.core.view.accessibility.AccessibilityNodeInfoCompat.ACTION_SCROLL_FORWARD ->
+                            return jumpByFraction(currentProgress() + step)
+                        androidx.core.view.accessibility.AccessibilityNodeInfoCompat.ACTION_SCROLL_BACKWARD ->
+                            return jumpByFraction(currentProgress() - step)
+                    }
+                    return super.performAccessibilityAction(host, action, args)
+                }
+            },
+        )
         progTouch.setOnTouchListener { _, event ->
             val usable = (progTouch.width - barInset * 2).coerceAtLeast(1)
             fun fractionAt(x: Float) = ((x - barInset) / usable).coerceIn(0f, 1f)
@@ -768,16 +793,8 @@ class ReaderView(
                 MotionEvent.ACTION_UP -> {
                     val fraction = fractionAt(event.x)
                     progBubble.visibility = View.GONE
-                    // 优先按「块下标」跳：顶栏百分比与进度条都用这个口径。
-                    // 若这里按像素比例跳，松手后进度条会从气泡上的数字滑到另一个数字，
-                    // 看起来就像进度条在骗人。够不着（超长文档没渲染到）才退回像素比例。
-                    val total = docBlocks?.size ?: 0
-                    val jumped = total > 0 &&
-                        tryJumpToBlock(((total - 1) * fraction).toInt())
-                    if (!jumped) sc?.let { restoreScrollNow(it, fraction) }
-                    hasInteracted = true
-                    saveProgress()
-                    true
+                    progTouch.performClick()
+                    jumpByFraction(fraction)
                 }
                 MotionEvent.ACTION_CANCEL -> {
                     progBubble.visibility = View.GONE
@@ -4974,6 +4991,23 @@ class ReaderView(
             .show().also { Glass.styleDialog(it, density(act)) }
     }
 
+    /**
+     * 按比例跳转。拖动进度条与读屏的前后翻页都走这里，保证两者落点口径一致。
+     *
+     * 优先按「块下标」跳：顶栏百分比与进度条都用这个口径，按像素比例跳会让
+     * 进度条从气泡上的数字滑到另一个数字，看起来像进度条在骗人。
+     * 超长文档够不着时静默退回像素比例。
+     */
+    private fun jumpByFraction(fraction: Float): Boolean {
+        val f = fraction.coerceIn(0f, 1f)
+        val total = docBlocks?.size ?: 0
+        val jumped = total > 0 && tryJumpToBlock(((total - 1) * f).toInt())
+        if (!jumped) sc?.let { restoreScrollNow(it, f) }
+        hasInteracted = true
+        saveProgress()
+        return true
+    }
+
     /** 跳转到指定段落（docBlocks 顺序与正文子 View 一致）；目标未渲染时先续载 */
     private fun jumpToBlock(index: Int, flash: Boolean = false) {
         if (!tryJumpToBlock(index, flash)) {
@@ -5278,5 +5312,19 @@ class ReaderView(
         archiveBitmaps.forEach { if (!it.isRecycled) it.recycle() }
         archiveBitmaps.clear()
         archivePageFiles = emptyList()
+    }
+}
+
+/**
+ * 进度条的触摸层。
+ *
+ * 单独做成一个类只为了能覆写 performClick：lint 要求使用 OnTouchListener 的 View
+ * 同时实现 performClick，否则辅助功能服务无法通过「点击」触发它。
+ * 拖动逻辑仍由外层的 OnTouchListener 承担，这里只保证语义完整。
+ */
+private class ProgressTouchView(context: android.content.Context) : android.widget.FrameLayout(context) {
+    override fun performClick(): Boolean {
+        super.performClick()
+        return true
     }
 }
