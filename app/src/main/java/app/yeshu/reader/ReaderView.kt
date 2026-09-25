@@ -19,6 +19,7 @@ import android.text.style.LeadingMarginSpan
 import android.text.style.RelativeSizeSpan
 import android.text.style.StyleSpan
 import android.util.SparseArray
+import android.view.MotionEvent
 import android.view.Gravity
 import android.view.View
 import android.view.ViewGroup
@@ -723,13 +724,68 @@ class ReaderView(
             sv.addView(err, LayoutParams(-1, -2))
         }
 
-        // 阅读进度细条（底部工具坞上方）
+        // 阅读进度条：视觉仍是 3dp 细线，但触摸区放到 26dp。
+        // 「拖进度条跳转」是读书时最直接的移动方式，而 3dp 的线根本捏不住。
         val prog = Glass.progressTrack(act)
         progBar = prog
-        // 3dp：2dp 在低密度屏上低于可感知阈值
-        col.addView(prog, LayoutParams(-1, Glass.dp(3, d)).also { lp ->
-            lp.setMargins(Glass.dp(22, d), Glass.dp(5, d), Glass.dp(22, d), Glass.dp(3, d))
+        val progTouch = FrameLayout(act)
+        progTouch.addView(
+            prog,
+            FrameLayout.LayoutParams(-1, Glass.dp(3, d), Gravity.CENTER_VERTICAL).also { lp ->
+                lp.leftMargin = Glass.dp(22, d)
+                lp.rightMargin = Glass.dp(22, d)
+            },
+        )
+        // 拖动时浮出的百分比气泡。拖动过程中不跳转：
+        // 长文档每帧重新排版会直接卡死，松手才落地。
+        val progBubble = TextView(act).apply {
+            textSize = 12f
+            setTextColor(Color.WHITE)
+            background = chromeChip(selected = true)
+            setPadding(Glass.dp(10, d), Glass.dp(3, d), Glass.dp(10, d), Glass.dp(3, d))
+            visibility = View.GONE
+        }
+        progTouch.addView(progBubble, FrameLayout.LayoutParams(-2, -2))
+        col.addView(progTouch, LayoutParams(-1, Glass.dp(26, d)).also { lp ->
+            lp.setMargins(0, Glass.dp(1, d), 0, Glass.dp(1, d))
         })
+        val barInset = Glass.dp(22, d)
+        progTouch.setOnTouchListener { _, event ->
+            val usable = (progTouch.width - barInset * 2).coerceAtLeast(1)
+            fun fractionAt(x: Float) = ((x - barInset) / usable).coerceIn(0f, 1f)
+            when (event.actionMasked) {
+                MotionEvent.ACTION_DOWN, MotionEvent.ACTION_MOVE -> {
+                    val fraction = fractionAt(event.x)
+                    // 气泡按落点的线性百分比提示。顶栏与进度条用位置口径（按块下标），
+                    // 与像素比例在长短段不齐的文档里会差一点，这里只作为「拖到哪」的参考。
+                    progBubble.text = "${(fraction * 100).toInt()}%"
+                    val bubbleWidth = progBubble.width.takeIf { it > 0 } ?: Glass.dp(48, d)
+                    progBubble.x = (event.x - bubbleWidth / 2f).coerceIn(0f, (progTouch.width - bubbleWidth).toFloat())
+                    progBubble.y = 0f
+                    progBubble.visibility = View.VISIBLE
+                    true
+                }
+                MotionEvent.ACTION_UP -> {
+                    val fraction = fractionAt(event.x)
+                    progBubble.visibility = View.GONE
+                    // 优先按「块下标」跳：顶栏百分比与进度条都用这个口径。
+                    // 若这里按像素比例跳，松手后进度条会从气泡上的数字滑到另一个数字，
+                    // 看起来就像进度条在骗人。够不着（超长文档没渲染到）才退回像素比例。
+                    val total = docBlocks?.size ?: 0
+                    val jumped = total > 0 &&
+                        tryJumpToBlock(((total - 1) * fraction).toInt())
+                    if (!jumped) sc?.let { restoreScrollNow(it, fraction) }
+                    hasInteracted = true
+                    saveProgress()
+                    true
+                }
+                MotionEvent.ACTION_CANCEL -> {
+                    progBubble.visibility = View.GONE
+                    true
+                }
+                else -> false
+            }
+        }
         fun updProg() {
             // 与落库、顶栏共用同一进度口径：三者不一致时用户会以为进度条在骗人
             prog.background?.level = (currentProgress() * 10000).toInt()
@@ -4920,19 +4976,24 @@ class ReaderView(
 
     /** 跳转到指定段落（docBlocks 顺序与正文子 View 一致）；目标未渲染时先续载 */
     private fun jumpToBlock(index: Int, flash: Boolean = false) {
-        val sv = sc ?: return
-        val box = sv.getChildAt(0) as? LinearLayout ?: return
-        val needsAppend = pdfRenderer == null && index >= renderedUpTo
-        if (pdfRenderer == null && !ensureRenderedUpTo(index, PRELOAD_MAX_CHUNKS)) {
+        if (!tryJumpToBlock(index, flash)) {
             // 超长文档可能一次补载不完：必须给出反馈，不能点了没反应
             showResult("提示", "目标位置较远，正在加载，请稍后再试")
-            return
         }
-        val v = box.getChildAt(index)
-        if (v == null) {
-            showResult("提示", "目标位置较远，正在加载，请稍后再试")
-            return
-        }
+    }
+
+    /**
+     * 跳到指定段落，失败时返回 false 而不是弹提示。
+     *
+     * 拖动进度条时用得到：够不着就静默退回像素比例跳转，
+     * 不能因为拖得远就弹一个「请稍后再试」——那正说明拖拽没做成。
+     */
+    private fun tryJumpToBlock(index: Int, flash: Boolean = false): Boolean {
+        val sv = sc ?: return false
+        val box = sv.getChildAt(0) as? LinearLayout ?: return false
+        val needsAppend = pdfRenderer == null && index >= renderedUpTo
+        if (pdfRenderer == null && !ensureRenderedUpTo(index, PRELOAD_MAX_CHUNKS)) return false
+        val v = box.getChildAt(index) ?: return false
         val scrollToTarget = Runnable {
             val target = box.getChildAt(index) ?: return@Runnable
             sv.smoothScrollTo(0, max(0, target.top - Glass.dp(56, density(act))))
@@ -4972,6 +5033,7 @@ class ReaderView(
                 }.start()
             }
         }
+        return true
     }
 
     private fun restoreScroll(sv: ScrollView) {
